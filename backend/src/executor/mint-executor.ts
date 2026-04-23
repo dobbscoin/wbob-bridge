@@ -225,6 +225,10 @@ export class MintExecutor {
       try {
         const depositIdHex = bufferToHex(row.deposit_id) as ViemHex;
         const sigs = row.signatures.map((e) => e.sig as ViemHex);
+        // DB stores Dobbscoin txids in raw Bitcoin-display hex (no 0x prefix).
+        // bytes32 ABI encoding needs a 0x-prefixed hex; must match the value the
+        // watchers signed (same prefix logic in watcher/src/index.ts).
+        const sourceTxHash = (row.txid.startsWith('0x') ? row.txid : `0x${row.txid}`) as ViemHex;
 
         const txHash = await this.walletClient.writeContract({
           address: this.config.bridgeControllerAddress as ViemHex,
@@ -236,7 +240,7 @@ export class MintExecutor {
               recipient:    row.recipient_address as ViemHex,
               amount:       row.amount_sat,
               sourceChainId: this.config.dobbscoinChainId,
-              sourceTxHash: row.txid as ViemHex,
+              sourceTxHash,
               sourceVout:   row.vout,
               deadline:     row.deadline,
               nonce:        row.mint_nonce,

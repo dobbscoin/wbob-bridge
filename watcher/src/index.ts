@@ -358,12 +358,16 @@ async function main(): Promise<void> {
       try {
         const depositIdHex = bufferToHex(row.deposit_id);
 
+        // Dobbscoin txids are stored in the DB as raw 64-char hex (no 0x prefix —
+        // native Bitcoin display form). EIP-712 bytes32 encoding needs a 0x-prefix
+        // so viem treats the value as hex, not as UTF-8-encoded ASCII.
+        const sourceTxHash = (row.txid.startsWith('0x') ? row.txid : `0x${row.txid}`) as Hex;
         const auth = {
           depositId:     depositIdHex,
           recipient:     row.recipient_address as Address,
           amount:        row.amount_sat,
           sourceChainId: config.dobbscoinChainId,
-          sourceTxHash:  row.txid as Hex,
+          sourceTxHash,
           sourceVout:    row.vout,
           deadline:      row.deadline,
           nonce:         row.mint_nonce,
