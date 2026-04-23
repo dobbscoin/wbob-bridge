@@ -97,9 +97,19 @@ async function main(): Promise<void> {
   };
 
   // ── Block handler ─────────────────────────────────────────────────────────
+  //
+  // Runs on every new canonical block. Two passes:
+  //   A) First-sighting — scan this block for outputs paying watched deposit
+  //      addresses. First match records txid/vout/amount/depositId/block_*
+  //      and advances DEPOSIT_ADDRESS_ASSIGNED → DEPOSIT_SEEN_MEMPOOL.
+  //   B) Confirmation advancement — for every deposit already matched and in
+  //      SEEN_MEMPOOL / CONFIRMED, compute confirmations from the tip height
+  //      vs. its home block_height and drive SEEN → CONFIRMED → FINALIZED as
+  //      thresholds are crossed. Also refreshes source_deposits.confirmations.
 
   async function handleBlock(block: RpcBlock): Promise<void> {
-    const activeDeposits = await sql<ActiveDepositRow[]>`
+    // ── A. First-sighting ──────────────────────────────────────────────────
+    const pendingFirst = await sql<ActiveDepositRow[]>`
       SELECT
         bo.id                   AS order_id,
         sd.deposit_address,
@@ -113,91 +123,152 @@ async function main(): Promise<void> {
       FROM bridge_orders bo
       JOIN source_deposits sd ON sd.order_id = bo.id
       WHERE bo.order_type = 'inbound'
-        AND bo.state NOT IN (
-          ${InboundState.COMPLETED},
-          ${InboundState.FAILED},
-          ${InboundState.REFUNDED},
-          ${InboundState.MINT_SUBMITTED},
-          ${InboundState.MINT_CONFIRMED},
-          ${InboundState.MINT_AUTH_CREATED}
-        )
+        AND bo.state = ${InboundState.DEPOSIT_ADDRESS_ASSIGNED}
+        AND sd.txid IS NULL
     `;
 
-    if (activeDeposits.length === 0) return;
+    if (pendingFirst.length > 0) {
+      const watchedSet = new Set(pendingFirst.map((d) => d.deposit_address));
+      const matches = matchBlock(block, watchedSet);
+      const depositsByAddress = new Map<string, ActiveDepositRow>();
+      for (const d of pendingFirst) depositsByAddress.set(d.deposit_address, d);
 
-    const watchedSet = new Set(activeDeposits.map((d) => d.deposit_address));
-    const matches = matchBlock(block, watchedSet);
-    if (matches.length === 0) return;
+      for (const match of matches) {
+        const deposit = depositsByAddress.get(match.depositAddress);
+        if (deposit === undefined) continue;
 
-    const depositsByAddress = new Map<string, ActiveDepositRow>();
-    for (const d of activeDeposits) depositsByAddress.set(d.deposit_address, d);
+        const depositId = computeDepositId({
+          sourceChainName:        deposit.source_chain_name,
+          dobbscoinTxid:          match.txid,
+          vout:                   match.vout,
+          depositAddress:         match.depositAddress,
+          rawAmountSat:           match.amountSat,
+          recipientGnosisAddress: deposit.user_gnosis_address as Address,
+        });
 
-    for (const match of matches) {
-      const deposit = depositsByAddress.get(match.depositAddress);
-      if (deposit === undefined) continue;
+        try {
+          await sql.begin(async (tx) => {
+            const rows = await tx<{ state: InboundState }[]>`
+              SELECT state FROM bridge_orders WHERE id = ${deposit.order_id} FOR UPDATE
+            `;
+            if (rows.length === 0) return;
+            if (rows[0]!.state !== InboundState.DEPOSIT_ADDRESS_ASSIGNED) return;
 
-      const currentState = deposit.inbound_state;
-      const confirmations = block.confirmations ?? 1;
+            assertInboundTransition(
+              InboundState.DEPOSIT_ADDRESS_ASSIGNED,
+              InboundState.DEPOSIT_SEEN_MEMPOOL,
+            );
 
-      const intent = computeConfirmationTransition(currentState, confirmations, confirmationConfig);
-      if (intent.transition === null) continue;
+            await tx`
+              UPDATE source_deposits
+              SET txid          = ${match.txid},
+                  vout          = ${match.vout},
+                  amount_sat    = ${match.amountSat},
+                  deposit_id    = ${hexToBuffer(depositId)},
+                  block_hash    = ${block.hash},
+                  block_height  = ${block.height},
+                  confirmations = 1,
+                  updated_at    = now()
+              WHERE order_id = ${deposit.order_id}
+            `;
+
+            await tx`
+              UPDATE bridge_orders
+              SET state = ${InboundState.DEPOSIT_SEEN_MEMPOOL}, updated_at = now()
+              WHERE id = ${deposit.order_id}
+            `;
+
+            await tx`
+              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (
+                ${deposit.order_id},
+                'STATE_TRANSITION',
+                ${InboundState.DEPOSIT_ADDRESS_ASSIGNED},
+                ${InboundState.DEPOSIT_SEEN_MEMPOOL},
+                'watcher',
+                ${tx.json({ blockHash: block.hash, blockHeight: block.height, txid: match.txid, vout: match.vout })}
+              )
+            `;
+          });
+          console.log(`[watcher] first-sight orderId=${deposit.order_id} txid=${match.txid} height=${block.height}`);
+        } catch (err) {
+          console.error(`[watcher] first-sight error txid=${match.txid}:`, err);
+        }
+      }
+    }
+
+    // ── B. Confirmation advancement ────────────────────────────────────────
+    type AdvanceRow = { order_id: string; state: InboundState; block_height: number };
+    const pendingAdvance = await sql<AdvanceRow[]>`
+      SELECT bo.id AS order_id, bo.state AS state, sd.block_height
+      FROM bridge_orders bo
+      JOIN source_deposits sd ON sd.order_id = bo.id
+      WHERE bo.order_type = 'inbound'
+        AND bo.state IN (${InboundState.DEPOSIT_SEEN_MEMPOOL}, ${InboundState.DEPOSIT_CONFIRMED})
+        AND sd.block_height IS NOT NULL
+    `;
+
+    for (const row of pendingAdvance) {
+      const confs = block.height - row.block_height + 1;
+      if (confs < 1) continue;
+
+      const intent = computeConfirmationTransition(row.state, confs, confirmationConfig);
 
       try {
         await sql.begin(async (tx) => {
           const rows = await tx<{ state: InboundState }[]>`
-            SELECT state FROM bridge_orders WHERE id = ${deposit.order_id} FOR UPDATE
+            SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
           `;
           if (rows.length === 0) return;
-          const actual = rows[0]!.state;
-          if (actual !== currentState) return;
+          let state = rows[0]!.state;
+          if (state !== row.state) return;
 
-          const toState = intent.transition!;
-          assertInboundTransition(actual, toState);
+          await tx`
+            UPDATE source_deposits
+            SET confirmations = ${confs}, updated_at = now()
+            WHERE order_id = ${row.order_id}
+          `;
 
-          // First time seeing this deposit: record txid/vout/amount + compute depositId
-          if (deposit.txid === null) {
-            const depositId = computeDepositId({
-              sourceChainName:        deposit.source_chain_name,
-              dobbscoinTxid:          match.txid,
-              vout:                   match.vout,
-              depositAddress:         match.depositAddress,
-              rawAmountSat:           match.amountSat,
-              recipientGnosisAddress: deposit.user_gnosis_address as Address,
-            });
+          if (intent.transition === null) return;
+
+          // computeConfirmationTransition returns the TARGET state (e.g. FINALIZED);
+          // the FSM only allows one edge per step, so walk through intermediates.
+          // Only multi-hop path in this FSM: SEEN_MEMPOOL → CONFIRMED → FINALIZED.
+          const path: InboundState[] = [];
+          if (
+            state === InboundState.DEPOSIT_SEEN_MEMPOOL &&
+            intent.transition === InboundState.DEPOSIT_FINALIZED
+          ) {
+            path.push(InboundState.DEPOSIT_CONFIRMED);
+          }
+          path.push(intent.transition);
+
+          for (const next of path) {
+            assertInboundTransition(state, next);
 
             await tx`
-              UPDATE source_deposits
-              SET txid       = ${match.txid},
-                  vout       = ${match.vout},
-                  amount_sat = ${match.amountSat},
-                  deposit_id = ${hexToBuffer(depositId)},
-                  block_hash = ${block.hash},
-                  block_height = ${block.height},
-                  updated_at = now()
-              WHERE order_id = ${deposit.order_id}
+              UPDATE bridge_orders
+              SET state = ${next}, updated_at = now()
+              WHERE id = ${row.order_id}
             `;
+
+            await tx`
+              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (
+                ${row.order_id},
+                'STATE_TRANSITION',
+                ${state},
+                ${next},
+                'watcher',
+                ${tx.json({ blockHash: block.hash, blockHeight: block.height, confirmations: confs })}
+              )
+            `;
+            console.log(`[watcher] advanced orderId=${row.order_id} confs=${confs} ${state} → ${next}`);
+            state = next;
           }
-
-          await tx`
-            UPDATE bridge_orders
-            SET state = ${toState}, updated_at = now()
-            WHERE id = ${deposit.order_id}
-          `;
-
-          await tx`
-            INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-            VALUES (
-              ${deposit.order_id},
-              'STATE_TRANSITION',
-              ${currentState},
-              ${toState},
-              'watcher',
-              ${tx.json({ blockHash: block.hash, blockHeight: block.height, txid: match.txid, vout: match.vout })}
-            )
-          `;
         });
       } catch (err) {
-        console.error(`[watcher] block handler error txid=${match.txid}:`, err);
+        console.error(`[watcher] advance error orderId=${row.order_id}:`, err);
       }
     }
   }
