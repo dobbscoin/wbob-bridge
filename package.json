@@ -1,0 +1,19 @@
+{
+  "name": "wbob-bridge",
+  "private": true,
+  "description": "Dobbscoin (BOB) <-> Gnosis wBOB bridge",
+  "workspaces": ["shared", "backend", "watcher", "portal"],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "contracts:test": "cd contracts && forge test",
+    "contracts:test:invariant": "cd contracts && forge test --match-path 'test/invariants/*'",
+    "contracts:build": "cd contracts && forge build",
+    "contracts:fmt": "cd contracts && forge fmt"
+  },
+  "devDependencies": {
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0"
+  }
+}

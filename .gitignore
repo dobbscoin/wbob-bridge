@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Foundry build artifacts
+contracts/out/
+contracts/cache/
+contracts/.gas-snapshot
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pnpm
+.pnpm-store/
+
+# TypeScript
+*.tsbuildinfo

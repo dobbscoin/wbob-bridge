@@ -1,0 +1,5 @@
+packages:
+  - "backend"
+  - "watcher"
+  - "portal"
+  - "shared"
