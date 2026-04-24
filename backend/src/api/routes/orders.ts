@@ -45,6 +45,55 @@ export async function ordersRoute(
   opts: { sql: Sql },
 ): Promise<void> {
 
+  // ── GET /v1/orders?recipient=0x…&limit=50 ─────────────────────────────────
+  // Lists recent orders for a given recipient (both inbound and outbound),
+  // newest first. Used by the portal's history view on the persistent-address
+  // deposit page.
+  fastify.get<{ Querystring: { recipient: string; limit?: string } }>(
+    '/v1/orders',
+    async (request, reply) => {
+      const { recipient } = request.query;
+      const limit = Math.min(parseInt(request.query.limit ?? '50', 10) || 50, 200);
+      if (!/^0x[0-9a-fA-F]{40}$/.test(recipient)) {
+        return reply.status(400).send({ error: 'Invalid recipient: must be a 0x Gnosis address' });
+      }
+
+      const rows = await opts.sql<OrderRow[]>`
+        SELECT
+          bo.id, bo.state, bo.order_type,
+          bo.user_gnosis_address, bo.amount_sat,
+          bo.expires_at, bo.created_at, bo.updated_at,
+          sd.deposit_address, sd.deposit_id, sd.txid, sd.vout, sd.confirmations,
+          mr.gnosis_tx_hash
+        FROM bridge_orders bo
+        LEFT JOIN source_deposits sd ON sd.order_id = bo.id
+        LEFT JOIN mint_requests    mr ON mr.order_id = bo.id
+        WHERE bo.user_gnosis_address = ${recipient}
+        ORDER BY bo.created_at DESC
+        LIMIT ${limit}
+      `;
+
+      const response = rows.map<OrderResponse>((row) => ({
+        orderId:          row.id,
+        state:            row.state,
+        orderType:        row.order_type,
+        recipientAddress: row.user_gnosis_address,
+        amountSat:        row.amount_sat !== null ? row.amount_sat.toString() : null,
+        depositAddress:   row.deposit_address,
+        depositId:        row.deposit_id !== null ? bufferToHex(row.deposit_id) : null,
+        txid:             row.txid,
+        vout:             row.vout,
+        confirmations:    row.confirmations,
+        gnosisTxHash:     row.gnosis_tx_hash,
+        expiresAt:        row.expires_at?.toISOString() ?? null,
+        createdAt:        row.created_at.toISOString(),
+        updatedAt:        row.updated_at.toISOString(),
+      }));
+
+      return reply.send({ orders: response });
+    },
+  );
+
   // ── GET /v1/orders/by-withdrawal/:withdrawalId ─────────────────────────────
   // Maps a Gnosis WithdrawalRequested.withdrawalId (uint256 string) to the
   // bridge order UUID. Used by the portal after a withdrawal tx confirms.

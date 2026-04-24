@@ -197,6 +197,98 @@ async function main(): Promise<void> {
       }
     }
 
+    // ── A2. Persistent-address auto-ingest ─────────────────────────────────
+    // For any deposit in this block paying to an address tracked in
+    // `deposit_addresses` that wasn't already claimed by a legacy quote
+    // order in pass A1, auto-create a new bridge_orders row in
+    // DEPOSIT_SEEN_MEMPOOL with the ACTUAL received amount. No quote, no
+    // expiry, no "exact amount" required.
+    type TrackedAddress = {
+      recipient_gnosis_address: string;
+      source_chain_name:        string;
+      dobbscoin_address:        string;
+      hd_index:                 number;
+    };
+    const tracked = await sql<TrackedAddress[]>`
+      SELECT recipient_gnosis_address, source_chain_name, dobbscoin_address, hd_index
+      FROM deposit_addresses
+    `;
+    if (tracked.length > 0) {
+      const trackedSet = new Set(tracked.map((a) => a.dobbscoin_address));
+      const matches = matchBlock(block, trackedSet);
+      const addrMap = new Map<string, TrackedAddress>();
+      for (const a of tracked) addrMap.set(a.dobbscoin_address, a);
+
+      for (const match of matches) {
+        const addrInfo = addrMap.get(match.depositAddress);
+        if (addrInfo === undefined) continue;
+
+        // Skip if this (txid, vout) is already recorded — either by A1 above
+        // (legacy match of an existing DEPOSIT_ADDRESS_ASSIGNED order) or by
+        // a previous watcher run that already ingested this deposit.
+        const existing = await sql<{ id: string }[]>`
+          SELECT id FROM source_deposits
+          WHERE txid = ${match.txid} AND vout = ${match.vout}
+          LIMIT 1
+        `;
+        if (existing.length > 0) continue;
+
+        const depositId = computeDepositId({
+          sourceChainName:        addrInfo.source_chain_name,
+          dobbscoinTxid:          match.txid,
+          vout:                   match.vout,
+          depositAddress:         match.depositAddress,
+          rawAmountSat:           match.amountSat,
+          recipientGnosisAddress: addrInfo.recipient_gnosis_address as Address,
+        });
+
+        try {
+          await sql.begin(async (tx) => {
+            // Re-check inside the tx to avoid races with a concurrent watcher
+            const stillNew = await tx<{ id: string }[]>`
+              SELECT id FROM source_deposits
+              WHERE txid = ${match.txid} AND vout = ${match.vout}
+              LIMIT 1
+            `;
+            if (stillNew.length > 0) return;
+
+            const orderRows = await tx<{ id: string }[]>`
+              INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+              VALUES ('inbound', ${InboundState.DEPOSIT_SEEN_MEMPOOL},
+                      ${addrInfo.recipient_gnosis_address}, ${match.amountSat})
+              RETURNING id
+            `;
+            const orderId = orderRows[0]!.id;
+
+            await tx`
+              INSERT INTO source_deposits (
+                order_id, deposit_address, hd_index, source_chain_name,
+                txid, vout, amount_sat, deposit_id,
+                block_hash, block_height, confirmations
+              ) VALUES (
+                ${orderId}, ${match.depositAddress}, ${addrInfo.hd_index}, ${addrInfo.source_chain_name},
+                ${match.txid}, ${match.vout}, ${match.amountSat}, ${hexToBuffer(depositId)},
+                ${block.hash}, ${block.height}, 1
+              )
+            `;
+
+            await tx`
+              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (
+                ${orderId}, 'ORDER_CREATED',
+                ${InboundState.QUOTE_CREATED}, ${InboundState.DEPOSIT_SEEN_MEMPOOL},
+                'watcher',
+                ${tx.json({ auto: true, blockHash: block.hash, blockHeight: block.height, txid: match.txid, vout: match.vout })}
+              )
+            `;
+          });
+          console.log(`[watcher] auto-ingested deposit orderId=new txid=${match.txid} amount=${match.amountSat} recipient=${addrInfo.recipient_gnosis_address}`);
+        } catch (err) {
+          console.error(`[watcher] auto-ingest error txid=${match.txid}:`, err);
+        }
+      }
+    }
+
     // ── B. Confirmation advancement ────────────────────────────────────────
     type AdvanceRow = { order_id: string; state: InboundState; block_height: number };
     const pendingAdvance = await sql<AdvanceRow[]>`

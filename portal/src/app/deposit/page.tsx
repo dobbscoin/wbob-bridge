@@ -1,149 +1,95 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import { useAccount } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useQuery } from '@tanstack/react-query';
-import { createQuote, getOrder, type QuoteResponse, type OrderResponse } from '@/lib/api';
-import { satsToBob, bobToSats, formatExpiry } from '@/lib/utils';
-import { OrderProgress } from '@/components/OrderProgress';
+import { getDepositAddress, listOrdersByRecipient, type OrderResponse } from '@/lib/api';
+import { satsToBob } from '@/lib/utils';
 
-type Phase =
-  | { tag: 'form' }
-  | { tag: 'creating' }
-  | { tag: 'pending'; quote: QuoteResponse; orderId: string }
-  | { tag: 'completed'; order: OrderResponse };
-
-const TERMINAL = new Set(['COMPLETED', 'FAILED', 'MANUAL_REVIEW', 'REFUNDED']);
+const ACTIVE_STATES = new Set([
+  'DEPOSIT_SEEN_MEMPOOL',
+  'DEPOSIT_CONFIRMED',
+  'DEPOSIT_FINALIZED',
+  'MINT_AUTH_CREATED',
+  'MINT_SUBMITTED',
+  'MINT_CONFIRMED',
+]);
 
 export default function DepositPage() {
   const { address } = useAccount();
-  const [phase, setPhase] = useState<Phase>({ tag: 'form' });
-  const [recipientAddress, setRecipientAddress] = useState('');
-  const [amountBob, setAmountBob] = useState('');
-  const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
 
-  // Pre-fill recipient from connected wallet
-  useEffect(() => {
-    if (address && !recipientAddress) setRecipientAddress(address);
-  }, [address, recipientAddress]);
+  // Resolve (or allocate) the persistent deposit address for the connected wallet
+  const { data: depositInfo, isLoading: loadingAddress } = useQuery({
+    queryKey: ['deposit-address', address],
+    queryFn: () => getDepositAddress(address!),
+    enabled: !!address,
+    staleTime: 24 * 60 * 60 * 1000, // address is permanent; cache a day
+  });
 
-  // Poll order status
-  const orderId = phase.tag === 'pending' ? phase.orderId : null;
-  const { data: orderData } = useQuery({
-    queryKey: ['order', orderId],
-    queryFn: () => getOrder(orderId!),
-    enabled: !!orderId,
+  // Poll the user's order history. Faster cadence while any order is active.
+  const { data: history } = useQuery({
+    queryKey: ['orders-by-recipient', address],
+    queryFn: () => listOrdersByRecipient(address!),
+    enabled: !!address,
     refetchInterval: (query) => {
-      const state = query.state.data?.state;
-      return state && TERMINAL.has(state) ? false : 12_000;
+      const anyActive = query.state.data?.orders.some(
+        (o) => o.orderType === 'inbound' && ACTIVE_STATES.has(o.state),
+      );
+      return anyActive ? 10_000 : 60_000;
     },
   });
 
-  useEffect(() => {
-    if (!orderData) return;
-    if (orderData.state === 'COMPLETED') {
-      setPhase({ tag: 'completed', order: orderData });
-    }
-  }, [orderData]);
-
-  const handleSubmit = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-
-    if (!/^0x[0-9a-fA-F]{40}$/.test(recipientAddress)) {
-      setError('Enter a valid Gnosis address (0x...)');
-      return;
-    }
-
-    let amountSat: bigint;
-    try {
-      amountSat = bobToSats(amountBob);
-      if (amountSat <= 0n) throw new Error('Amount must be positive');
-    } catch {
-      setError('Enter a valid BOB amount (e.g. 0.001)');
-      return;
-    }
-
-    setPhase({ tag: 'creating' });
-    try {
-      const quote = await createQuote(recipientAddress, amountSat.toString());
-      setPhase({ tag: 'pending', quote, orderId: quote.orderId });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create quote');
-      setPhase({ tag: 'form' });
-    }
-  }, [recipientAddress, amountBob]);
-
   const copyAddress = useCallback(() => {
-    if (phase.tag !== 'pending') return;
-    navigator.clipboard.writeText(phase.quote.depositAddress);
+    if (!depositInfo) return;
+    navigator.clipboard.writeText(depositInfo.depositAddress);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  }, [phase]);
+  }, [depositInfo]);
 
-  // ── Completed ───────────────────────────────────────────────────────────────
-  if (phase.tag === 'completed') {
+  // ── Wallet not connected ──────────────────────────────────────────────
+  if (!address) {
     return (
       <div className="mx-auto max-w-lg space-y-6">
-        <h1 className="text-2xl font-bold">Deposit BOB</h1>
-        <div className="card text-center space-y-4">
-          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-bob-500/20">
-            <svg className="h-8 w-8 text-bob-400" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          </div>
-          <div>
-            <p className="text-lg font-semibold text-bob-400">
-              {satsToBob(phase.order.amountSat ?? '0')} wBOB received
-            </p>
-            <p className="text-sm text-gray-400 mt-1">
-              Delivered to {phase.order.recipientAddress?.slice(0, 10)}…
-            </p>
-          </div>
-          {phase.order.gnosisTxHash && (
-            <a
-              href={`https://gnosisscan.io/tx/${phase.order.gnosisTxHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm text-bob-400 hover:underline"
-            >
-              View on Gnosisscan ↗
-            </a>
-          )}
-          <button onClick={() => setPhase({ tag: 'form' })} className="btn-secondary">
-            Make another deposit
-          </button>
+        <div>
+          <h1 className="text-2xl font-bold">Deposit BOB</h1>
+          <p className="text-sm text-gray-400 mt-1">
+            Connect your Gnosis wallet to see your permanent Dobbscoin deposit address.
+          </p>
+        </div>
+        <div className="card text-center">
+          <ConnectButton.Custom>
+            {({ openConnectModal }) => (
+              <button onClick={openConnectModal} className="btn-primary w-full">
+                Connect wallet
+              </button>
+            )}
+          </ConnectButton.Custom>
         </div>
       </div>
     );
   }
 
-  // ── Pending (deposit address shown + polling) ────────────────────────────────
-  if (phase.tag === 'pending') {
-    const { quote } = phase;
-    const currentOrder = orderData;
-
-    return (
-      <div className="mx-auto max-w-lg space-y-6">
+  return (
+    <div className="mx-auto max-w-lg space-y-6">
+      <div>
         <h1 className="text-2xl font-bold">Deposit BOB</h1>
+        <p className="text-sm text-gray-400 mt-1">
+          Your permanent Dobbscoin deposit address — send any amount, any time.
+        </p>
+      </div>
 
-        {/* Deposit address card */}
-        <div className="card space-y-4">
-          <div className="space-y-1">
-            <p className="text-sm text-gray-400">Send exactly</p>
-            <p className="text-2xl font-bold text-bob-400">{satsToBob(quote.amountSat)} BOB</p>
-            <p className="text-xs text-gray-500">
-              Expires in {formatExpiry(quote.expiresAt)}
-            </p>
-          </div>
-
-          <div className="space-y-1">
-            <p className="label">Dobbscoin deposit address</p>
+      {/* ── Persistent address card ─────────────────────────────────── */}
+      <div className="card space-y-4">
+        <div className="space-y-1">
+          <p className="label">Dobbscoin deposit address</p>
+          {loadingAddress || !depositInfo ? (
+            <p className="text-sm text-gray-500 animate-pulse">Resolving your address…</p>
+          ) : (
             <div className="flex items-center gap-2">
               <code className="flex-1 rounded-lg bg-gray-800 px-3 py-2 text-xs font-mono text-bob-300 break-all">
-                {quote.depositAddress}
+                {depositInfo.depositAddress}
               </code>
               <button
                 onClick={copyAddress}
@@ -152,104 +98,71 @@ export default function DepositPage() {
                 {copied ? '✓ Copied' : 'Copy'}
               </button>
             </div>
-          </div>
-
-          <p className="text-xs text-gray-500 border-t border-gray-800 pt-3">
-            Send exactly this amount. The bridge monitors for this deposit
-            and will mint wBOB automatically once confirmed.
-          </p>
-        </div>
-
-        {/* Progress */}
-        <div className="card space-y-4">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">Progress</h2>
-          {currentOrder ? (
-            <OrderProgress order={currentOrder} />
-          ) : (
-            <p className="text-sm text-gray-500 animate-pulse">Waiting for deposit…</p>
           )}
         </div>
 
-        <p className="text-center text-xs text-gray-600">Order ID: {quote.orderId}</p>
-      </div>
-    );
-  }
-
-  // ── Form ────────────────────────────────────────────────────────────────────
-  return (
-    <div className="mx-auto max-w-lg space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold">Deposit BOB</h1>
-        <p className="text-sm text-gray-400 mt-1">
-          Get a Dobbscoin deposit address. Once your BOB is confirmed, wBOB is minted to your Gnosis wallet.
-        </p>
+        <div className="text-xs text-gray-400 space-y-1 border-t border-gray-800 pt-3">
+          <p>• Send <span className="text-gray-200 font-medium">any amount</span> of BOB to this address.</p>
+          <p>• You'll receive the exact amount sent as wBOB on Gnosis ({depositInfo?.recipientAddress.slice(0, 10)}…).</p>
+          <p>• Deposits are credited after 6 Dobbscoin confirmations (~6 minutes).</p>
+          <p>• Reusable — deposit as many times as you like.</p>
+        </div>
       </div>
 
-      <form onSubmit={handleSubmit} className="card space-y-5">
-        {/* Recipient */}
-        <div>
-          <label className="label">Recipient Gnosis address</label>
-          <input
-            type="text"
-            className="input-field font-mono"
-            placeholder="0x..."
-            value={recipientAddress}
-            onChange={(e) => setRecipientAddress(e.target.value)}
-          />
-          {!address && (
-            <p className="mt-1.5 text-xs text-gray-500">
-              Or{' '}
-              <span className="text-bob-400 cursor-pointer">connect your wallet</span>{' '}
-              to auto-fill.
-            </p>
-          )}
-        </div>
-
-        {/* Amount */}
-        <div>
-          <label className="label">Amount (BOB)</label>
-          <div className="relative">
-            <input
-              type="text"
-              className="input-field pr-14"
-              placeholder="0.00000000"
-              value={amountBob}
-              onChange={(e) => setAmountBob(e.target.value)}
-            />
-            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500 pointer-events-none">
-              BOB
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-gray-500">
-            Minimum: 0.00010000 BOB (10,000 sats)
-          </p>
-        </div>
-
-        {error && <p className="text-sm text-red-400">{error}</p>}
-
-        {!address ? (
-          <ConnectButton.Custom>
-            {({ openConnectModal }) => (
-              <button type="button" onClick={openConnectModal} className="btn-primary w-full">
-                Connect wallet to continue
-              </button>
-            )}
-          </ConnectButton.Custom>
+      {/* ── History ────────────────────────────────────────────────── */}
+      <div className="card space-y-3">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+          Your deposits
+        </h2>
+        {history === undefined ? (
+          <p className="text-sm text-gray-500 animate-pulse">Loading…</p>
+        ) : history.orders.filter((o) => o.orderType === 'inbound').length === 0 ? (
+          <p className="text-sm text-gray-500">No deposits yet. Send BOB to the address above to get started.</p>
         ) : (
-          <button
-            type="submit"
-            disabled={phase.tag === 'creating'}
-            className="btn-primary w-full"
-          >
-            {phase.tag === 'creating' ? 'Creating deposit address…' : 'Get deposit address'}
-          </button>
+          <ul className="space-y-2">
+            {history.orders
+              .filter((o) => o.orderType === 'inbound')
+              .map((o) => (
+                <OrderRow key={o.orderId} order={o} />
+              ))}
+          </ul>
         )}
-      </form>
-
-      <div className="text-xs text-gray-600 space-y-1 text-center">
-        <p>No approval needed. Send BOB directly to the provided address.</p>
-        <p>Deposit addresses expire after 1 hour.</p>
       </div>
     </div>
+  );
+}
+
+function OrderRow({ order }: { order: OrderResponse }) {
+  const displayState = order.state.replace(/_/g, ' ').toLowerCase();
+  const isDone = order.state === 'COMPLETED';
+  const isFailed = ['FAILED', 'REFUNDED', 'MANUAL_REVIEW'].includes(order.state);
+  const stateColor = isDone
+    ? 'text-bob-400'
+    : isFailed
+      ? 'text-red-400'
+      : 'text-yellow-400';
+
+  return (
+    <li className="rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2 text-xs">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="font-mono text-bob-300">
+          {order.amountSat ? satsToBob(order.amountSat) : '—'} BOB
+        </span>
+        <span className={`capitalize ${stateColor}`}>{displayState}</span>
+      </div>
+      <div className="mt-1 flex items-baseline justify-between gap-2 text-[10px] text-gray-500">
+        <span>{new Date(order.createdAt).toLocaleString()}</span>
+        {order.gnosisTxHash && (
+          <a
+            href={`https://gnosisscan.io/tx/${order.gnosisTxHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-bob-400 hover:underline"
+          >
+            mint tx ↗
+          </a>
+        )}
+      </div>
+    </li>
   );
 }

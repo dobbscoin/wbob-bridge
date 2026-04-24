@@ -7,6 +7,7 @@ import cors from '@fastify/cors';
 import type { Sql } from 'postgres';
 import type { HdWallet } from '../wallet/hd-wallet.js';
 import { quotesRoute } from './routes/quotes.js';
+import { depositAddressRoute } from './routes/deposit-address.js';
 import { ordersRoute } from './routes/orders.js';
 import { healthRoute } from './routes/health.js';
 import type { BackendConfig } from '../config.js';
@@ -23,7 +24,8 @@ export async function buildServer(opts: {
   await fastify.register(cors, { origin: true });
 
   // Routes
-  await fastify.register(quotesRoute, opts);
+  await fastify.register(quotesRoute, opts);             // legacy: fixed-amount quote flow
+  await fastify.register(depositAddressRoute, opts);     // modern: persistent address per recipient
   await fastify.register(ordersRoute, { sql: opts.sql });
   await fastify.register(healthRoute, { monitor: opts.monitor });
 

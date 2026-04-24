@@ -50,3 +50,19 @@ export function getOrder(orderId: string): Promise<OrderResponse> {
 export function getOrderByWithdrawal(withdrawalId: string): Promise<{ orderId: string }> {
   return api<{ orderId: string }>(`/v1/orders/by-withdrawal/${withdrawalId}`);
 }
+
+export interface DepositAddressResponse {
+  recipientAddress: string;
+  depositAddress:   string;
+  sourceChainName:  string;
+  hdIndex:          number;
+  createdAt:        string;
+}
+
+export function getDepositAddress(recipient: string): Promise<DepositAddressResponse> {
+  return api<DepositAddressResponse>(`/v1/deposit-address?recipient=${recipient}`);
+}
+
+export function listOrdersByRecipient(recipient: string, limit = 50): Promise<{ orders: OrderResponse[] }> {
+  return api<{ orders: OrderResponse[] }>(`/v1/orders?recipient=${recipient}&limit=${limit}`);
+}
