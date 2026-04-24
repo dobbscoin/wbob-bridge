@@ -136,11 +136,14 @@ export class DobbscoinTxBuilder {
       const prevHex = await rpc.getRawTransactionHex(utxo.txid);
       const prevBytes = Buffer.from(prevHex, 'hex');
 
-      // txid must be little-endian for @scure/btc-signer
-      const txidLE = Buffer.from(utxo.txid, 'hex').reverse();
-
+      // @scure/btc-signer accepts the txid in DISPLAY byte order (same as RPC
+      // returns) and reverses internally when serializing. Do NOT pre-reverse
+      // here — the raw tx's prev_hash field needs to be the REVERSE of the
+      // display txid, and btc-signer does that step for us. Empirically
+      // verified: pre-reversing produces a raw tx referencing a non-existent
+      // txid, causing `sendrawtransaction error -25`.
       tx.addInput({
-        txid: txidLE,
+        txid: Buffer.from(utxo.txid, 'hex'),
         index: utxo.vout,
         nonWitnessUtxo: prevBytes,
       });
