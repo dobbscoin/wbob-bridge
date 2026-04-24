@@ -66,7 +66,10 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
 
   await Promise.all([
-    server.listen({ port: config.port, host: '0.0.0.0' }),
+    // Bind to loopback by default; the public surface is the nginx vhost
+    // that reverse-proxies from `bridge.subgenius.finance:443`. Override via
+    // BIND_HOST=0.0.0.0 if you need direct external reachability (dev only).
+    server.listen({ port: config.port, host: process.env.BIND_HOST ?? '127.0.0.1' }),
     mintExecutor.start(),
     gnosisWatcher.start(),
     payoutExecutor.start(),

@@ -1,5 +1,5 @@
 [Unit]
-Description=wBOB Bridge — Next.js portal (dev mode)
+Description=wBOB Bridge — Next.js portal (production)
 After=network-online.target wbob-backend.service
 Wants=network-online.target
 
@@ -8,7 +8,9 @@ Type=simple
 WorkingDirectory=/home/btcbob/claude/wBOB/portal
 EnvironmentFile=/home/btcbob/claude/wBOB/portal/.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/local/bin/npm run dev -- --port 8888 --hostname 0.0.0.0
+# Pre-built (.next/) artifact must exist — run `npm run build` after code changes
+# before reloading this unit.  Bind to loopback only; nginx is the public face.
+ExecStart=/usr/local/bin/npm start -- --port 8888 --hostname 127.0.0.1
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
