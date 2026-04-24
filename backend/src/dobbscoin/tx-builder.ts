@@ -22,6 +22,8 @@ export interface UtxoInput {
   vout:     number;
   amountSat: bigint;
   hdIndex:  number;   // which HD index produced this address
+  /** Which HD path the address was derived from. Deposits → m/0/N, change → m/1/N. */
+  isChange: boolean;
 }
 
 export interface BuildTxResult {
@@ -165,7 +167,7 @@ export class DobbscoinTxBuilder {
     // ── Sign each input with the derived private key ───────────────────────
     for (let i = 0; i < selected.length; i++) {
       const utxo = selected[i]!;
-      const privKey = this.derivePrivKey(utxo.hdIndex);
+      const privKey = this.derivePrivKey(utxo.hdIndex, utxo.isChange);
       tx.sign(privKey, undefined, new Uint8Array([i]));
     }
 
@@ -190,9 +192,10 @@ export class DobbscoinTxBuilder {
   }
 
   /** Derive the private key for a given HD index. */
-  derivePrivKey(index: number): Uint8Array {
-    const child = this.rootKey.derive(`m/0/${index}`);
-    if (!child.privateKey) throw new Error(`No private key at index ${index}`);
+  derivePrivKey(index: number, isChange = false): Uint8Array {
+    const path = isChange ? `m/1/${index}` : `m/0/${index}`;
+    const child = this.rootKey.derive(path);
+    if (!child.privateKey) throw new Error(`No private key at ${path}`);
     return child.privateKey;
   }
 

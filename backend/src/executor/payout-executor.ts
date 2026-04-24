@@ -30,9 +30,12 @@ interface QueuedPayoutRow {
 }
 
 interface SignedPayoutRow {
-  order_id:   string;
-  payout_id:  string;
-  signed_hex: string;
+  order_id:       string;
+  payout_id:      string;
+  signed_hex:     string;
+  change_sat:     string | null;   // comes back as JSON string via metadata->>
+  change_address: string | null;
+  change_index:   string | null;
 }
 
 interface BroadcastPayoutRow {
@@ -48,14 +51,13 @@ interface BridgeUtxoRow {
   amount_sat: bigint;
   address:   string;
   hd_index:  number;
+  derivation_path: 'deposit' | 'change';
 }
 
 // ─── PayoutExecutor ───────────────────────────────────────────────────────────
 
 export class PayoutExecutor {
   private readonly txBuilder: DobbscoinTxBuilder;
-  private changeIndex = 0;
-
   constructor(
     private readonly sql: Sql,
     private readonly rpc: DobbscoinBackendRpc,
@@ -115,7 +117,7 @@ export class PayoutExecutor {
   private async _buildAndSignPayout(row: QueuedPayoutRow): Promise<void> {
     // Fetch available UTXOs
     const utxoRows = await this.sql<BridgeUtxoRow[]>`
-      SELECT id, txid, vout, amount_sat, address, hd_index
+      SELECT id, txid, vout, amount_sat, address, hd_index, derivation_path
       FROM bridge_utxos
       WHERE status = 'available'
       ORDER BY amount_sat DESC
@@ -130,9 +132,17 @@ export class PayoutExecutor {
       vout:      u.vout,
       amountSat: u.amount_sat,
       hdIndex:   u.hd_index,
+      isChange:  u.derivation_path === 'change',
     }));
 
-    const changeAddress = this.txBuilder.deriveChangeAddress(this.changeIndex);
+    // Allocate the next change index from DB (not an in-memory counter — that
+    // resets on restart and would reuse the same change address, and also
+    // desyncs across multiple backend instances).
+    const changeIdxRows = await this.sql<{ max: number | null }[]>`
+      SELECT MAX(hd_index) AS max FROM bridge_utxos WHERE derivation_path = 'change'
+    `;
+    const changeIndex = (changeIdxRows[0]?.max ?? -1) + 1;
+    const changeAddress = this.txBuilder.deriveChangeAddress(changeIndex);
 
     const result = await this.txBuilder.buildPayoutTx(
       utxos,
@@ -180,6 +190,8 @@ export class PayoutExecutor {
             signedHex: result.rawHex,
             feeSat: result.feeSat.toString(),
             changeSat: result.changeSat.toString(),
+            changeAddress: result.changeSat > 0n ? changeAddress : null,
+            changeIndex:   result.changeSat > 0n ? changeIndex   : null,
           })}
         )
       `;
@@ -201,19 +213,21 @@ export class PayoutExecutor {
       `;
     });
 
-    this.changeIndex++;
     console.log(`[payout-executor] signed payout orderId=${row.order_id} fee=${result.feeSat}`);
   }
 
   // ── Job 2: PAYOUT_SIGNED → PAYOUT_BROADCAST ──────────────────────────────
 
   private async broadcastSigned(): Promise<void> {
-    // Retrieve signed hex from the last audit_events entry
+    // Retrieve signed hex + change-output details from the PAYOUT_SIGNED audit row
     const signed = await this.sql<SignedPayoutRow[]>`
       SELECT
         bo.id AS order_id,
         p.id  AS payout_id,
-        (ae.metadata->>'signedHex') AS signed_hex
+        (ae.metadata->>'signedHex')     AS signed_hex,
+        (ae.metadata->>'changeSat')     AS change_sat,
+        (ae.metadata->>'changeAddress') AS change_address,
+        (ae.metadata->>'changeIndex')   AS change_index
       FROM bridge_orders bo
       JOIN withdrawal_requests wr ON wr.order_id = bo.id
       JOIN payouts p ON p.withdrawal_request_id = wr.id
@@ -242,6 +256,22 @@ export class PayoutExecutor {
             UPDATE bridge_utxos SET status = 'spent', updated_at = now()
             WHERE spent_payout_id = ${row.payout_id}
           `;
+
+          // Ingest the change output as a new spendable UTXO. Convention: the
+          // tx-builder always places change at vout=1 (recipient is vout=0),
+          // and emits no change output when changeSat <= dust threshold.
+          if (row.change_sat && BigInt(row.change_sat) > 0n
+              && row.change_address && row.change_index !== null) {
+            await tx`
+              INSERT INTO bridge_utxos
+                (order_id, txid, vout, amount_sat, address, hd_index, derivation_path, status)
+              VALUES
+                (${row.order_id}, ${txid}, 1, ${BigInt(row.change_sat)},
+                 ${row.change_address}, ${parseInt(row.change_index, 10)},
+                 'change', 'available')
+            `;
+          }
+
           await tx`
             UPDATE bridge_orders SET state = ${OutboundState.PAYOUT_BROADCAST}, updated_at = now()
             WHERE id = ${row.order_id}
