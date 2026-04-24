@@ -1,0 +1,18 @@
+[Unit]
+Description=wBOB Bridge — watcher signer 2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/btcbob/claude/wBOB/watcher
+EnvironmentFile=/home/btcbob/claude/wBOB/.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash -c 'export WATCHER_PRIVATE_KEY=$WATCHER_2_KEY && exec /usr/local/bin/npm start'
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

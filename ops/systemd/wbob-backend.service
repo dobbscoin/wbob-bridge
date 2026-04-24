@@ -1,0 +1,19 @@
+[Unit]
+Description=wBOB Bridge — backend API + executors
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/btcbob/claude/wBOB/backend
+EnvironmentFile=/home/btcbob/claude/wBOB/.env
+# Ensure node/npm are discoverable even with systemd's minimal PATH
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/npm start
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
