@@ -73,9 +73,16 @@ export class DobbscoinBackendRpc {
     return env.result;
   }
 
-  /** Returns raw transaction as hex string. */
+  /**
+   * Returns raw transaction as hex string.
+   *
+   * Dobbscoin is a pre-0.12 Bitcoin Core fork: the `verbose` flag must be
+   * passed as an int (0/1), not a bool — bool triggers
+   * `value is type bool, expected int`. (Note this is the opposite convention
+   * from `getblock` on the same node, which wants bool.)
+   */
   getRawTransactionHex(txid: string): Promise<string> {
-    return this.call<string>('getrawtransaction', [txid, false]);
+    return this.call<string>('getrawtransaction', [txid, 0]);
   }
 
   /** Returns current chain tip info. */
@@ -99,7 +106,7 @@ export class DobbscoinBackendRpc {
   async getConfirmations(txid: string): Promise<number> {
     type RawTx = { confirmations?: number };
     try {
-      const tx = await this.call<RawTx>('getrawtransaction', [txid, true]);
+      const tx = await this.call<RawTx>('getrawtransaction', [txid, 1]);
       return tx.confirmations ?? 0;
     } catch (e) {
       if (e instanceof RpcCallError && e.code === -5) return -1; // not found
