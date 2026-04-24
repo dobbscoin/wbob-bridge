@@ -125,7 +125,11 @@ export class DobbscoinTxBuilder {
     const inputTotal = selected.reduce((s, u) => s + u.amountSat, 0n);
     const changeSat = inputTotal - payoutAmountSat - feeSat;
 
-    const tx = new btc.Transaction();
+    // Dobbscoin is a pre-0.12 Bitcoin Core fork. Its consensus rules predate
+    // BIP68 (Bitcoin Core 0.11 introduced tx version 2), so it rejects v2 txs
+    // with `sendrawtransaction error -26: 64: version`. Default @scure/btc-signer
+    // emits v2; force v1 for broadcast acceptance.
+    const tx = new btc.Transaction({ version: 1 });
 
     // ── Add inputs ────────────────────────────────────────────────────────────
     for (const utxo of selected) {
