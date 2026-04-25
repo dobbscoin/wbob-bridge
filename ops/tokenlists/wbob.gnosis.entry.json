@@ -1,0 +1,8 @@
+{
+  "name": "Wrapped Dobbscoin on Gnosis",
+  "address": "0x13550ae65f22a36f60a50d625b70b58666488263",
+  "symbol": "wBOB",
+  "decimals": 8,
+  "chainId": 100,
+  "logoURI": "https://raw.githubusercontent.com/1Hive/default-token-list/master/src/assets/gnosis/0x13550ae65f22a36f60a50d625b70b58666488263/logo.png"
+}
