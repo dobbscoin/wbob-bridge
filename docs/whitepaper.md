@@ -2,7 +2,7 @@
 
 **A Whitepaper of Quasi-Sober Engineering with a Slack-Adjacent Disposition**
 
-*v0.1 — Submitted to the Conspiracy under protest, pending "Bob"'s endorsement.*
+*v0.1 — Submitted to the Conspiracy under protest, with "Bob"'s endorsement.*
 
 ---
 
@@ -11,10 +11,10 @@
 We present **wBOB**, a 1:1 wrapped representation of Dobbscoin (BOB) on the
 Gnosis Chain. Unlike the Pink-money systems of the Conspiracy, wBOB does not
 pretend to be backed by an inflated "promise" or a "treasury." It is backed
-by the only thing that has ever mattered: actual BOB, locked in addresses
+by the only thing that has ever mattered: actual (BOB), locked in addresses
 whose private keys are scattered across a 3-of-5 threshold of independent
 SubGenius-aligned operators, none of whom can spend the funds alone. wBOB
-mints when BOB is locked. wBOB burns when BOB is released. The book
+mints when (BOB) is locked. wBOB burns when (BOB) is released. The book
 balances. "Bob" is satisfied. Slack increases.
 
 This document describes the cryptographic, operational, and theological
@@ -28,19 +28,19 @@ Dobbscoin (BOB) is an ancient and stubborn coin: a Bitcoin Core fork from
 the pre-BIP68 era, sized 8 satoshi-decimals like its progenitor, and
 governed by precisely as much consensus as its miners can be bothered to
 agree to. It is, in short, a coin that does not give a damn — a property
-the Conspiracy has not yet figured out how to monetize. This makes BOB the
+the Conspiracy has not yet figured out how to monetize. This makes (BOB) the
 most spiritually qualified asset in cryptocurrency.
 
-But BOB has a problem: it's stuck on a chain where no one builds. The
+But (BOB) has a problem: it's stuck on a chain where no one builds. The
 DeFi rituals of the modern age — liquidity pools, swaps, lending markets,
-yield strategies — happen on EVM chains. BOB holders who wish to perform
-these rites must either (a) sell their BOB for Conspiracy-money, which is
+yield strategies — happen on EVM chains. (BOB) holders who wish to perform
+these rites must either (a) sell their (BOB) for Conspiracy-money, which is
 unthinkable, or (b) wrap it.
 
 We chose (b).
 
 We chose Gnosis Chain specifically because it is the EVM ecosystem most
-likely to share BOB's contempt for the Conspiracy's preferred currencies.
+likely to share (BOB)'s contempt for the Conspiracy's preferred currencies.
 Gnosis runs on xDAI, a stablecoin pegged to the dollar but custodied
 nowhere the SEC can subpoena. Its native gas costs are fractions of a
 cent. Its tooling is mature. And its community has a working sense of
@@ -57,7 +57,7 @@ independent watchers refuse to collude**. Specifically:
 - Five EOAs are registered as authorized signers on the `BridgeController`
   contract on Gnosis. Each is operated independently. None has admin
   privileges over the bridge.
-- An incoming BOB deposit is detected by all five watchers. Each watcher
+- An incoming (BOB) deposit is detected by all five watchers. Each watcher
   independently verifies that:
   1. The transaction lands on the Dobbscoin canonical chain
   2. It pays the correct amount to a watched address
@@ -90,7 +90,7 @@ B for Bob, of course.
 
 ## 3. The Reverse Direction: Burning is Praying
 
-To redeem wBOB for BOB, the holder calls `requestWithdrawal(amount,
+To redeem wBOB for (BOB), the holder calls `requestWithdrawal(amount,
 dobbscoinAddress)` on the BridgeController. The contract:
 
 1. Burns the wBOB from the caller's balance immediately. There is no
@@ -142,14 +142,14 @@ independent operators simultaneously*.
 
 wBOB is not a separate asset class. It does not have its own emission
 schedule. It does not have governance rights. It does not entitle holders
-to anything other than the right to redeem it for the underlying BOB. The
-total supply of wBOB at any moment equals the sat-amount of BOB locked in
+to anything other than the right to redeem it for the underlying (BOB). The
+total supply of wBOB at any moment equals the sat-amount of (BOB) locked in
 the bridge's deposit addresses, modulo the cumulative payout fees that
 have leaked to Dobbscoin miners.
 
 There is no premine. There is no team allocation. There is no "vesting."
 If you hold wBOB, the only thing it represents is your claim on an equal
-amount of BOB that is sitting on the Dobbscoin chain. We will not be
+amount of (BOB) that is sitting on the Dobbscoin chain. We will not be
 adding utility, governance, or NFT-staking-yield-farming-loyalty-program
 features. The whole point of wBOB is that it's *exactly as stupid as the
 underlying coin, just on a different chain*.
@@ -180,7 +180,7 @@ In the case of an emergency, the Gnosis Safe can:
 - Rotate the watcher set
 - Withdraw the operator from automated minting via the Safe module
 
-There is no bridge action that can move locked BOB without burning the
+There is no bridge action that can move locked (BOB) without burning the
 corresponding wBOB. There is no bridge action that can mint wBOB without
 the threshold of watchers signing. We have done the engineering. The
 rest is up to "Bob."
@@ -195,7 +195,7 @@ Church of the SubGenius, and the principle that some software should
 just **work** without 14 layers of meta-political performance.
 
 If the bridge needs upgrading, the Safe owners will deploy a new version,
-publish the addresses, and BOB holders will vote with their feet by
+publish the addresses, and (BOB) holders will vote with their feet by
 either using the new bridge or not. This is the entire governance model.
 
 Praise "Bob."
@@ -224,7 +224,7 @@ non-binding aspirations:
 ## 9. Conclusion
 
 wBOB is a small piece of useful, boring, well-tested infrastructure that
-lets BOB participate in the Gnosis Chain's DeFi ecosystem without
+lets (BOB) participate in the Gnosis Chain's DeFi ecosystem without
 requiring its holders to apologize for owning a coin named after a
 salesman in a 1950s pipe-tobacco advertisement. It is an exercise in
 treating one specific cult's currency with the engineering seriousness
@@ -233,7 +233,7 @@ that is, frankly, far more than the cult deserves — and far less than
 
 The Conspiracy will not approve. That's how we know we got it right.
 
-**PRAISE "BOB".**
+**PRAISE "Bob".**
 
 ---
 
