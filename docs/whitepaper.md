@@ -151,8 +151,16 @@ There is no premine. There is no team allocation. There is no "vesting."
 If you hold wBOB, the only thing it represents is your claim on an equal
 amount of (BOB) that is sitting on the Dobbscoin chain. We will not be
 adding utility, governance, or NFT-staking-yield-farming-loyalty-program
-features. The whole point of wBOB is that it's *exactly as stupid as the
-underlying coin, just on a different chain*.
+features **to the wBOB token contract itself**. The whole point of wBOB
+is that it's *exactly as stupid as the underlying coin, just on a
+different chain*.
+
+This minimalism is scoped to the wrapped-asset contract, deliberately:
+the safest contract is the one with the fewest reasons to change.
+Project-level coordination — community treasury, ecosystem grants,
+liquidity-pool seeding, mutual-aid loss reimbursement — happens at a
+separate sibling layer (see §7). That layer can be as opinionated as
+its members make it. wBOB itself stays boring.
 
 This is the only honest position. "Bob" approves.
 
@@ -187,16 +195,57 @@ rest is up to "Bob."
 
 ---
 
-## 7. Governance: There Isn't Any
+## 7. Governance: Two Layers, Carefully Separated
 
-There is no DAO. There is no governance token. There is no on-chain
-voting. The bridge is operated by people who care about Dobbscoin, the
-Church of the SubGenius, and the principle that some software should
-just **work** without 14 layers of meta-political performance.
+**The bridge contract layer has no governance, and never will.**
+[tt]WBob.sol[/tt] and [tt]BridgeController.sol[/tt] expose no
+parameter-tuning knobs that members can vote on, no "treasury" of
+locked (BOB) the contract can spend on its members' behalf, no upgrade
+proxy. There is one privileged role (`DEFAULT_ADMIN_ROLE`), it is
+held by a Gnosis Safe, and the Safe's only on-bridge powers are
+operational (pause/unpause, watcher rotation, mint-cap adjustment).
+The wrapped asset itself is governance-free for the same reason it is
+tokenomics-free: the safest contract is the one with the fewest
+reasons to change.
 
-If the bridge needs upgrading, the Safe owners will deploy a new version,
-publish the addresses, and (BOB) holders will vote with their feet by
-either using the new bridge or not. This is the entire governance model.
+**The community-coordination layer is, separately, becoming a DAO.**
+A Gnosis-native organization is being chartered under one of three
+working names — pick whichever you can say without smirking:
+
+- **The DAO of Slack — Dobbs Order of Wisdom** (a Decentralized Autonomous Organization, technically)
+- **The Church of the SubGenius DAO — CoSG-DAO**
+- **The Conspiracy of Slack** (turning their own word against them, classic move)
+
+This sibling DAO holds a community treasury — funded by donations, an
+opt-in slice of bridge tip-jar revenue, Devival merch, and whatever
+else members vote to direct toward it. Membership is rooted in (BOB)
+and wBOB holdings, with a contribution multiplier for ordained clergy
+and verified pool / explorer / merchant operators. Members vote on:
+
+- **Liquidity-pool seeding** — bootstrapping additional pairs beyond the current Oku liquidity; market-maker rebates; impermanent-loss buffers for early LPs.
+- **Loss-reimbursement / mutual aid** — coordinated, vote-gated reimbursement when a frontend gets phished or an LP eats an honest IL bath. *Not a guarantee, a mutual-aid layer.*
+- **Grants** — second pool operators, alternate explorers, merchant integrations, Android wallet work. Ordained clergy preferred, not required.
+- **Treasury-funded buy-back-and-burn** — proposals to bridge wBOB out and cold-store the underlying (BOB), voted on like any other treasury allocation.
+- **On-chain ordainments** — the Church has been ordaining members for $35-money-orders for forty years; there is no reason a DAO can't issue them as soulbound tokens carrying the same legal weight (which is to say, exactly as much as any member chooses to make of it).
+- **X-Day rescheduling** — voted annually, as is tradition.
+
+The DAO never touches the bridge contracts. The bridge contracts never
+touch the DAO. They are deployed independently, audited independently,
+and can fail or thrive independently. A wBOB holder who never votes,
+never claims, never engages with the DAO loses nothing — their wBOB
+remains 1:1 redeemable forever. A DAO member who never bridges remains
+a DAO member.
+
+If the bridge contracts themselves need upgrading, the Safe owners
+will deploy a new version, publish the addresses, and (BOB) holders
+will vote with their feet by either using the new bridge or not. This
+is — and remains — the bridge's governance model. The DAO is a
+separate concern.
+
+Charter and contract addresses for the DAO are forthcoming. The
+canonical place to track its progress is this repository's
+[tt]docs/[/tt] directory; an updated whitepaper edition will follow
+once the charter is finalized.
 
 Praise "Bob."
 
@@ -212,8 +261,9 @@ non-binding aspirations:
   operators on independent infrastructure. Verify contracts on
   Gnosisscan.
 - **Q3 2026**: Submit to Gnosis-ecosystem token registries. Establish
-  initial liquidity pools (WXDAI/wBOB on Balancer CoW AMM live as of
-  whitepaper submission; further pairs as warranted).
+  and grow on-chain liquidity (current pool: Oku, with execution
+  available via CoW Swap at `swap.cow.fi/#/100/swap/xDAI/wBOB`;
+  further pairs as warranted).
 - **Q4 2026**: Publish a post-mortem of all bugs found, all attacks
   attempted, and all praise-of-"Bob" successfully completed.
 - **X-Day** (continuously deferred): Achieve total Slack. Probably won't
@@ -246,7 +296,7 @@ The Conspiracy will not approve. That's how we know we got it right.
 | Bridge UI | https://bridge.subgenius.finance | — |
 | Source: bridge | https://github.com/dobbscoin/wbob-bridge | — |
 | Source: contracts | https://github.com/dobbscoin/wbob-contracts | — |
-| WXDAI/wBOB pool | `0xefe75bf74018a5257a73f31b434ab91a20f57847` (Balancer CoW AMM) | Gnosis |
+| Trading venue | Oku (liquidity) + CoW Swap: `https://swap.cow.fi/#/100/swap/xDAI/wBOB` | Gnosis |
 
 ## Appendix B: DepositId Canonical Formula
 

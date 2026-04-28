@@ -1,5 +1,7 @@
 # wBOB Bridge — Project Guide
 
+@~/claude/dobbscoin-facts.md
+
 Dobbscoin (BOB) ↔ Gnosis wBOB application-specific lock/mint + burn/release bridge.
 
 ## Repo layout
@@ -104,7 +106,7 @@ bridge.executeMint(auth, sigs);
 | MAX_SIGNERS | 5 |
 | THRESHOLD | 3 |
 | wBOB decimals | 8 |
-| MAX_SUPPLY | 21,000,000 BOB (configurable at deploy) |
+| MAX_SUPPLY | wBOB ERC-20 deploy-time ceiling, set at deployment as a defence-in-depth cap. **Not** a reflection of (BOB)'s chain supply — the (BOB) chain has no hard supply cap; see `~/claude/dobbscoin-facts.md`. |
 | Daily mint limit | 1,000,000 BOB/day (admin-adjustable) |
 | Confirmation threshold | 6 (Dobbscoin, configurable via FINAL_CONFIRMATIONS env) |
 | Min confirmations | 3 (configurable via MIN_CONFIRMATIONS env) |
