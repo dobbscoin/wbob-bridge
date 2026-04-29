@@ -129,6 +129,27 @@ export interface BridgeStateRow {
   updated_at: Date;
 }
 
+// ─── gas_drips ───────────────────────────────────────────────────────────────
+
+export type GasDripStatus =
+  | 'opted_in'
+  | 'opted_out'
+  | 'sent'
+  | 'failed'
+  | 'wallet_dry';
+
+export interface GasDripRow {
+  recipient_gnosis_address: string;
+  status:                   GasDripStatus;
+  order_id:                 string | null;
+  amount_wei:               string | null; // NUMERIC(78,0) → string
+  gnosis_tx_hash:           string | null;
+  error:                    string | null;
+  created_at:               Date;
+  updated_at:               Date;
+  sent_at:                  Date | null;
+}
+
 // ─── audit_events ────────────────────────────────────────────────────────────
 
 export interface AuditEventRow {

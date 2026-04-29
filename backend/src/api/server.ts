@@ -10,6 +10,7 @@ import { quotesRoute } from './routes/quotes.js';
 import { depositAddressRoute } from './routes/deposit-address.js';
 import { ordersRoute } from './routes/orders.js';
 import { healthRoute } from './routes/health.js';
+import { dripRoute } from './routes/drip.js';
 import type { BackendConfig } from '../config.js';
 import type { SolvencyMonitor } from '../monitor/solvency-monitor.js';
 
@@ -28,6 +29,7 @@ export async function buildServer(opts: {
   await fastify.register(depositAddressRoute, opts);     // modern: persistent address per recipient
   await fastify.register(ordersRoute, { sql: opts.sql });
   await fastify.register(healthRoute, { monitor: opts.monitor });
+  await fastify.register(dripRoute, { sql: opts.sql, config: opts.config });
 
   // Legacy liveness probe (kept for backwards compat)
   fastify.get('/health', async () => ({ status: 'ok' }));

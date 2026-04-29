@@ -25,7 +25,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   <span className="text-sm text-gray-500">Bridge</span>
                 </a>
                 <nav className="hidden sm:flex items-center gap-6 text-sm text-gray-400">
-                  <a href="/deposit"  className="hover:text-gray-100 transition-colors">Deposit</a>
+                  <a href="/"         className="hover:text-gray-100 transition-colors">Bridge</a>
+                  <a href="/trade"    className="hover:text-gray-100 transition-colors">Trade</a>
                   <a href="/withdraw" className="hover:text-gray-100 transition-colors">Withdraw</a>
                 </nav>
                 <ConnectButton

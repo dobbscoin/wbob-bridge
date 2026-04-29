@@ -17,6 +17,12 @@ import type { BackendConfig } from '../../config.js';
 
 interface DepositAddressQuery {
   recipient: string;
+  /**
+   * Drip-opt-in flag (Option 2 onboarding). Default true.
+   * Stored on first allocation; cannot be changed via this endpoint
+   * once set (preserves "one drip per address ever" with idempotent calls).
+   */
+  optInDrip?: 'true' | 'false';
 }
 
 interface DepositAddressResponse {
@@ -50,20 +56,34 @@ export async function depositAddressRoute(
         required: ['recipient'],
         properties: {
           recipient: { type: 'string' },
+          optInDrip: { type: 'string', enum: ['true', 'false'] },
         },
       },
     },
   }, async (request, reply) => {
-    const { recipient } = request.query;
+    const { recipient, optInDrip } = request.query;
 
     if (!isValidAddress(recipient)) {
       return reply.status(400).send({ error: 'Invalid recipient: must be a 0x Gnosis address' });
     }
 
     const chain = opts.config.sourceChainName;
+    const dripOptIn = optInDrip !== 'false'; // default true
 
     try {
       const row = await opts.sql.begin(async (tx) => {
+        // Always record drip preference on first call. ON CONFLICT preserves
+        // the *first* preference set — calls after that are no-ops, regardless
+        // of optInDrip value, so users can't flip-flop their decision.
+        if (opts.config.dripEnabled) {
+          const status = dripOptIn ? 'opted_in' : 'opted_out';
+          await tx`
+            INSERT INTO gas_drips (recipient_gnosis_address, status)
+            VALUES (${recipient}, ${status})
+            ON CONFLICT (recipient_gnosis_address) DO NOTHING
+          `;
+        }
+
         // Return the most recently created address for this recipient, if any.
         const existing = await tx<DepositAddressRow[]>`
           SELECT recipient_gnosis_address, source_chain_name, dobbscoin_address, hd_index, created_at

@@ -30,6 +30,7 @@ import type { Sql } from 'postgres';
 import { InboundState, assertInboundTransition, type Address, type Hex } from '@wbob/shared';
 import { hexToBuffer, bufferToHex } from '../db/hex.js';
 import type { BackendConfig } from '../config.js';
+import type { DripSender } from './drip-sender.js';
 
 // ─── ABI ─────────────────────────────────────────────────────────────────────
 
@@ -82,6 +83,7 @@ export class MintExecutor {
   constructor(
     private readonly sql: Sql,
     private readonly config: BackendConfig,
+    private readonly dripSender: DripSender | null = null,
   ) {
     this.account = privateKeyToAccount(config.executorPrivateKey as ViemHex);
     this.publicClient = createPublicClient({
@@ -343,6 +345,32 @@ export class MintExecutor {
         );
 
         console.log(`[executor] mint confirmed orderId=${row.order_id}`);
+
+        // ── Gas drip (Option 2) ─────────────────────────────────────────
+        // Fire-and-log only — failures must not affect the mint outcome.
+        if (this.dripSender) {
+          try {
+            const [recip] = await this.sql<{ user_gnosis_address: string; amount_sat: bigint }[]>`
+              SELECT user_gnosis_address, amount_sat
+              FROM bridge_orders
+              WHERE id = ${row.order_id}
+            `;
+            if (recip?.user_gnosis_address && recip.amount_sat) {
+              const decision = await this.dripSender.sendDripIfEligible(
+                recip.user_gnosis_address,
+                row.order_id,
+                recip.amount_sat,
+              );
+              console.log(
+                `[executor] drip orderId=${row.order_id} recipient=${recip.user_gnosis_address} outcome=${decision.outcome}` +
+                  (decision.txHash ? ` tx=${decision.txHash}` : '') +
+                  (decision.message ? ` ${decision.message}` : ''),
+              );
+            }
+          } catch (err) {
+            console.error(`[executor] drip threw (mint already completed) orderId=${row.order_id}:`, err);
+          }
+        }
       } catch (err) {
         console.error(`[executor] confirmSubmittedMints error orderId=${row.order_id}:`, err);
       }

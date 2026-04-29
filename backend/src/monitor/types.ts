@@ -8,7 +8,9 @@ export type AlertType =
   | 'SOLVENCY_BREACH'     // wBOB supply > UTXO pool (bridge underwater)
   | 'SOLVENCY_RECOVERED'  // previously breached, now back above 1:1
   | 'LOW_UTXO_POOL'       // UTXO pool below configurable warning threshold
-  | 'STUCK_ORDERS';       // one or more orders have not advanced state in too long
+  | 'STUCK_ORDERS'        // one or more orders have not advanced state in too long
+  | 'DRIP_WALLET_LOW'     // gas-drip hot wallet xDAI balance below low-water mark
+  | 'DRIP_WALLET_DRY';    // gas-drip hot wallet has < drip amount; users being skipped
 
 export interface Alert {
   level: AlertLevel;

@@ -125,6 +125,8 @@ export function buildAlerts(
   }
 
   // ── Stuck orders ─────────────────────────────────────────────────────────
+  // (drip-wallet alerts are produced by checkDripWalletBalance, not here, since
+  //  they don't fit in the SolvencySnapshot.)
   if (snapshot.stuckOrderCount > 0) {
     alerts.push({
       level: 'warning',
@@ -137,5 +139,56 @@ export function buildAlerts(
     });
   }
 
+  return alerts;
+}
+
+// ─── checkDripWalletBalance ──────────────────────────────────────────────────
+
+/**
+ * Decide whether the drip wallet's balance warrants an alert.
+ *
+ *   balance < dripAmountWei      → DRIP_WALLET_DRY (critical — users skipped)
+ *   balance < lowWaterMarkWei    → DRIP_WALLET_LOW (warning — refill soon)
+ *   otherwise                    → no alert
+ */
+export function checkDripWalletBalance(
+  walletAddress: string,
+  balanceWei: bigint,
+  dripAmountWei: bigint,
+  lowWaterMarkWei: bigint,
+  checkedAt: string = new Date().toISOString(),
+): Alert[] {
+  const alerts: Alert[] = [];
+  if (balanceWei < dripAmountWei) {
+    alerts.push({
+      level: 'critical',
+      type: 'DRIP_WALLET_DRY',
+      timestamp: checkedAt,
+      message:
+        `Drip wallet ${walletAddress} balance ${balanceWei} wei is below the ` +
+        `drip amount ${dripAmountWei} wei. New users opted-in for a drip ` +
+        `are being skipped on mint until the wallet is refilled.`,
+      data: {
+        walletAddress,
+        balanceWei: balanceWei.toString(),
+        dripAmountWei: dripAmountWei.toString(),
+      },
+    });
+  } else if (balanceWei < lowWaterMarkWei) {
+    alerts.push({
+      level: 'warning',
+      type: 'DRIP_WALLET_LOW',
+      timestamp: checkedAt,
+      message:
+        `Drip wallet ${walletAddress} balance ${balanceWei} wei is below the ` +
+        `low-water mark ${lowWaterMarkWei} wei. Refill soon to avoid stalling ` +
+        `new-user onboarding.`,
+      data: {
+        walletAddress,
+        balanceWei: balanceWei.toString(),
+        lowWaterMarkWei: lowWaterMarkWei.toString(),
+      },
+    });
+  }
   return alerts;
 }

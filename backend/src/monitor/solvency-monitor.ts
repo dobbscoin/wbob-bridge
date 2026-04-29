@@ -21,8 +21,9 @@ import { gnosis } from 'viem/chains';
 import type { Sql } from 'postgres';
 import type { BackendConfig } from '../config.js';
 import type { SolvencySnapshot, AlertType } from './types.js';
-import { checkSolvency, checkStuckOrders, buildAlerts } from './checks.js';
+import { checkSolvency, checkStuckOrders, buildAlerts, checkDripWalletBalance } from './checks.js';
 import { AlertDispatcher } from './webhook.js';
+import type { DripSender } from '../executor/drip-sender.js';
 
 const TOTAL_SUPPLY_ABI = parseAbiItem('function totalSupply() view returns (uint256)');
 
@@ -39,12 +40,16 @@ export class SolvencyMonitor {
   constructor(
     private readonly sql: Sql,
     private readonly config: BackendConfig,
+    private readonly dripSender: DripSender | null = null,
   ) {
     this.publicClient = createPublicClient({
       chain: gnosis,
       transport: http(config.gnosisRpcUrl),
     });
-    this.dispatcher = new AlertDispatcher(config.alertWebhookUrl);
+    this.dispatcher = new AlertDispatcher({
+      webhookUrl: config.alertWebhookUrl,
+      emailTo:    config.alertEmailTo,
+    });
   }
 
   /** Latest snapshot — exposed to the health endpoint. */
@@ -139,6 +144,25 @@ export class SolvencyMonitor {
       previouslySolvent,
       BigInt(this.config.lowUtxoThresholdSat),
     );
+
+    // ── Drip wallet balance (Option 2) ──────────────────────────────────────
+    if (this.dripSender) {
+      try {
+        const balance = await this.dripSender.getWalletBalanceWei();
+        alerts.push(
+          ...checkDripWalletBalance(
+            this.dripSender.walletAddress,
+            balance,
+            this.config.dripAmountWei,
+            this.config.dripLowWaterMarkWei,
+            checkedAt,
+          ),
+        );
+      } catch (err) {
+        console.error('[solvency-monitor] drip wallet balance read failed:', err);
+      }
+    }
+
     const now = Date.now();
     for (const alert of alerts) {
       const lastFired = this.alertCooldowns.get(alert.type) ?? 0;

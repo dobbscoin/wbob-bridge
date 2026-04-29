@@ -59,10 +59,39 @@ export interface DepositAddressResponse {
   createdAt:        string;
 }
 
-export function getDepositAddress(recipient: string): Promise<DepositAddressResponse> {
-  return api<DepositAddressResponse>(`/v1/deposit-address?recipient=${recipient}`);
+export function getDepositAddress(
+  recipient: string,
+  optInDrip: boolean = true,
+): Promise<DepositAddressResponse> {
+  const optInParam = optInDrip ? 'true' : 'false';
+  return api<DepositAddressResponse>(
+    `/v1/deposit-address?recipient=${recipient}&optInDrip=${optInParam}`,
+  );
 }
 
 export function listOrdersByRecipient(recipient: string, limit = 50): Promise<{ orders: OrderResponse[] }> {
   return api<{ orders: OrderResponse[] }>(`/v1/orders?recipient=${recipient}&limit=${limit}`);
+}
+
+// ─── Gas drip ────────────────────────────────────────────────────────────────
+
+export type DripStatus =
+  | 'opted_in'
+  | 'opted_out'
+  | 'sent'
+  | 'failed'
+  | 'wallet_dry'
+  | 'no_record';
+
+export interface DripStatusResponse {
+  enabled: boolean;
+  recipient: string;
+  status: DripStatus;
+  amountWei: string | null;
+  gnosisTxHash: string | null;
+  sentAt: string | null;
+}
+
+export function getDripStatus(recipient: string): Promise<DripStatusResponse> {
+  return api<DripStatusResponse>(`/v1/drip/${recipient}`);
 }

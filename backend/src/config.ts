@@ -80,6 +80,23 @@ export interface BackendConfig {
   dobbscoinChainId: bigint;
   /** Source chain name for depositId computation. */
   sourceChainName: string;
+
+  // ── Gas drip (Option 2 onboarding) ────────────────────────────────────────
+  /** Master switch — when false, no drips ever, no wallet config required. */
+  dripEnabled: boolean;
+  /**
+   * Drip hot-wallet private key. Separate EOA from the executor.
+   * Required when dripEnabled=true; otherwise unused.
+   */
+  dripHotWalletPrivateKey: Hex | null;
+  /** Drip amount in wei. Default 5e16 = 0.05 xDAI. */
+  dripAmountWei: bigint;
+  /** Minimum bridged amount (sat) to qualify for a drip. Default 1_000_000 = 0.01 BOB. */
+  dripMinDepositSat: bigint;
+  /** Drip wallet balance (wei) below which the monitor pages ops. Default 1e18 = 1 xDAI. */
+  dripLowWaterMarkWei: bigint;
+  /** Email recipient for ops alerts (drip wallet low, etc.). Sent via local sendmail. */
+  alertEmailTo: string | null;
 }
 
 function requireEnv(key: string): string {
@@ -94,6 +111,22 @@ function optionalEnvInt(key: string, def: number): number {
   const n = parseInt(val, 10);
   if (isNaN(n)) throw new Error(`${key} must be an integer, got: ${val}`);
   return n;
+}
+
+function optionalEnvBool(key: string, def: boolean): boolean {
+  const val = process.env[key];
+  if (val === undefined) return def;
+  return val.toLowerCase() === 'true' || val === '1';
+}
+
+function optionalEnvBigInt(key: string, def: bigint): bigint {
+  const val = process.env[key];
+  if (!val) return def;
+  try {
+    return BigInt(val);
+  } catch {
+    throw new Error(`${key} must be a base-10 integer, got: ${val}`);
+  }
 }
 
 export function loadConfig(): BackendConfig {
@@ -133,5 +166,12 @@ export function loadConfig(): BackendConfig {
     dobbscoinNetwork:           network,
     dobbscoinChainId:           DOBBSCOIN_CHAIN_IDS[network],
     sourceChainName:            `dobbscoin-${network}`,
+
+    dripEnabled:                optionalEnvBool('DRIP_ENABLED', false),
+    dripHotWalletPrivateKey:    (process.env['DRIP_HOT_WALLET_PRIVATE_KEY'] ?? null) as Hex | null,
+    dripAmountWei:              optionalEnvBigInt('DRIP_AMOUNT_WEI', 50_000_000_000_000_000n),
+    dripMinDepositSat:          optionalEnvBigInt('DRIP_MIN_DEPOSIT_SAT', 1_000_000n),
+    dripLowWaterMarkWei:        optionalEnvBigInt('DRIP_LOW_WATER_MARK_WEI', 1_000_000_000_000_000_000n),
+    alertEmailTo:               process.env['ALERT_EMAIL_TO'] ?? null,
   };
 }
