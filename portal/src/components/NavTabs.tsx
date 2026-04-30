@@ -26,8 +26,8 @@ export function NavTabs() {
               className={
                 'rounded-t-md border px-4 py-1.5 text-sm transition-colors ' +
                 (active
-                  ? 'border-gray-800 border-b-transparent bg-gray-950 text-bob-300 font-semibold'
-                  : 'border-gray-800 bg-gray-900/60 text-gray-400 hover:text-gray-100 hover:bg-gray-900')
+                  ? 'border-[#8b6f3e] border-b-transparent bg-[#e8cf9d] text-[#3a2a14] font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.4)]'
+                  : 'border-[#8b6f3e] bg-[#c9a86a] text-[#4a3618] hover:bg-[#d4b67a]')
               }
             >
               {t.label}

@@ -89,8 +89,8 @@ export default function TestBedPage() {
             <p className="text-sm text-gray-400">
               Bridge (BOB) → wBOB on Gnosis, ..and if ya want, trade a sliver
               for WXDAI in the process; so you can transact without hunting
-              for gas, &apos;cos transactions require gas to process. Same
-              bridge, lower learning curve.
+              for gas, &apos;cos transactions require gas to process.
+              <span className="block">Same bridge, lower learning curve.</span>
               <span className="block text-right">—Praise &quot;Bob&quot;.</span>
             </p>
           </div>
