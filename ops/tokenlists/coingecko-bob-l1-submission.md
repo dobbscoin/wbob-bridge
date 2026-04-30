@@ -100,14 +100,14 @@ Because wBOB is 1:1 redeemable for native BOB through the bridge at
 https://bridge.subgenius.finance, the WXDAI/wBOB market on Gnosis is
 also the canonical USD-equivalent price reference for native BOB.
 
-## You-fill-this fields
+## Social / community fields
 
-- [ ] Twitter / X handle
-- [ ] Telegram group
-- [ ] Discord invite (existing SubGenius / Dobbscoin server)
-- [ ] Reddit (r/SubGenius? r/Dobbscoin?)
-- [ ] Bitcointalk ANN thread (link the most-active current ANN)
-- [ ] Whitepaper URL (or use the architecture reference: `github.com/dobbscoin/wbob-bridge/blob/master/CLAUDE.md`)
+- Twitter / X: https://x.com/Dobbscoin
+- Telegram: https://t.me/+_alqp0yLOIs1ZmMx (SubGenius.Finance)
+- Discord: https://discord.gg/xbeeAwp3Z5
+- Reddit: https://reddit.com/r/Dobbscoin
+- Bitcointalk ANN (2014): https://bitcointalk.org/index.php?topic=792459.0
+- Whitepaper: https://github.com/dobbscoin/wbob-bridge/blob/master/docs/whitepaper.md
 
 ## Notes for the reviewer (additional-context field)
 

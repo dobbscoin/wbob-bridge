@@ -38,8 +38,8 @@ For listing context see https://support.coingecko.com/hc/en-us/sections/32146983
 > 2014 (the official cryptocurrency of the Church of the SubGenius).
 > Backed 1:1 by native BOB locked in a 3-of-5 threshold-signed bridge
 > between the Dobbscoin L1 and Gnosis Chain. Brings Dobbscoin liquidity
-> into Gnosis DeFi (CoW Swap, Oku, Balancer-style AMMs) while preserving
-> custody of the underlying.
+> into Gnosis DeFi (CoW Swap, Oku) while preserving custody of the
+> underlying.
 
 ## Markets / liquidity
 
@@ -55,15 +55,14 @@ contract `0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d`). This pair is the
 canonical price-discovery venue for both wBOB and (by 1:1 bridge backing)
 BOB itself.
 
-## You-fill-this fields (CoinGecko nearly always asks)
+## Social / community fields
 
-- [ ] Twitter / X handle
-- [ ] Telegram group
-- [ ] Discord invite
-- [ ] Reddit (r/SubGenius? r/Dobbscoin?)
-- [ ] Whitepaper URL — `github.com/dobbscoin/wbob-bridge/blob/master/CLAUDE.md`
-      is the architecture reference; if a formal whitepaper is needed, link
-      the bitcointalk ANN thread instead
+- Twitter / X: https://x.com/Dobbscoin
+- Telegram: https://t.me/+_alqp0yLOIs1ZmMx (SubGenius.Finance)
+- Discord: https://discord.gg/xbeeAwp3Z5
+- Reddit: https://reddit.com/r/Dobbscoin
+- Bitcointalk ANN (2014): https://bitcointalk.org/index.php?topic=792459.0
+- Whitepaper: https://github.com/dobbscoin/wbob-bridge/blob/master/docs/whitepaper.md
 
 ## Notes for the reviewer (paste in any "additional context" field)
 
