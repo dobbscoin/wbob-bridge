@@ -26,11 +26,17 @@ export interface SolvencySnapshot {
   wBobSupplySat: bigint;
   /** Sum of bridge_utxos with status='available'. */
   utxoPoolSat: bigint;
+  /**
+   * Sum of fee_sat across broadcast/confirmed payouts. The bridge subsidises
+   * Dobbscoin network fees on withdrawals, so this amount has left the pool
+   * but never left wBOB supply. Solvency math adds it back to the pool side.
+   */
+  cumulativeFeesPaidSat: bigint;
   /** Sum of amount_sat on non-terminal outbound orders. */
   pendingPayoutsSat: bigint;
-  /** utxoPoolSat / wBobSupplySat. 1 = exactly covered. */
+  /** (utxoPoolSat + cumulativeFeesPaidSat) / wBobSupplySat. 1 = exactly covered. */
   coverageRatio: number;
-  /** True iff utxoPoolSat >= wBobSupplySat. */
+  /** True iff utxoPoolSat + cumulativeFeesPaidSat >= wBobSupplySat. */
   isSolvent: boolean;
   /** Number of orders stuck in non-terminal state past the configured threshold. */
   stuckOrderCount: number;

@@ -18,19 +18,29 @@ export interface SolvencyResult {
 /**
  * Determine whether the bridge UTXO pool covers the total wBOB supply.
  *
- * @param wBobSupplySat  Total wBOB minted (satoshi units, from chain or DB).
- * @param utxoPoolSat    Sum of available bridge UTXOs (satoshi units).
+ * The bridge subsidises Dobbscoin network fees on every withdrawal: a payout
+ * sends the user the full burned amount and the fee comes out of the bridge's
+ * own UTXO inputs. Cumulative paid fees therefore make the raw pool drift
+ * below supply by exactly that amount, even though no funds are missing. We
+ * add fees-paid to the pool side so the comparison reflects the funds the
+ * operator has *committed*, not just the funds still on hand.
+ *
+ * @param wBobSupplySat        Total wBOB minted (satoshi units, from chain or DB).
+ * @param utxoPoolSat          Sum of available bridge UTXOs (satoshi units).
+ * @param cumulativeFeesPaidSat Sum of fee_sat across broadcast/confirmed payouts.
  */
 export function checkSolvency(
   wBobSupplySat: bigint,
   utxoPoolSat: bigint,
+  cumulativeFeesPaidSat: bigint = 0n,
 ): SolvencyResult {
-  const isSolvent   = utxoPoolSat >= wBobSupplySat;
-  const deficitSat  = isSolvent ? 0n : wBobSupplySat - utxoPoolSat;
+  const effectivePoolSat = utxoPoolSat + cumulativeFeesPaidSat;
+  const isSolvent   = effectivePoolSat >= wBobSupplySat;
+  const deficitSat  = isSolvent ? 0n : wBobSupplySat - effectivePoolSat;
   // Guard against division by zero; if supply is 0 the bridge is trivially solvent.
   const coverageRatio = wBobSupplySat === 0n
     ? 1
-    : Number(utxoPoolSat) / Number(wBobSupplySat);
+    : Number(effectivePoolSat) / Number(wBobSupplySat);
   return { isSolvent, coverageRatio, deficitSat };
 }
 
@@ -73,21 +83,29 @@ export function buildAlerts(
   const ts = snapshot.checkedAt;
 
   // ── Solvency breach / recovery ────────────────────────────────────────────
+  // Fees-paid is added to the pool side (operator-subsidized payout fees are a
+  // committed obligation, not lost funds). A real breach now means the bridge
+  // is under water beyond cumulative fees.
+  const fees = snapshot.cumulativeFeesPaidSat;
+  const effectivePool = snapshot.utxoPoolSat + fees;
   if (!snapshot.isSolvent) {
-    const deficit = snapshot.wBobSupplySat - snapshot.utxoPoolSat;
+    const deficit = snapshot.wBobSupplySat - effectivePool;
     alerts.push({
       level: 'critical',
       type: 'SOLVENCY_BREACH',
       timestamp: ts,
       message:
         `Bridge undercollateralized: UTXO pool ${snapshot.utxoPoolSat} sat ` +
+        `+ fees paid ${fees} sat = ${effectivePool} sat ` +
         `< wBOB supply ${snapshot.wBobSupplySat} sat ` +
-        `(deficit ${deficit} sat, ratio ${snapshot.coverageRatio.toFixed(4)})`,
+        `(deficit ${deficit} sat, ratio ${snapshot.coverageRatio.toFixed(6)})`,
       data: {
-        wBobSupplySat:    snapshot.wBobSupplySat.toString(),
-        utxoPoolSat:      snapshot.utxoPoolSat.toString(),
-        deficitSat:       deficit.toString(),
-        coverageRatio:    snapshot.coverageRatio,
+        wBobSupplySat:         snapshot.wBobSupplySat.toString(),
+        utxoPoolSat:           snapshot.utxoPoolSat.toString(),
+        cumulativeFeesPaidSat: fees.toString(),
+        effectivePoolSat:      effectivePool.toString(),
+        deficitSat:            deficit.toString(),
+        coverageRatio:         snapshot.coverageRatio,
       },
     });
   } else if (previouslySolvent === false) {
@@ -98,12 +116,15 @@ export function buildAlerts(
       timestamp: ts,
       message:
         `Bridge solvency restored. ` +
-        `Coverage ratio: ${snapshot.coverageRatio.toFixed(4)} ` +
-        `(UTXO pool ${snapshot.utxoPoolSat} sat, supply ${snapshot.wBobSupplySat} sat)`,
+        `Coverage ratio: ${snapshot.coverageRatio.toFixed(6)} ` +
+        `(UTXO pool ${snapshot.utxoPoolSat} sat + fees paid ${fees} sat, ` +
+        `supply ${snapshot.wBobSupplySat} sat)`,
       data: {
-        utxoPoolSat:   snapshot.utxoPoolSat.toString(),
-        wBobSupplySat: snapshot.wBobSupplySat.toString(),
-        coverageRatio: snapshot.coverageRatio,
+        utxoPoolSat:           snapshot.utxoPoolSat.toString(),
+        cumulativeFeesPaidSat: fees.toString(),
+        effectivePoolSat:      effectivePool.toString(),
+        wBobSupplySat:         snapshot.wBobSupplySat.toString(),
+        coverageRatio:         snapshot.coverageRatio,
       },
     });
   }

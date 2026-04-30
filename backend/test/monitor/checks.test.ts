@@ -12,13 +12,14 @@ import type { SolvencySnapshot } from '../../src/monitor/types.js';
 
 function makeSnapshot(overrides: Partial<SolvencySnapshot> = {}): SolvencySnapshot {
   return {
-    checkedAt:        '2025-01-01T00:00:00.000Z',
-    wBobSupplySat:    1_000_000_000n,  // 10 BOB
-    utxoPoolSat:      1_200_000_000n,  // 12 BOB (120 % covered)
-    pendingPayoutsSat: 100_000_000n,
-    coverageRatio:    1.2,
-    isSolvent:        true,
-    stuckOrderCount:  0,
+    checkedAt:             '2025-01-01T00:00:00.000Z',
+    wBobSupplySat:         1_000_000_000n,  // 10 BOB
+    utxoPoolSat:           1_200_000_000n,  // 12 BOB (120 % covered)
+    cumulativeFeesPaidSat: 0n,
+    pendingPayoutsSat:     100_000_000n,
+    coverageRatio:         1.2,
+    isSolvent:             true,
+    stuckOrderCount:       0,
     ...overrides,
   };
 }
@@ -67,6 +68,43 @@ describe('checkSolvency', () => {
   it('deficit equals exact shortfall', () => {
     const r = checkSolvency(500n, 300n);
     expect(r.deficitSat).toBe(200n);
+  });
+
+  // Fee-aware solvency: cumulativeFeesPaid is added to the pool side because
+  // the bridge subsidises payout fees (funds left the pool but stayed in
+  // supply). See migration 010_solvency_fees_paid.sql.
+
+  it('counts cumulative fees paid toward the pool', () => {
+    // Pool 998 < supply 1000 looks like a 2-sat deficit, but 5 sat of fees
+    // paid more than makes up for it.
+    const r = checkSolvency(1_000n, 998n, 5n);
+    expect(r.isSolvent).toBe(true);
+    expect(r.deficitSat).toBe(0n);
+    expect(r.coverageRatio).toBeCloseTo(1.003);
+  });
+
+  it('reproduces 2026-04-29 alert values: 2260 sat fee drift looks solvent once fees counted', () => {
+    const supply = 14_143_700_000_000n;
+    const pool   = 14_143_699_997_740n;  // 2260 sat short
+    const fees   = 2_260n;
+    const r = checkSolvency(supply, pool, fees);
+    expect(r.isSolvent).toBe(true);
+    expect(r.deficitSat).toBe(0n);
+  });
+
+  it('still reports breach when shortfall exceeds fees paid', () => {
+    // Pool 900 + fees 50 = 950 < supply 1000 → real 50-sat breach.
+    const r = checkSolvency(1_000n, 900n, 50n);
+    expect(r.isSolvent).toBe(false);
+    expect(r.deficitSat).toBe(50n);
+    expect(r.coverageRatio).toBeCloseTo(0.95);
+  });
+
+  it('fees default to zero when omitted (back-compat)', () => {
+    const r = checkSolvency(1_000n, 1_000n);
+    expect(r.isSolvent).toBe(true);
+    expect(r.deficitSat).toBe(0n);
+    expect(r.coverageRatio).toBeCloseTo(1.0);
   });
 });
 
@@ -209,6 +247,21 @@ describe('buildAlerts', () => {
     const alerts = buildAlerts(snap, null, LOW_THRESHOLD);
     const breach = alerts.find((a) => a.type === 'SOLVENCY_BREACH')!;
     expect(breach.data['deficitSat']).toBe('400');
+  });
+
+  it('SOLVENCY_BREACH deficit and effectivePool reflect fees paid', () => {
+    const snap = makeSnapshot({
+      isSolvent:             false,
+      wBobSupplySat:         1_000n,
+      utxoPoolSat:           600n,
+      cumulativeFeesPaidSat: 100n,    // effective pool = 700
+      coverageRatio:         0.7,
+    });
+    const alerts = buildAlerts(snap, null, LOW_THRESHOLD);
+    const breach = alerts.find((a) => a.type === 'SOLVENCY_BREACH')!;
+    expect(breach.data['deficitSat']).toBe('300');
+    expect(breach.data['effectivePoolSat']).toBe('700');
+    expect(breach.data['cumulativeFeesPaidSat']).toBe('100');
   });
 
   it('does NOT emit SOLVENCY_BREACH when previously insolvent and still insolvent (same tick behavior)', () => {

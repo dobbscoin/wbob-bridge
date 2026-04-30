@@ -73,6 +73,16 @@ export class SolvencyMonitor {
     `;
     const utxoPoolSat = utxoRows[0]!.total;
 
+    // 2b. Cumulative payout fees the bridge has subsidised. Anything past
+    // broadcast (txid is set) has actually left the pool. Adding this to the
+    // pool side prevents fee drift from looking like a solvency breach.
+    const feeRows = await this.sql<{ total: bigint }[]>`
+      SELECT COALESCE(SUM(fee_sat), 0)::bigint AS total
+      FROM payouts
+      WHERE txid IS NOT NULL AND fee_sat IS NOT NULL
+    `;
+    const cumulativeFeesPaidSat = feeRows[0]!.total;
+
     // 3. Outstanding withdrawal obligations (non-terminal outbound orders)
     const pendingRows = await this.sql<{ total: bigint }[]>`
       SELECT COALESCE(SUM(amount_sat), 0)::bigint AS total
@@ -99,11 +109,16 @@ export class SolvencyMonitor {
     );
 
     // 5. Build snapshot
-    const { isSolvent, coverageRatio } = checkSolvency(wBobSupplySat, utxoPoolSat);
+    const { isSolvent, coverageRatio } = checkSolvency(
+      wBobSupplySat,
+      utxoPoolSat,
+      cumulativeFeesPaidSat,
+    );
     const snapshot: SolvencySnapshot = {
       checkedAt,
       wBobSupplySat,
       utxoPoolSat,
+      cumulativeFeesPaidSat,
       pendingPayoutsSat,
       coverageRatio,
       isSolvent,
@@ -116,12 +131,13 @@ export class SolvencyMonitor {
     const ratioStored = Math.min(coverageRatio, 999_999);
     await this.sql`
       INSERT INTO solvency_snapshots (
-        checked_at, wbob_supply_sat, utxo_pool_sat,
+        checked_at, wbob_supply_sat, utxo_pool_sat, cumulative_fees_paid_sat,
         pending_payouts_sat, coverage_ratio, is_solvent, stuck_order_count
       ) VALUES (
         ${checkedAt},
         ${wBobSupplySat.toString()},
         ${utxoPoolSat.toString()},
+        ${cumulativeFeesPaidSat.toString()},
         ${pendingPayoutsSat.toString()},
         ${ratioStored},
         ${isSolvent},

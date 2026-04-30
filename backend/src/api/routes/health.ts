@@ -33,11 +33,12 @@ export async function healthRoute(
     return reply.send({
       status,
       solvency: {
-        wBobSupplySat:    snap.wBobSupplySat.toString(),
-        utxoPoolSat:      snap.utxoPoolSat.toString(),
-        pendingPayoutsSat: snap.pendingPayoutsSat.toString(),
-        coverageRatio:    snap.coverageRatio.toFixed(6),
-        isSolvent:        snap.isSolvent,
+        wBobSupplySat:         snap.wBobSupplySat.toString(),
+        utxoPoolSat:           snap.utxoPoolSat.toString(),
+        cumulativeFeesPaidSat: snap.cumulativeFeesPaidSat.toString(),
+        pendingPayoutsSat:     snap.pendingPayoutsSat.toString(),
+        coverageRatio:         snap.coverageRatio.toFixed(6),
+        isSolvent:             snap.isSolvent,
       },
       stuckOrderCount: snap.stuckOrderCount,
       lastChecked:     snap.checkedAt,
