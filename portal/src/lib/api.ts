@@ -8,20 +8,24 @@ export interface QuoteResponse {
 }
 
 export interface OrderResponse {
-  orderId:          string;
-  state:            string;
-  orderType:        string;
-  recipientAddress: string | null;
-  amountSat:        string | null;
-  depositAddress:   string | null;
-  depositId:        string | null;
-  txid:             string | null;
-  vout:             number | null;
-  confirmations:    number | null;
-  gnosisTxHash:     string | null;
-  expiresAt:        string | null;
-  createdAt:        string;
-  updatedAt:        string;
+  orderId:              string;
+  state:                string;
+  orderType:            string;
+  recipientAddress:     string | null;
+  amountSat:            string | null;
+  depositAddress:       string | null;
+  depositId:            string | null;
+  txid:                 string | null;
+  vout:                 number | null;
+  confirmations:        number | null;
+  gnosisTxHash:         string | null;
+  // Outbound-specific (null for inbound):
+  burnTxHash:           string | null;
+  payoutTxid:           string | null;
+  payoutConfirmations:  number | null;
+  expiresAt:            string | null;
+  createdAt:            string;
+  updatedAt:            string;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {

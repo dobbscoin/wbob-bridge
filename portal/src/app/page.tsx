@@ -48,7 +48,7 @@ export default function TestBedPage() {
   const { data: dripStatus } = useQuery({
     queryKey: ['drip-status', address],
     queryFn: () => getDripStatus(address!),
-    enabled: !!address && confirmed,
+    enabled: !!address,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       // Poll faster while drip is pending; slower (or stop) once terminal.
@@ -78,8 +78,8 @@ export default function TestBedPage() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
-      {/* Top row: Hero + connect (left) ◇ One-click setup (right) */}
-      <div className="grid md:grid-cols-2 gap-6 items-start">
+      {/* Single 2-col grid: left = hero + step0 + step1 + drip + history, right = One-click setup + Step 2 (fills) */}
+      <div className="grid md:grid-cols-2 gap-6">
         <div className="space-y-6">
           <div className="space-y-2">
             <div className="inline-flex items-center gap-2 rounded-full border border-bob-700/40 bg-bob-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-bob-300">
@@ -87,9 +87,11 @@ export default function TestBedPage() {
             </div>
             <h1 className="text-3xl font-bold tracking-tight">Bridge &amp; Fuel</h1>
             <p className="text-sm text-gray-400">
-              Bridge (BOB) → wBOB on Gnosis, then trade a sliver for WXDAI so
-              you can transact without hunting for gas. Same bridge, lower
-              learning curve.
+              Bridge (BOB) → wBOB on Gnosis, ..and if ya want, trade a sliver
+              for WXDAI in the process; so you can transact without hunting
+              for gas, &apos;cos transactions require gas to process. Same
+              bridge, lower learning curve.
+              <span className="block text-right">—Praise &quot;Bob&quot;.</span>
             </p>
           </div>
 
@@ -114,66 +116,90 @@ export default function TestBedPage() {
               </ConnectButton.Custom>
             )}
           </div>
-        </div>
 
-        <OnboardingPanel />
-      </div>
+          {/* Step 1 — bridge in (with drip opt-in checkbox before allocation) */}
+          <div className="card space-y-4">
+            <div>
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+                Step 1 — Bridge (BOB) in
+              </h2>
+              <p className="mt-1 text-xs text-gray-500">
+                Connect a wallet to get a permanent Dobbscoin deposit address.
+                Send any amount; wBOB lands on Gnosis after 6 confirmations
+                (~6 minutes).
+              </p>
+            </div>
 
-      {/* Steps row: Step 1 (bridge in) ◇ Step 2 (trade link) */}
-      <div className="grid md:grid-cols-2 gap-6 items-start">
-        {/* Step 1 — bridge in (with drip opt-in checkbox before allocation) */}
-        <div className="card space-y-4">
-          <div>
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
-              Step 1 — Bridge (BOB) in
-            </h2>
-            <p className="mt-1 text-xs text-gray-500">
-              Connect a wallet to get a permanent Dobbscoin deposit address.
-              Send any amount; wBOB lands on Gnosis after 6 confirmations
-              (~6 minutes).
-            </p>
+            {!address ? (
+              <p className="text-xs text-gray-500">Connect above to continue.</p>
+            ) : !confirmed ? (
+              <DripOptInForm
+                optIn={optInDrip}
+                onToggle={setOptInDrip}
+                onConfirm={() => setConfirmed(true)}
+                dripStatus={dripStatus}
+              />
+            ) : loadingAddress || !depositInfo ? (
+              <p className="text-sm text-gray-500 animate-pulse">Resolving your address…</p>
+            ) : (
+              <>
+                <div className="space-y-1">
+                  <p className="label">Dobbscoin deposit address</p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 rounded-lg bg-gray-800 px-3 py-2 text-xs font-mono text-bob-300 break-all">
+                      {depositInfo.depositAddress}
+                    </code>
+                    <button
+                      onClick={copyAddress}
+                      className="shrink-0 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 hover:bg-gray-800 transition-colors"
+                    >
+                      {copied ? '✓ Copied' : 'Copy'}
+                    </button>
+                  </div>
+                </div>
+                <div className="text-xs text-gray-400 space-y-1 border-t border-gray-800 pt-3">
+                  <p>• Send <span className="text-gray-200 font-medium">any amount</span> of (BOB).</p>
+                  <p>• wBOB will mint to {depositInfo.recipientAddress.slice(0, 10)}… on Gnosis.</p>
+                  <p>• Reusable forever. No approval. No expiry.</p>
+                </div>
+              </>
+            )}
           </div>
 
-          {!address ? (
-            <p className="text-xs text-gray-500">Connect above to continue.</p>
-          ) : !confirmed ? (
-            <DripOptInForm
-              optIn={optInDrip}
-              onToggle={setOptInDrip}
-              onConfirm={() => setConfirmed(true)}
-            />
-          ) : loadingAddress || !depositInfo ? (
-            <p className="text-sm text-gray-500 animate-pulse">Resolving your address…</p>
-          ) : (
-            <>
-              <div className="space-y-1">
-                <p className="label">Dobbscoin deposit address</p>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 rounded-lg bg-gray-800 px-3 py-2 text-xs font-mono text-bob-300 break-all">
-                    {depositInfo.depositAddress}
-                  </code>
-                  <button
-                    onClick={copyAddress}
-                    className="shrink-0 rounded-lg border border-gray-700 px-3 py-2 text-xs text-gray-300 hover:bg-gray-800 transition-colors"
-                  >
-                    {copied ? '✓ Copied' : 'Copy'}
-                  </button>
-                </div>
+          {/* Drip status — appears once allocated */}
+          {address && confirmed && dripStatus && dripStatus.enabled && (
+            <DripStatusCard status={dripStatus} />
+          )}
+
+          {/* Tx history (now stacked under Step 1; grid still adapts at sm/lg) */}
+          {address && history && history.orders.filter((o) => o.orderType === 'inbound').length > 0 && (
+            <div className="card space-y-3">
+              <div className="flex items-baseline justify-between">
+                <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
+                  Your deposits
+                </h2>
+                <span className="text-[11px] text-gray-500">
+                  {history.orders.filter((o) => o.orderType === 'inbound').length} total
+                </span>
               </div>
-              <div className="text-xs text-gray-400 space-y-1 border-t border-gray-800 pt-3">
-                <p>• Send <span className="text-gray-200 font-medium">any amount</span> of (BOB).</p>
-                <p>• wBOB will mint to {depositInfo.recipientAddress.slice(0, 10)}… on Gnosis.</p>
-                <p>• Reusable forever. No approval. No expiry.</p>
-              </div>
-            </>
+              <ul className="grid sm:grid-cols-2 gap-2">
+                {history.orders
+                  .filter((o) => o.orderType === 'inbound')
+                  .map((o) => (
+                    <OrderRow key={o.orderId} order={o} />
+                  ))}
+              </ul>
+            </div>
           )}
         </div>
 
-        {/* Step 2 — trade link */}
-        <Link
-          href="/trade"
-          className="card flex flex-col justify-between space-y-3 group hover:border-bob-600 transition-colors"
-        >
+        {/* Right column: Step 2 on top (mobile flow 0→1→2 stays in order), One-click setup grows to fill */}
+        <div className="flex flex-col gap-6">
+          {/* Step 2 — trade link, natural height */}
+          <Link
+            href="/trade"
+            className="card flex flex-col justify-between gap-3 group hover:border-bob-600 transition-colors"
+          >
           <div>
             <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400 group-hover:text-bob-400 transition-colors">
               Step 2 — Trade wBOB
@@ -192,36 +218,14 @@ export default function TestBedPage() {
           <p className="text-xs text-bob-400 group-hover:underline">
             Open trade page →
           </p>
-        </Link>
+          </Link>
+
+          {/* One-click setup — grows to fill remaining right-column height */}
+          <OnboardingPanel className="flex-1" />
+        </div>
       </div>
 
-      {/* Drip status — appears once allocated */}
-      {address && confirmed && dripStatus && dripStatus.enabled && (
-        <DripStatusCard status={dripStatus} />
-      )}
-
-      {/* Wide tx history */}
-      {address && history && history.orders.filter((o) => o.orderType === 'inbound').length > 0 && (
-        <div className="card space-y-3">
-          <div className="flex items-baseline justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
-              Your deposits
-            </h2>
-            <span className="text-[11px] text-gray-500">
-              {history.orders.filter((o) => o.orderType === 'inbound').length} total
-            </span>
-          </div>
-          <ul className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
-            {history.orders
-              .filter((o) => o.orderType === 'inbound')
-              .map((o) => (
-                <OrderRow key={o.orderId} order={o} />
-              ))}
-          </ul>
-        </div>
-      )}
-
-      <div className="mx-auto max-w-2xl space-y-6">
+      <div className="space-y-6">
         <div className="card space-y-2">
           <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">
             About this bridge
@@ -256,35 +260,53 @@ function DripOptInForm({
   optIn,
   onToggle,
   onConfirm,
+  dripStatus,
 }: {
   optIn: boolean;
   onToggle: (v: boolean) => void;
   onConfirm: () => void;
+  dripStatus?: DripStatusResponse;
 }) {
+  const alreadyDripped = dripStatus?.status === 'sent';
+
+  // If the user already received their one-time drip, force the opt-in off so
+  // we never re-submit a stale "true" preference to the backend.
+  useEffect(() => {
+    if (alreadyDripped && optIn) onToggle(false);
+  }, [alreadyDripped, optIn, onToggle]);
+
   return (
     <div className="space-y-3">
-      <label className="flex items-start gap-3 rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-3 cursor-pointer hover:border-bob-700/60 transition-colors">
-        <input
-          type="checkbox"
-          checked={optIn}
-          onChange={(e) => onToggle(e.target.checked)}
-          className="mt-0.5 h-4 w-4 rounded border-gray-700 bg-gray-800 text-bob-500 focus:ring-bob-500"
-        />
-        <span className="flex-1 space-y-1">
-          <span className="block text-sm font-medium text-gray-100">
-            Drip me xDAI for gas on my first bridge
+      {alreadyDripped ? (
+        <DripAlreadyReceivedBanner txHash={dripStatus?.gnosisTxHash} />
+      ) : (
+        <label className="flex items-start gap-3 rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-3 cursor-pointer hover:border-bob-700/60 transition-colors">
+          <input
+            type="checkbox"
+            checked={optIn}
+            onChange={(e) => onToggle(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-gray-700 bg-gray-800 text-bob-500 focus:ring-bob-500"
+          />
+          <span className="flex-1 space-y-1">
+            <span className="block text-sm font-medium text-gray-100">
+              Drip me xDAI for gas on my first bridge
+            </span>
+            <span className="block text-xs text-gray-500">
+              On your <span className="text-gray-300">first</span> wBOB mint, the
+              bridge will send you a small amount of native xDAI so you can
+              transact on Gnosis without hunting for gas. One-time per address.
+              Bridge eats the cost. No tracking; no obligation.
+            </span>
           </span>
-          <span className="block text-xs text-gray-500">
-            On your <span className="text-gray-300">first</span> wBOB mint, the
-            bridge will send you a small amount of native xDAI so you can
-            transact on Gnosis without hunting for gas. One-time per address.
-            Bridge eats the cost. No tracking; no obligation.
-          </span>
-        </span>
-      </label>
+        </label>
+      )}
 
       <button onClick={onConfirm} className="btn-primary w-full">
-        {optIn ? 'Get my deposit address & drip' : 'Get my deposit address'}
+        {alreadyDripped
+          ? 'Get my deposit address'
+          : optIn
+            ? 'Get my deposit address & drip'
+            : 'Get my deposit address'}
       </button>
 
       <p className="text-[11px] text-gray-500">
@@ -300,6 +322,41 @@ function DripOptInForm({
         </a>
         .
       </p>
+    </div>
+  );
+}
+
+function DripAlreadyReceivedBanner({ txHash }: { txHash?: string | null }) {
+  return (
+    <div
+      className="relative overflow-hidden rounded-lg border-2 border-orange-500/80 bg-black px-4 py-3"
+      style={{
+        backgroundImage:
+          'repeating-linear-gradient(45deg, rgba(0,0,0,0) 0 14px, rgba(234,88,12,0.12) 14px 28px)',
+      }}
+    >
+      <div className="space-y-1.5">
+        <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-orange-400">
+          <span aria-hidden>▲</span>
+          Drip Already Received
+          <span aria-hidden>▲</span>
+        </p>
+        <p className="text-xs text-orange-100/80 leading-relaxed">
+          This wallet already pulled its one-time gas drip from the bridge.
+          The drip pool is gas for new arrivals, not a vending machine — bridge
+          freely, but no second drip. Praise &quot;Bob.&quot;
+        </p>
+        {txHash && (
+          <a
+            href={`https://gnosisscan.io/tx/${txHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block text-[11px] font-mono text-orange-300 underline hover:text-orange-200 break-all"
+          >
+            view drip tx ↗ {txHash.slice(0, 10)}…{txHash.slice(-8)}
+          </a>
+        )}
+      </div>
     </div>
   );
 }

@@ -11,7 +11,7 @@ import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useQuery } from '@tanstack/react-query';
 import { parseEventLogs } from 'viem';
 import { getOrder, getOrderByWithdrawal, type OrderResponse } from '@/lib/api';
-import { satsToBob, bobToSats, gnosisExplorerTx, shortHash } from '@/lib/utils';
+import { satsToBob, bobToSats, gnosisExplorerTx, dobbscoinExplorerTx, shortHash } from '@/lib/utils';
 import { WBOB_ABI, BRIDGE_CONTROLLER_ABI, WBOB_ADDRESS, BRIDGE_CONTROLLER_ADDRESS } from '@/lib/contracts';
 import { OrderProgress } from '@/components/OrderProgress';
 
@@ -153,6 +153,8 @@ export default function WithdrawPage() {
 
   // ── Completed ───────────────────────────────────────────────────────────────
   if (phase.tag === 'completed') {
+    const payoutTxid = phase.order.payoutTxid;
+    const burnTxHash = phase.order.burnTxHash;
     return (
       <div className="mx-auto max-w-lg space-y-6">
         <h1 className="text-2xl font-bold">Withdraw BOB</h1>
@@ -170,6 +172,36 @@ export default function WithdrawPage() {
               Paid out on Dobbscoin
             </p>
           </div>
+          {(payoutTxid || burnTxHash) && (
+            <div className="rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2 text-left text-xs space-y-1">
+              {payoutTxid && (
+                <p className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500">Dobbscoin payout</span>
+                  <a
+                    href={dobbscoinExplorerTx(payoutTxid)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-bob-400 hover:underline"
+                  >
+                    {shortHash(payoutTxid, 8)} ↗
+                  </a>
+                </p>
+              )}
+              {burnTxHash && (
+                <p className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500">Gnosis burn</span>
+                  <a
+                    href={gnosisExplorerTx(burnTxHash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-bob-400 hover:underline"
+                  >
+                    {shortHash(burnTxHash, 8)} ↗
+                  </a>
+                </p>
+              )}
+            </div>
+          )}
           <button onClick={() => { setPhase({ tag: 'form' }); setLookupWithdrawalId(null); }} className="btn-secondary">
             Make another withdrawal
           </button>
@@ -180,6 +212,8 @@ export default function WithdrawPage() {
 
   // ── Polling order ────────────────────────────────────────────────────────────
   if (phase.tag === 'polling') {
+    const payoutTxid = orderData?.payoutTxid;
+    const burnTxHash = orderData?.burnTxHash;
     return (
       <div className="mx-auto max-w-lg space-y-6">
         <h1 className="text-2xl font-bold">Withdraw BOB</h1>
@@ -189,6 +223,41 @@ export default function WithdrawPage() {
             <OrderProgress order={orderData} />
           ) : (
             <p className="text-sm text-gray-500 animate-pulse">Processing withdrawal…</p>
+          )}
+          {(payoutTxid || burnTxHash) && (
+            <div className="rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2 text-xs space-y-1">
+              {burnTxHash && (
+                <p className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500">Gnosis burn</span>
+                  <a
+                    href={gnosisExplorerTx(burnTxHash)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-bob-400 hover:underline"
+                  >
+                    {shortHash(burnTxHash, 8)} ↗
+                  </a>
+                </p>
+              )}
+              {payoutTxid && (
+                <p className="flex items-center justify-between gap-2">
+                  <span className="text-gray-500">
+                    Dobbscoin payout
+                    {orderData?.payoutConfirmations !== null && orderData?.payoutConfirmations !== undefined && (
+                      <span className="ml-1 text-gray-600">· {orderData.payoutConfirmations} conf</span>
+                    )}
+                  </span>
+                  <a
+                    href={dobbscoinExplorerTx(payoutTxid)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-bob-400 hover:underline"
+                  >
+                    {shortHash(payoutTxid, 8)} ↗
+                  </a>
+                </p>
+              )}
+            </div>
           )}
         </div>
         <p className="text-center text-xs text-gray-600">Order ID: {phase.orderId}</p>

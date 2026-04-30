@@ -43,3 +43,14 @@ export const GNOSIS_EXPLORER = 'https://gnosisscan.io';
 export function gnosisExplorerTx(hash: string): string {
   return `${GNOSIS_EXPLORER}/tx/${hash}`;
 }
+
+/** Dobbscoin explorer URL */
+export const DOBBSCOIN_EXPLORER = 'https://explorer.dobbscoin.info';
+
+export function dobbscoinExplorerTx(txid: string): string {
+  return `${DOBBSCOIN_EXPLORER}/tx/${txid}`;
+}
+
+export function dobbscoinExplorerAddress(addr: string): string {
+  return `${DOBBSCOIN_EXPLORER}/address/${addr}`;
+}

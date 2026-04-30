@@ -7,37 +7,44 @@ import type { Sql } from 'postgres';
 import { bufferToHex } from '../../db/hex.js';
 
 interface OrderResponse {
-  orderId:           string;
-  state:             string;
-  orderType:         string;
-  recipientAddress:  string | null;
-  amountSat:         string | null;
-  depositAddress:    string | null;
-  depositId:         string | null;   // 0x-prefixed bytes32, null until tx seen
-  txid:              string | null;
-  vout:              number | null;
-  confirmations:     number | null;
-  gnosisTxHash:      string | null;
-  expiresAt:         string | null;
-  createdAt:         string;
-  updatedAt:         string;
+  orderId:               string;
+  state:                 string;
+  orderType:             string;
+  recipientAddress:      string | null;
+  amountSat:             string | null;
+  depositAddress:        string | null;
+  depositId:             string | null;   // 0x-prefixed bytes32, null until tx seen
+  txid:                  string | null;
+  vout:                  number | null;
+  confirmations:         number | null;
+  gnosisTxHash:          string | null;
+  // Outbound-specific (null for inbound):
+  burnTxHash:            string | null;   // Gnosis burn tx that requested the withdrawal
+  payoutTxid:            string | null;   // Dobbscoin tx the bridge broadcast to pay the user
+  payoutConfirmations:   number | null;
+  expiresAt:             string | null;
+  createdAt:             string;
+  updatedAt:             string;
 }
 
 interface OrderRow {
-  id:                  string;
-  state:               string;
-  order_type:          string;
-  user_gnosis_address: string | null;
-  amount_sat:          bigint | null;
-  expires_at:          Date | null;
-  created_at:          Date;
-  updated_at:          Date;
-  deposit_address:     string | null;
-  deposit_id:          Buffer | null;
-  txid:                string | null;
-  vout:                number | null;
-  confirmations:       number | null;
-  gnosis_tx_hash:      string | null;
+  id:                    string;
+  state:                 string;
+  order_type:            string;
+  user_gnosis_address:   string | null;
+  amount_sat:            bigint | null;
+  expires_at:            Date | null;
+  created_at:            Date;
+  updated_at:            Date;
+  deposit_address:       string | null;
+  deposit_id:            Buffer | null;
+  txid:                  string | null;
+  vout:                  number | null;
+  confirmations:         number | null;
+  gnosis_tx_hash:        string | null;
+  burn_tx_hash:          string | null;
+  payout_txid:           string | null;
+  payout_confirmations:  number | null;
 }
 
 export async function ordersRoute(
@@ -64,30 +71,38 @@ export async function ordersRoute(
           bo.user_gnosis_address, bo.amount_sat,
           bo.expires_at, bo.created_at, bo.updated_at,
           sd.deposit_address, sd.deposit_id, sd.txid, sd.vout, sd.confirmations,
-          mr.gnosis_tx_hash
+          mr.gnosis_tx_hash,
+          wr.burn_tx_hash,
+          p.txid          AS payout_txid,
+          p.confirmations AS payout_confirmations
         FROM bridge_orders bo
-        LEFT JOIN source_deposits sd ON sd.order_id = bo.id
-        LEFT JOIN mint_requests    mr ON mr.order_id = bo.id
+        LEFT JOIN source_deposits     sd ON sd.order_id = bo.id
+        LEFT JOIN mint_requests       mr ON mr.order_id = bo.id
+        LEFT JOIN withdrawal_requests wr ON wr.order_id = bo.id
+        LEFT JOIN payouts             p  ON p.withdrawal_request_id = wr.id
         WHERE bo.user_gnosis_address = ${recipient}
         ORDER BY bo.created_at DESC
         LIMIT ${limit}
       `;
 
       const response = rows.map<OrderResponse>((row) => ({
-        orderId:          row.id,
-        state:            row.state,
-        orderType:        row.order_type,
-        recipientAddress: row.user_gnosis_address,
-        amountSat:        row.amount_sat !== null ? row.amount_sat.toString() : null,
-        depositAddress:   row.deposit_address,
-        depositId:        row.deposit_id !== null ? bufferToHex(row.deposit_id) : null,
-        txid:             row.txid,
-        vout:             row.vout,
-        confirmations:    row.confirmations,
-        gnosisTxHash:     row.gnosis_tx_hash,
-        expiresAt:        row.expires_at?.toISOString() ?? null,
-        createdAt:        row.created_at.toISOString(),
-        updatedAt:        row.updated_at.toISOString(),
+        orderId:             row.id,
+        state:               row.state,
+        orderType:           row.order_type,
+        recipientAddress:    row.user_gnosis_address,
+        amountSat:           row.amount_sat !== null ? row.amount_sat.toString() : null,
+        depositAddress:      row.deposit_address,
+        depositId:           row.deposit_id !== null ? bufferToHex(row.deposit_id) : null,
+        txid:                row.txid,
+        vout:                row.vout,
+        confirmations:       row.confirmations,
+        gnosisTxHash:        row.gnosis_tx_hash,
+        burnTxHash:          row.burn_tx_hash,
+        payoutTxid:          row.payout_txid,
+        payoutConfirmations: row.payout_confirmations,
+        expiresAt:           row.expires_at?.toISOString() ?? null,
+        createdAt:           row.created_at.toISOString(),
+        updatedAt:           row.updated_at.toISOString(),
       }));
 
       return reply.send({ orders: response });
@@ -145,10 +160,15 @@ export async function ordersRoute(
         sd.txid,
         sd.vout,
         sd.confirmations,
-        mr.gnosis_tx_hash
+        mr.gnosis_tx_hash,
+        wr.burn_tx_hash,
+        p.txid          AS payout_txid,
+        p.confirmations AS payout_confirmations
       FROM bridge_orders bo
-      LEFT JOIN source_deposits sd ON sd.order_id = bo.id
-      LEFT JOIN mint_requests    mr ON mr.order_id = bo.id
+      LEFT JOIN source_deposits     sd ON sd.order_id = bo.id
+      LEFT JOIN mint_requests       mr ON mr.order_id = bo.id
+      LEFT JOIN withdrawal_requests wr ON wr.order_id = bo.id
+      LEFT JOIN payouts             p  ON p.withdrawal_request_id = wr.id
       WHERE bo.id = ${id}
     `;
 
@@ -158,20 +178,23 @@ export async function ordersRoute(
 
     const row = rows[0]!;
     const response: OrderResponse = {
-      orderId:          row.id,
-      state:            row.state,
-      orderType:        row.order_type,
-      recipientAddress: row.user_gnosis_address,
-      amountSat:        row.amount_sat !== null ? row.amount_sat.toString() : null,
-      depositAddress:   row.deposit_address,
-      depositId:        row.deposit_id !== null ? bufferToHex(row.deposit_id) : null,
-      txid:             row.txid,
-      vout:             row.vout,
-      confirmations:    row.confirmations,
-      gnosisTxHash:     row.gnosis_tx_hash,
-      expiresAt:        row.expires_at?.toISOString() ?? null,
-      createdAt:        row.created_at.toISOString(),
-      updatedAt:        row.updated_at.toISOString(),
+      orderId:             row.id,
+      state:               row.state,
+      orderType:           row.order_type,
+      recipientAddress:    row.user_gnosis_address,
+      amountSat:           row.amount_sat !== null ? row.amount_sat.toString() : null,
+      depositAddress:      row.deposit_address,
+      depositId:           row.deposit_id !== null ? bufferToHex(row.deposit_id) : null,
+      txid:                row.txid,
+      vout:                row.vout,
+      confirmations:       row.confirmations,
+      gnosisTxHash:        row.gnosis_tx_hash,
+      burnTxHash:          row.burn_tx_hash,
+      payoutTxid:          row.payout_txid,
+      payoutConfirmations: row.payout_confirmations,
+      expiresAt:           row.expires_at?.toISOString() ?? null,
+      createdAt:           row.created_at.toISOString(),
+      updatedAt:           row.updated_at.toISOString(),
     };
 
     return reply.send(response);

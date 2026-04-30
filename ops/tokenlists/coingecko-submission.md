@@ -1,6 +1,15 @@
-# CoinGecko submission — wBOB
+# CoinGecko submission — wBOB (Gnosis chain)
 
-Form: https://www.coingecko.com/en/coins/new
+**Submit alongside `coingecko-bob-l1-submission.md`** — wBOB and BOB L1
+should be linked as wrapped/underlying. Submit BOB first if possible,
+then wBOB and reference BOB's CoinGecko ID; otherwise submit
+simultaneously and ask the reviewer to cross-link them.
+
+Form: https://www.coingecko.com/request-form?locale=en
+(The old `/en/coins/new` URL is gone as of 2026; everything funnels through
+the unified request form, which branches into coin / token / exchange flows.
+For listing context see https://support.coingecko.com/hc/en-us/sections/32146983631641-Token-Coin-Listing
+— note the **Fast Pass** (24h review) vs **Regular Pass** (≤ 5 days) option.)
 
 ## Fields
 
@@ -13,25 +22,38 @@ Form: https://www.coingecko.com/en/coins/new
 | Contract address | `0x13550ae65f22A36f60A50d625B70b58666488263` |
 | Network / Chain | Gnosis (xDai) — chainId 100 |
 | Block explorer | https://gnosisscan.io/address/0x13550ae65f22A36f60A50d625B70b58666488263 |
-| Logo | https://dobbscoin.info/images/wBOB.png |
+| Source-verified? | Yes — verified on Gnosisscan 2026-04-29 |
+| Logo | https://raw.githubusercontent.com/1Hive/default-token-list/master/src/assets/gnosis/0x13550ae65f22a36f60a50d625b70b58666488263/logo.png |
 | Website | https://bridge.subgenius.finance |
 | Project homepage | https://dobbscoin.info |
 | Source (bridge) | https://github.com/dobbscoin/wbob-bridge |
 | Source (contracts) | https://github.com/dobbscoin/wbob-contracts |
+| Underlying asset (CoinGecko ID) | `dobbscoin` (or whatever the BOB L1 ID becomes — see paired submission) |
+| Wrapped/peg ratio | 1:1 with native BOB, backed by escrow on the Dobbscoin chain |
 
 ## Description (paste verbatim)
 
-> wBOB is the Gnosis-chain ERC-20 representation of Dobbscoin (BOB), the
-> official cryptocurrency of the Church of the SubGenius. Backed 1:1 by
-> BOB locked in a 3-of-5 threshold-signed bridge between the Dobbscoin L1
-> and Gnosis Chain. Brings BOB liquidity into Gnosis DeFi (CoW Swap,
-> Balancer, Honeyswap) while preserving custody of the underlying.
+> wBOB is the Gnosis-chain ERC-20 representation of Dobbscoin (BOB), an
+> independent scrypt-PoW chain forked from Bitcoin Core 0.10 in January
+> 2014 (the official cryptocurrency of the Church of the SubGenius).
+> Backed 1:1 by native BOB locked in a 3-of-5 threshold-signed bridge
+> between the Dobbscoin L1 and Gnosis Chain. Brings Dobbscoin liquidity
+> into Gnosis DeFi (CoW Swap, Oku, Balancer-style AMMs) while preserving
+> custody of the underlying.
 
-## Markets / liquidity (Balancer CoW AMM)
+## Markets / liquidity
 
-- Pair: **WXDAI / wBOB**
-- Pool address: `0xefe75bf74018a5257a73f31b434ab91a20f57847`
-- URL: https://balancer.fi/pools/gnosis/cow/0xefe75bf74018a5257a73f31b434ab91a20f57847
+Active trading venues on Gnosis:
+
+- **CoW Swap** (default direction wBOB → WXDAI):
+  https://swap.cow.fi/#/100/swap/wBOB/WXDAI
+- **Oku** (default direction WXDAI → wBOB):
+  https://oku.trade/swap?inputChain=gnosis&inToken=0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d&outToken=0x13550ae65f22A36f60A50d625B70b58666488263
+
+Quote currency: **WXDAI** (Wrapped xDai, USD-pegged stablecoin on Gnosis,
+contract `0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d`). This pair is the
+canonical price-discovery venue for both wBOB and (by 1:1 bridge backing)
+BOB itself.
 
 ## You-fill-this fields (CoinGecko nearly always asks)
 
@@ -39,16 +61,26 @@ Form: https://www.coingecko.com/en/coins/new
 - [ ] Telegram group
 - [ ] Discord invite
 - [ ] Reddit (r/SubGenius? r/Dobbscoin?)
-- [ ] Parent CoinGecko ID — search `coingecko.com` for "dobbscoin". If BOB is already listed, link wBOB as a wrapped variant.
-- [ ] Whitepaper URL (or use `github.com/dobbscoin/wbob-bridge/blob/master/CLAUDE.md` as the architecture reference if no formal whitepaper exists)
+- [ ] Whitepaper URL — `github.com/dobbscoin/wbob-bridge/blob/master/CLAUDE.md`
+      is the architecture reference; if a formal whitepaper is needed, link
+      the bitcointalk ANN thread instead
 
 ## Notes for the reviewer (paste in any "additional context" field)
 
-- Bridge has been smoke-tested end-to-end on Gnosis mainnet — inbound mint
-  and outbound burn/payout both confirmed.
-- Independent contract review is in progress; the architecture is the
-  standard threshold-signed lock/mint pattern with a Gnosis Safe holding
-  admin (`DEFAULT_ADMIN_ROLE`) and a Safe module (`BridgeExecutorModule`)
-  gating automated mint calls.
-- Pool is a Balancer CoW AMM (not vanilla Balancer Vault), so it's
-  tradeable via CoW Swap once solvers index the token.
+- Bridge contracts source-verified on Gnosisscan as of 2026-04-29:
+  - wBOB ERC-20: `0x13550ae65f22A36f60A50d625B70b58666488263`
+  - BridgeController: `0x20a9A6D5FB3615a79603a6Ed74A3d26FB11aB872`
+  - BridgeExecutorModule: `0xd5ebf9EC7971B18A6b1e7f05Ee0BF96BE72e3410`
+- Bridge has been smoke-tested end-to-end on Gnosis mainnet — inbound
+  (BOB → wBOB mint) and outbound (wBOB burn → BOB payout) both confirmed.
+- Trust model: 3-of-5 threshold-signed mints (independent watcher EOAs);
+  admin role held by a Gnosis Safe; no hot wallet ever holds
+  `DEFAULT_ADMIN_ROLE`.
+- Contracts have a thorough Foundry test suite (unit + 1000-run fuzz +
+  invariant runs at depth 100); third-party security audit is a planned
+  follow-up — not yet completed. Treat the trust model accordingly.
+- The underlying Dobbscoin L1 chain has been continuously operating since
+  its January 2014 genesis. Live chain stats (supply, hashrate, height)
+  are publicly readable at https://explorer.dobbscoin.info/ext/getsummary
+- Please cross-reference this entry as the wrapped variant of the
+  paired BOB L1 submission.

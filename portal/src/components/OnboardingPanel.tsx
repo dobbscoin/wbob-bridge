@@ -20,7 +20,7 @@ function statusLabel(s: Status, doneText: string): string {
   }
 }
 
-export function OnboardingPanel() {
+export function OnboardingPanel({ className = '' }: { className?: string }) {
   const [chain, setChain] = useState<Status>('idle');
   const [wbob, setWbob] = useState<Status>('idle');
   const [wxdai, setWxdai] = useState<Status>('idle');
@@ -50,7 +50,7 @@ export function OnboardingPanel() {
   }
 
   return (
-    <div className="card space-y-4">
+    <div className={`card space-y-4 ${className}`}>
       <div>
         <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
           One-click setup

@@ -4,6 +4,9 @@ import Link from 'next/link';
 import { CowSwapWidget } from '@/components/CowSwapWidget';
 import { OkuSwapWidget } from '@/components/OkuSwapWidget';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
+import { CopyAddress } from '@/components/CopyAddress';
+import { WBOB_ADDRESS } from '@/lib/contracts';
+import { WXDAI_ADDRESS } from '@/lib/onboarding';
 
 export default function TradePage() {
   return (
@@ -41,7 +44,15 @@ export default function TradePage() {
         </h3>
         <ul className="text-xs text-gray-500 space-y-1">
           <li>• Two third-party swap UIs, embedded as iframes. Bridge takes no fee.</li>
-          <li>• Verify the token addresses in your wallet before signing — wBOB is <code className="text-bob-300">0x13550ae6…488263</code>; WXDAI is <code className="text-bob-300">0xe91D153E…3a97d</code>.</li>
+          <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span>• Verify the token addresses in your wallet before signing —</span>
+            <span className="inline-flex items-center gap-1">
+              wBOB <CopyAddress address={WBOB_ADDRESS} label="wBOB token address" />
+            </span>
+            <span className="inline-flex items-center gap-1">
+              WXDAI <CopyAddress address={WXDAI_ADDRESS} label="WXDAI token address" />
+            </span>
+          </li>
           <li>• Both venues need xDAI for gas. If you have none, check the gas-drip status on the home page or use the public Gnosis faucet.</li>
           <li>• (BOB) is not for sale — it is for trade.</li>
         </ul>
