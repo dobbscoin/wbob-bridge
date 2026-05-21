@@ -36,3 +36,6 @@ Thumbs.db
 
 # TypeScript
 *.tsbuildinfo
+
+# Operational DB snapshots (kept on disk, not in source control)
+backups/
