@@ -21,7 +21,7 @@ import { gnosis } from 'viem/chains';
 import type { Sql } from 'postgres';
 import type { BackendConfig } from '../config.js';
 import type { SolvencySnapshot, AlertType } from './types.js';
-import { checkSolvency, checkStuckOrders, buildAlerts, checkDripWalletBalance } from './checks.js';
+import { checkSolvency, checkStuckOrders, buildAlerts, checkDripWalletBalance, checkScanHalt } from './checks.js';
 import { AlertDispatcher } from './webhook.js';
 import type { DripSender } from '../executor/drip-sender.js';
 
@@ -177,6 +177,40 @@ export class SolvencyMonitor {
       } catch (err) {
         console.error('[solvency-monitor] drip wallet balance read failed:', err);
       }
+    }
+
+    // ── Gnosis log-scan halt (independent observer of the watcher's state) ──
+    // The watcher records halt facts to bridge_state when _createWithdrawalOrder
+    // fails; this check reads those facts on the monitor's cadence and decides
+    // whether they warrant an alert. Watcher writes facts, monitor decides.
+    try {
+      const haltRows = await this.sql<{ key: string; value: string }[]>`
+        SELECT key, value FROM bridge_state
+        WHERE key IN (
+          'gnosis_scan_halt_block',
+          'gnosis_scan_halt_count',
+          'gnosis_scan_halt_withdrawal_id',
+          'gnosis_scan_halt_last_error'
+        )
+      `;
+      const haltState: Record<string, string> = {};
+      for (const row of haltRows) haltState[row.key] = row.value;
+      const haltBlock = haltState['gnosis_scan_halt_block'] ?? null;
+      const haltCount = parseInt(haltState['gnosis_scan_halt_count'] ?? '0', 10);
+      const failingWithdrawalId = haltState['gnosis_scan_halt_withdrawal_id'] ?? null;
+      const lastError = haltState['gnosis_scan_halt_last_error'] ?? null;
+      alerts.push(
+        ...checkScanHalt(
+          haltBlock,
+          isNaN(haltCount) ? 0 : haltCount,
+          this.config.gnosisScanHaltAlertThreshold,
+          failingWithdrawalId,
+          lastError,
+          checkedAt,
+        ),
+      );
+    } catch (err) {
+      console.error('[solvency-monitor] scan-halt state read failed:', err);
     }
 
     const now = Date.now();
