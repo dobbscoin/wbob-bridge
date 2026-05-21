@@ -10,7 +10,8 @@ export type AlertType =
   | 'LOW_UTXO_POOL'       // UTXO pool below configurable warning threshold
   | 'STUCK_ORDERS'        // one or more orders have not advanced state in too long
   | 'DRIP_WALLET_LOW'     // gas-drip hot wallet xDAI balance below low-water mark
-  | 'DRIP_WALLET_DRY';    // gas-drip hot wallet has < drip amount; users being skipped
+  | 'DRIP_WALLET_DRY'     // gas-drip hot wallet has < drip amount; users being skipped
+  | 'GNOSIS_SCAN_HALTED'; // log-scan stuck on a failing event past consecutive-poll threshold
 
 export interface Alert {
   level: AlertLevel;

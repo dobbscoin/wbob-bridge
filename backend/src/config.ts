@@ -74,6 +74,19 @@ export interface BackendConfig {
   executorPollIntervalMs: number;
   /** Gnosis blocks required before a burn is considered confirmed. */
   gnosisConfirmationDepth: number;
+  /**
+   * Max blocks per `eth_getLogs` window when scanning Gnosis history.
+   * Bounds the watcher's catch-up batch size to whatever the upstream RPC
+   * accepts. Default 1000 matches our self-hosted Erigon node's server limit.
+   */
+  gnosisLogScanChunk: number;
+  /**
+   * Consecutive halted polls before the solvency monitor raises a
+   * GNOSIS_SCAN_HALTED alert. The watcher writes halt-state into bridge_state
+   * on every failed scan; the monitor observes that state on its own cadence.
+   * Default 10 ≈ 2.5 min of halt at the 15s executor poll interval.
+   */
+  gnosisScanHaltAlertThreshold: number;
   /** Dobbscoin network: mainnet | testnet. */
   dobbscoinNetwork: 'mainnet' | 'testnet';
   /** Derived from dobbscoinNetwork. */
@@ -163,6 +176,8 @@ export function loadConfig(): BackendConfig {
     mintDeadlineSeconds:        optionalEnvInt('MINT_DEADLINE_SECONDS', 3600),
     executorPollIntervalMs:     optionalEnvInt('EXECUTOR_POLL_INTERVAL_MS', 15_000),
     gnosisConfirmationDepth:    optionalEnvInt('GNOSIS_CONFIRMATION_DEPTH', 12),
+    gnosisLogScanChunk:         optionalEnvInt('GNOSIS_LOG_SCAN_CHUNK', 1000),
+    gnosisScanHaltAlertThreshold: optionalEnvInt('GNOSIS_SCAN_HALT_ALERT_THRESHOLD', 10),
     dobbscoinNetwork:           network,
     dobbscoinChainId:           DOBBSCOIN_CHAIN_IDS[network],
     sourceChainName:            `dobbscoin-${network}`,

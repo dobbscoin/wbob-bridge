@@ -213,3 +213,52 @@ export function checkDripWalletBalance(
   }
   return alerts;
 }
+
+// ─── checkScanHalt ───────────────────────────────────────────────────────────
+
+/**
+ * Decide whether the Gnosis log scan has been halted at a single block for
+ * long enough to alert. The watcher writes halt-state into `bridge_state` on
+ * every poll where it fails to process an event; this check is the
+ * independent observer that escalates a sustained halt to a real alert.
+ *
+ * @param haltBlock              Block where the watcher is currently stuck,
+ *                               or null/empty if not halted.
+ * @param haltCount              Consecutive polls halted at `haltBlock`.
+ * @param threshold              Polls of halt required before alerting.
+ * @param failingWithdrawalId    The withdrawalId that's failing, if known.
+ * @param lastError              Last underlying error string from the watcher,
+ *                               if recorded. NEVER contains secrets — it's
+ *                               whatever the watcher chose to persist.
+ * @param checkedAt              Snapshot timestamp.
+ */
+export function checkScanHalt(
+  haltBlock: string | null,
+  haltCount: number,
+  threshold: number,
+  failingWithdrawalId: string | null,
+  lastError: string | null,
+  checkedAt: string = new Date().toISOString(),
+): Alert[] {
+  if (!haltBlock || haltCount < threshold) return [];
+  const idClause = failingWithdrawalId
+    ? ` (failing withdrawalId=${failingWithdrawalId})`
+    : '';
+  const errClause = lastError ? ` Last error: ${lastError}` : '';
+  return [{
+    level: 'critical',
+    type: 'GNOSIS_SCAN_HALTED',
+    timestamp: checkedAt,
+    message:
+      `Gnosis log scan has been halted at block ${haltBlock} for ` +
+      `${haltCount} consecutive polls (threshold ${threshold})${idClause}.` +
+      errClause,
+    data: {
+      haltBlock,
+      haltCount,
+      threshold,
+      failingWithdrawalId,
+      lastError,
+    },
+  }];
+}
