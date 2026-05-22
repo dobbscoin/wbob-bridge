@@ -55,8 +55,22 @@ export interface BackendConfig {
   };
   /** Fee rate for Dobbscoin payout transactions (satoshis per vbyte). */
   dobbscoinFeeRateSatPerVbyte: number;
-  /** Gnosis mainnet RPC URL. */
+  /**
+   * Single Gnosis RPC endpoint — the WRITE/signing path (executeMint, gas drip,
+   * emergency pause/unpause) is pinned to this. Equals gnosisRpcUrls[0] (the
+   * preferred self-hosted node). Pinned, not fallback(), to avoid splitting
+   * nonce derivation across endpoints with divergent mempools. See
+   * gnosis-rpc-fallback-v1.
+   */
   gnosisRpcUrl: string;
+  /**
+   * Ordered Gnosis RPC fallback list, preferred node first (public RPC after).
+   * The READ path (solvency monitor, event watcher, balance/receipt reads)
+   * wraps these in viem fallback() so chain reads survive the node going down.
+   * NOTE: entries past [0] may be non-archive public endpoints — deep-history
+   * reads must NOT ride this list (see questions-still-open.md Q28).
+   */
+  gnosisRpcUrls: string[];
   /** Private key of the wallet that pays gas for executeMint (needs xDAI only). */
   executorPrivateKey: Hex;
   /**
@@ -118,6 +132,30 @@ function requireEnv(key: string): string {
   return val;
 }
 
+/**
+ * Parse the ordered Gnosis RPC fallback list.
+ *
+ * Prefers the new comma-separated GNOSIS_RPC_URLS (node first, public after).
+ * Falls back to the legacy single GNOSIS_RPC_URL so existing deployments keep
+ * working if the new var is unset. Order is preserved and load-bearing:
+ * index 0 is the preferred endpoint and is what the write/signing path pins to.
+ */
+export function parseGnosisRpcUrls(): string[] {
+  const multi = process.env['GNOSIS_RPC_URLS'];
+  if (multi && multi.trim()) {
+    const urls = multi
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    if (urls.length === 0) {
+      throw new Error('GNOSIS_RPC_URLS is set but contains no usable URLs');
+    }
+    return urls;
+  }
+  // Back-compat: no GNOSIS_RPC_URLS → use the legacy single endpoint.
+  return [requireEnv('GNOSIS_RPC_URL')];
+}
+
 function optionalEnvInt(key: string, def: number): number {
   const val = process.env[key];
   if (!val) return def;
@@ -148,6 +186,11 @@ export function loadConfig(): BackendConfig {
     throw new Error(`DOBBSCOIN_NETWORK must be "mainnet" or "testnet", got: ${network}`);
   }
 
+  // Ordered Gnosis RPC list (node first). gnosisRpcUrls[0] is the preferred
+  // endpoint the write/signing path pins to; the full list feeds the read-path
+  // fallback().
+  const gnosisRpcUrls = parseGnosisRpcUrls();
+
   return {
     databaseUrl:                requireEnv('DATABASE_URL'),
     port:                       optionalEnvInt('PORT', 3000),
@@ -163,7 +206,8 @@ export function loadConfig(): BackendConfig {
       timeoutMs: optionalEnvInt('DOBBSCOIN_RPC_TIMEOUT_MS', 30_000),
     },
     dobbscoinFeeRateSatPerVbyte: optionalEnvInt('DOBBSCOIN_FEE_RATE_SAT_PER_VBYTE', 10),
-    gnosisRpcUrl:               requireEnv('GNOSIS_RPC_URL'),
+    gnosisRpcUrl:               gnosisRpcUrls[0]!,
+    gnosisRpcUrls,
     executorPrivateKey:         requireEnv('EXECUTOR_PRIVATE_KEY') as Hex,
     bridgeControllerAddress:    requireEnv('BRIDGE_CONTROLLER_ADDRESS') as Address,
     bridgeExecutorModuleAddress: (process.env['BRIDGE_EXECUTOR_MODULE_ADDRESS'] ?? null) as Address | null,

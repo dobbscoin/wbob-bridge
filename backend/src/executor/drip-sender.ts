@@ -17,6 +17,7 @@ import {
   createPublicClient,
   createWalletClient,
   http,
+  fallback,
   type Hex as ViemHex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -58,7 +59,9 @@ export class DripSender {
     this.account = privateKeyToAccount(config.dripHotWalletPrivateKey as ViemHex);
     this.publicClient = createPublicClient({
       chain: gnosis,
-      transport: http(config.gnosisRpcUrl),
+      // READ path: fallback() across the ordered RPC list so reads survive the
+      // node going down. Writers stay pinned to gnosisRpcUrl — see config.ts.
+      transport: fallback(config.gnosisRpcUrls.map((u) => http(u))),
     });
     this.walletClient = createWalletClient({
       account: this.account,

@@ -40,6 +40,7 @@ const _WITHDRAWAL_EVENT_SIGHASH =
 function makeConfig(overrides: Partial<BackendConfig> = {}): BackendConfig {
   return {
     gnosisRpcUrl:                'http://unused-in-test:8545',
+    gnosisRpcUrls:               ['http://unused-in-test:8545'],
     gnosisConfirmationDepth:     12,
     gnosisLogScanChunk:          1000,
     gnosisScanHaltAlertThreshold: 10,

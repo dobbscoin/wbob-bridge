@@ -21,6 +21,7 @@ import {
   createPublicClient,
   createWalletClient,
   http,
+  fallback,
   parseAbi,
   type Hex as ViemHex,
 } from 'viem';
@@ -88,7 +89,9 @@ export class MintExecutor {
     this.account = privateKeyToAccount(config.executorPrivateKey as ViemHex);
     this.publicClient = createPublicClient({
       chain: gnosis,
-      transport: http(config.gnosisRpcUrl),
+      // READ path: fallback() across the ordered RPC list so reads survive the
+      // node going down. Writers stay pinned to gnosisRpcUrl — see config.ts.
+      transport: fallback(config.gnosisRpcUrls.map((u) => http(u))),
     });
     this.walletClient = createWalletClient({
       account: this.account,
