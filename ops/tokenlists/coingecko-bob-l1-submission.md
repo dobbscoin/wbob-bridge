@@ -30,7 +30,7 @@ path. The wBOB submission uses the contract-address path.)
 | Max supply | **No hard cap** (a `MAX_MONEY` sanity ceiling exists at 10,000,000,000 BOB but is not a circulating-supply cap) |
 | Block explorer | https://explorer.dobbscoin.info/ |
 | Explorer JSON API | https://explorer.dobbscoin.info/ext/getsummary (returns blockcount, difficulty, hashrate, supply, connections) |
-| Source repo | https://github.com/dobbscoin/dobbscoin-source |
+| Source repo | https://github.com/SubGeniusFinance/dobbscoin-source |
 | Project homepage | https://dobbscoin.info |
 | Logo | Canonical BOB layer-1 logo (gold coin with "Bob" Dobbs face + binary border) — local copy: `ops/tokenlists/logo/BOB-512.png` (512×512 RGBA, 235 KB). Source-of-truth: `androidbob/market/market-app-icon.png` (the Google Play store icon for the official BOB Android wallet). For submissions that want smaller resolution, also available at `ops/tokenlists/logo/BOB-256.png`. **NOTE:** this is a different image from the wBOB submission's logo — that one has a "w"-prefix variant; this one is the original (BOB) coin face. |
 | Wrapped variant (CoinGecko ID) | The paired wBOB-on-Gnosis submission |

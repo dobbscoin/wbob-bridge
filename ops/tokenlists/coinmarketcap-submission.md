@@ -78,7 +78,7 @@ fall back to CoW Swap as the primary cited venue.)
 - [ ] Telegram group
 - [ ] Discord invite (existing SubGenius / Dobbscoin server)
 - [ ] Reddit — r/SubGenius (community), r/Dobbscoin (token-specific if it exists)
-- [ ] GitHub: https://github.com/dobbscoin (org)
+- [ ] GitHub: https://github.com/SubGeniusFinance (org)
 - [ ] Bitcointalk thread: TBD (link if there's a current ANN)
 
 ## "Parent" coin link

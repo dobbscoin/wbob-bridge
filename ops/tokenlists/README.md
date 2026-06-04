@@ -54,7 +54,7 @@ git add src/tokens/gnosis.json src/assets/gnosis/0x13550ae65f22a36f60a50d625b70b
 git commit -m "feat(add): Wrapped Dobbscoin (wBOB)"
 git push origin master
 
-# 7. Open the PR via github.com/dobbscoin/default-token-list and click
+# 7. Open the PR via github.com/SubGeniusFinance/default-token-list and click
 #    "Compare & pull request". Title:  "feat(add): Wrapped Dobbscoin (wBOB)"
 #
 #    Body suggestion:

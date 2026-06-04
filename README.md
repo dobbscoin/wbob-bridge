@@ -137,7 +137,7 @@ modifications (Kimoto Gravity Well at block 13,579, DigiShield at
 | Max supply | **No hard cap.** A `MAX_MONEY` sanity ceiling of 10B exists, but is not a circulating-supply cap. The "21M cap" is a marketing line from 2014 that has never been true since the flat-subsidy transition. |
 | Genesis | January 2014 |
 
-Source: [`dobbscoin/dobbscoin-source`](https://github.com/dobbscoin/dobbscoin-source).
+Source: [`SubGeniusFinance/dobbscoin-source`](https://github.com/SubGeniusFinance/dobbscoin-source).
 Live chain stats: https://explorer.dobbscoin.info/ext/getsummary
 
 ---

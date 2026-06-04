@@ -11,9 +11,9 @@ const RESOURCES: ResourceLink[] = [
   { href: 'https://dobbscoin.info/',                                            label: 'Dobbscoin.info',    sub: 'Backed by NOTHING,\nPowered by Everything'},
   { href: 'https://explorer.dobbscoin.info/',                                   label: 'Explorer',          sub: 'Where They At?'                          },
   { href: 'https://pool.dobbscoin.info/',                                       label: 'Mining Pool',       sub: 'Get Slack NOW,\nWhile Difficulty is LOW' },
-  { href: 'https://github.com/dobbscoin/dobbscoin-source/releases',             label: 'Full Node',         sub: 'Full Node Wallet'                        },
-  { href: 'https://github.com/dobbscoin/dobbscoin-source/releases/tag/v0.10.1', label: 'Qt Wallet',         sub: 'Windows Dobbscoin Client'                },
-  { href: 'https://github.com/dobbscoin/dobbscoin-source',                      label: 'GitHub REPO',       sub: 'Daemon + Qt repo'                        },
+  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source/releases',             label: 'Full Node',         sub: 'Full Node Wallet'                        },
+  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source/releases/tag/v0.11.0', label: 'Qt Wallet',         sub: 'Windows Dobbscoin Client'                },
+  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source',                      label: 'GitHub REPO',       sub: 'Daemon + Qt repo'                        },
   { href: 'https://subgenius.vip/dobbscoin.apk',                                label: 'Android Wallet',    sub: '.apk download'                           },
   { href: 'https://dobbscoin.info/faucet',                                      label: 'FAUCET',            sub: 'Something 4 Nothing'                     },
 ];
