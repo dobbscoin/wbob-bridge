@@ -12,6 +12,7 @@ import { useQuery } from '@tanstack/react-query';
 import { parseEventLogs } from 'viem';
 import { getOrder, getOrderByWithdrawal, type OrderResponse } from '@/lib/api';
 import { satsToBob, bobToSats, gnosisExplorerTx, dobbscoinExplorerTx, shortHash } from '@/lib/utils';
+import { OutboundConfirmationNote } from '@/components/ConfirmationNotice';
 import { WBOB_ABI, BRIDGE_CONTROLLER_ABI, WBOB_ADDRESS, BRIDGE_CONTROLLER_ADDRESS } from '@/lib/contracts';
 import { OrderProgress } from '@/components/OrderProgress';
 
@@ -307,6 +308,8 @@ export default function WithdrawPage() {
           Burn wBOB on Gnosis. The bridge pays out BOB to your Dobbscoin address.
         </p>
       </div>
+
+      <OutboundConfirmationNote />
 
       {!address ? (
         <div className="card flex flex-col items-center gap-4 py-10">

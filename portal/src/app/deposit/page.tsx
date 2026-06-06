@@ -104,7 +104,7 @@ export default function DepositPage() {
         <div className="text-xs text-gray-400 space-y-1 border-t border-gray-800 pt-3">
           <p>• Send <span className="text-gray-200 font-medium">any amount</span> of BOB to this address.</p>
           <p>• You'll receive the exact amount sent as wBOB on Gnosis ({depositInfo?.recipientAddress.slice(0, 10)}…).</p>
-          <p>• Deposits are credited after 6 Dobbscoin confirmations (~6 minutes).</p>
+          <p>• Deposits are credited after 60 Dobbscoin confirmations (~2 hours).</p>
           <p>• Reusable — deposit as many times as you like.</p>
         </div>
       </div>

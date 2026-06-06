@@ -15,6 +15,7 @@ import { satsToBob } from '@/lib/utils';
 import Link from 'next/link';
 import { OnboardingPanel } from '@/components/OnboardingPanel';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
+import { InboundConfirmationBanner } from '@/components/ConfirmationNotice';
 
 const ACTIVE_STATES = new Set([
   'DEPOSIT_SEEN_MEMPOOL',
@@ -117,6 +118,8 @@ export default function TestBedPage() {
             )}
           </div>
 
+          <InboundConfirmationBanner />
+
           {/* Step 1 — bridge in (with drip opt-in checkbox before allocation) */}
           <div className="card space-y-4">
             <div>
@@ -125,8 +128,8 @@ export default function TestBedPage() {
               </h2>
               <p className="mt-1 text-xs text-gray-500">
                 Connect a wallet to get a permanent Dobbscoin deposit address.
-                Send any amount; wBOB lands on Gnosis after 6 confirmations
-                (~6 minutes).
+                Send any amount; wBOB lands on Gnosis after 60 confirmations
+                (~2 hours, at 2-minute Dobbscoin blocks).
               </p>
             </div>
 

@@ -89,7 +89,7 @@ export default function OrderPage() {
 
         {!isOutbound && order.confirmations !== null && (
           <DetailRow label="Confirmations">
-            {order.confirmations} / 6
+            {order.confirmations} / 60
           </DetailRow>
         )}
 
