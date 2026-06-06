@@ -2,14 +2,12 @@
 //
 // User-facing explainer for the inbound confirmation wait (BOB → wBOB).
 //
-// Background: the watcher's MIN/FINAL Dobbscoin confirmation thresholds are
-// 30/60 (~1h / ~2h) as of the 2026-06-06 recalibration (previously 144/288,
-// ~9.6h, which was uncalibrated — and the UI had never been updated to match).
-// Some depth is still 51%-attack hardening: (BOB) is a low-hash scrypt chain,
-// so a couple hours of confirmations stop rented-hash reorgs from un-spending a
-// deposit already minted as wBOB on Gnosis. A 100-block consensus reorg cap
-// also lands at block 1,888,808 (~2026-07-16), after which 100 confs is
-// provable finality.
+// The watcher's MIN/FINAL Dobbscoin confirmation thresholds are 30/60
+// (~1h to "confirmed", ~2h to mint), tuned for 51%-attack hardening.
+// (BOB) is a low-hash scrypt chain, so a couple hours of confirmations stop
+// rented-hash reorgs from un-spending a deposit already minted as wBOB on
+// Gnosis. A 100-block consensus reorg cap also lands at block 1,888,808
+// (~2026-07-16), after which 100 confs is provable finality.
 //
 // The wait applies to *inbound* (BOB → wBOB) only. Withdrawals (wBOB → BOB)
 // settle in roughly one Gnosis block-time on the burn side (~1 min), since
