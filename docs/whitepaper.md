@@ -2,7 +2,7 @@
 
 **A Whitepaper of Quasi-Sober Engineering with a Slack-Adjacent Disposition**
 
-*v0.1 — Submitted to the Conspiracy under protest, with "Bob"'s endorsement.*
+*v0.2 — Recalibrated confirmation thresholds to match the deployed bridge. Submitted to the Conspiracy under protest, with "Bob"'s endorsement.*
 
 ---
 
@@ -61,16 +61,40 @@ independent watchers refuse to collude**. Specifically:
   independently verifies that:
   1. The transaction lands on the Dobbscoin canonical chain
   2. It pays the correct amount to a watched address
-  3. It has reached the finalization threshold (6 confirmations, ~6 minutes)
+  3. It has reached the finalization threshold (**60 confirmations, ~2 hours
+     at 2-minute block spacing**)
   4. The deposit hasn't already been processed (replay prevention via
      a deterministic `depositId` derived from txid + vout + amount + recipient)
-- Once confirmed, each watcher signs an **EIP-712 typed `MintAuthorization`**
+- Once finalized, each watcher signs an **EIP-712 typed `MintAuthorization`**
   — a structured data blob that includes the `depositId`, the recipient
   address, the amount, the source chain ID, and a deadline.
 - When 3 of 5 signatures accumulate, **anyone** may submit them to
   `BridgeController.executeMint()`, which verifies the threshold, dedupes
   signers, marks the `depositId` as processed (forever, no clearing), and
   mints the corresponding wBOB.
+
+### 2.1 Why 60 confirmations
+
+(BOB) is a low-hash scrypt chain. Network hashrate hovers in the low
+hundreds of MH/s — well within the rental envelope of a NiceHash-class
+attacker. A bridge that minted wBOB after 6 confirmations could, in
+principle, be drained: deposit (BOB), wait 12 minutes, mint wBOB, swap
+wBOB for xDAI on Gnosis, then 51%-reorg the Dobbscoin chain to invalidate
+the deposit before the watchers noticed. The bridge would still hold the
+debt; the underlying (BOB) deposit would simply disappear from canonical
+history.
+
+Sixty confirmations (~2 hours) raises the rented-hashrate budget for that
+attack by an order of magnitude — sustained 51%+ for two hours is a very
+different shopping list than for twelve minutes. It is also forward-
+compatible with the **v0.11.0 hard fork at block 1,888,808 (~2026-07-16)**,
+which introduces a 100-block consensus cap on reorg depth (see
+`dobbscoin-source/src/pow.h MAX_REORG_DEPTH`). Past that fork, a reorg
+deeper than 60 blocks is not consensus-legal to begin with; 60-conf
+finality straddles the cap with margin.
+
+This is the trade we make explicit: **inbound deposits are slow on
+purpose**. Outbound withdrawals are not (§3).
 
 The contract requires no further authority for mint. There is no
 sysadmin who can intervene mid-mint. There is no oracle that can declare
@@ -90,6 +114,12 @@ B for Bob, of course.
 
 ## 3. The Reverse Direction: Burning is Praying
 
+Outbound is the fast direction. The asymmetry is the entire point of §2.1:
+inbound has to defend against rented-hash reorgs, outbound does not —
+because by the time the bridge pays out, the wBOB it represents has
+already been burned on Gnosis and cannot be re-spent. A failed-payout
+liability stays on the operator's books, not on the supply ledger.
+
 To redeem wBOB for (BOB), the holder calls `requestWithdrawal(amount,
 dobbscoinAddress)` on the BridgeController. The contract:
 
@@ -98,14 +128,20 @@ dobbscoinAddress)` on the BridgeController. The contract:
    tithe and you walk away lighter.
 2. Emits a `WithdrawalRequested` event containing the burn details and a
    monotonically-increasing per-user nonce.
-3. The bridge backend, watching Gnosis for these events, waits 12 blocks
-   for finalization, then constructs a Dobbscoin transaction that pays
-   the requested address from the bridge's hot-wallet UTXO pool. The hot
-   wallet's keys are derived from a hierarchical deterministic seed that
-   the bridge operator alone holds.
-4. Once the Dobbscoin payout transaction reaches 3 confirmations, the
-   bridge marks the order `COMPLETED`, and Slack returns to its previous
-   level.
+3. The bridge backend, watching Gnosis for these events, waits **12
+   Gnosis blocks (~1 minute)** for burn-tx finalization, then constructs
+   a Dobbscoin transaction that pays the requested address from the
+   bridge's hot-wallet UTXO pool. The hot wallet's keys are derived from
+   a hierarchical deterministic seed that the bridge operator alone holds.
+4. Once the Dobbscoin payout transaction reaches **3 confirmations
+   (~6 minutes)**, the bridge marks the order `COMPLETED`, and Slack
+   returns to its previous level.
+
+End-to-end outbound latency is therefore on the order of **~7 minutes**
+(1 min Gnosis finality + a few seconds for queue and broadcast + ~6 min
+Dobbscoin payout confirmation). Compared to inbound's ~2-hour deep-conf
+wait, this is the bridge's standing offer: *the door swings out faster
+than it swings in*.
 
 The bridge absorbs the Dobbscoin miner fee (~2,260 satoshis per
 2-input/2-output payout). This is the bridge's tithe to the Dobbscoin
@@ -177,9 +213,11 @@ The contracts have been subjected to:
   sequences and asserts the supply-vs-deposits balance never breaks
 
 None of this is a substitute for a real audit. An independent contract
-review is currently underway. Until that review is complete, the prudent
-SubGenius will treat the bridge as **experimental** and limit exposure
-accordingly. Your Slack is yours to risk.
+review remains pending; soliciting one is on the active roadmap (§8).
+Until that review is complete, the prudent SubGenius will treat the
+bridge as **experimental** and limit exposure accordingly. The
+contracts have a `BridgeController.dailyMintCap` parameter currently
+set conservatively for the same reason. Your Slack is yours to risk.
 
 In the case of an emergency, the Gnosis Safe can:
 
@@ -198,7 +236,7 @@ rest is up to "Bob."
 ## 7. Governance: Two Layers, Carefully Separated
 
 **The bridge contract layer has no governance, and never will.**
-[tt]WBob.sol[/tt] and [tt]BridgeController.sol[/tt] expose no
+`WBob.sol` and `BridgeController.sol` expose no
 parameter-tuning knobs that members can vote on, no "treasury" of
 locked (BOB) the contract can spend on its members' behalf, no upgrade
 proxy. There is one privileged role (`DEFAULT_ADMIN_ROLE`), it is
@@ -244,7 +282,7 @@ separate concern.
 
 Charter and contract addresses for the DAO are forthcoming. The
 canonical place to track its progress is this repository's
-[tt]docs/[/tt] directory; an updated whitepaper edition will follow
+`docs/` directory; an updated whitepaper edition will follow
 once the charter is finalized.
 
 Praise "Bob."
@@ -257,15 +295,23 @@ A roadmap is a confession of insecurity, but in the spirit of the
 Conspiracy-tolerant ecosystem we're entering, we offer the following
 non-binding aspirations:
 
-- **Q2 2026**: Independent contract audit. Onboard 5 distinct watcher
-  operators on independent infrastructure. Verify contracts on
-  Gnosisscan.
-- **Q3 2026**: Submit to Gnosis-ecosystem token registries. Establish
-  and grow on-chain liquidity (current pool: Oku, with execution
-  available via CoW Swap at `swap.cow.fi/#/100/swap/xDAI/wBOB`;
-  further pairs as warranted).
-- **Q4 2026**: Publish a post-mortem of all bugs found, all attacks
-  attempted, and all praise-of-"Bob" successfully completed.
+- **Shipped (Q2 2026):** Bridge live on Gnosis mainnet. Contracts
+  verified on Gnosisscan. Five watchers running on independent
+  infrastructure. wBOB liquidity established on Oku (primary) with
+  execution available via CoW Swap at
+  `swap.cow.fi/#/100/swap/xDAI/wBOB` (secondary).
+- **Q3 2026:** Solicit and complete an independent contract audit.
+  Publish the report verbatim, findings and remediations alongside.
+  Submit wBOB to Gnosis-ecosystem token registries. Coordinate the bridge
+  through the (BOB) v0.11.0 LWMA-3 hard fork at block 1,888,808
+  (~2026-07-16) — once the 100-block consensus reorg cap is live, the
+  60-confirmation rule becomes provably above the worst-case attacker
+  budget, not merely above the practical one.
+- **Q4 2026:** Add the (BOB) v0.13.0 emergency-difficulty fork at block
+  1,888,888 and the v0.12.0 AuxPoW fork at block 2,000,000 (~2026-12-17)
+  to the watcher's chain-rule expectations. Publish a public post-mortem
+  of every bug found, every attack attempted, and every praise-of-"Bob"
+  successfully completed in the bridge's first six months.
 - **X-Day** (continuously deferred): Achieve total Slack. Probably won't
   happen but we'll mint the wBOB anyway.
 
