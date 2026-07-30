@@ -39,7 +39,9 @@ const DUMMY_KEY = `0x${'1'.repeat(64)}` as `0x${string}`;
 const MODULE_ADDR = `0x${'2'.repeat(40)}` as `0x${string}`;
 const CONTROLLER_ADDR = `0x${'3'.repeat(40)}` as `0x${string}`;
 
-const NODE = 'http://100.87.114.52:8545';
+// Placeholder self-hosted-node URL (TEST-NET-1 doc range) — never dialed;
+// these tests only assert transport wiring, not connectivity.
+const NODE = 'http://192.0.2.1:8545';
 const PUBLIC = 'https://rpc.gnosischain.com';
 
 function makeConfig(overrides: Partial<BackendConfig> = {}): BackendConfig {
