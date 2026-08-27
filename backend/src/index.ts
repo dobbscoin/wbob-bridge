@@ -58,7 +58,7 @@ async function main(): Promise<void> {
     console.log('[backend] DripSender disabled (DRIP_ENABLED=false)');
   }
 
-  const monitor        = new SolvencyMonitor(sql, config, dripSender);
+  const monitor        = new SolvencyMonitor(sql, config, dripSender, rpc);
   const server         = await buildServer({ sql, wallet, config, monitor });
   const mintExecutor   = new MintExecutor(sql, config, dripSender);
   const gnosisWatcher  = new GnosisEventWatcher(sql, config);

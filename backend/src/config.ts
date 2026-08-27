@@ -29,6 +29,13 @@ export interface BackendConfig {
    * Default 4 h.
    */
   stuckOrderThresholdHours: number;
+
+  /**
+   * Minutes without a new Dobbscoin block before the chain is called stalled.
+   * (BOB) has a single miner, so production stops when he stops -- and every
+   * in-flight deposit stops confirming with it. Normal spacing is ~2 minutes.
+   */
+  chainStallThresholdMinutes: number;
   /** Postgres connection string. */
   databaseUrl: string;
   /** HTTP port. */
@@ -217,6 +224,7 @@ export function loadConfig(): BackendConfig {
     alertCooldownMs:            optionalEnvInt('ALERT_COOLDOWN_MS', 3_600_000),
     lowUtxoThresholdSat:        optionalEnvInt('LOW_UTXO_THRESHOLD_SAT', 100_000_000),
     stuckOrderThresholdHours:   optionalEnvInt('STUCK_ORDER_THRESHOLD_HOURS', 4),
+    chainStallThresholdMinutes: optionalEnvInt('CHAIN_STALL_THRESHOLD_MINUTES', 30),
     mintDeadlineSeconds:        optionalEnvInt('MINT_DEADLINE_SECONDS', 3600),
     executorPollIntervalMs:     optionalEnvInt('EXECUTOR_POLL_INTERVAL_MS', 15_000),
     gnosisConfirmationDepth:    optionalEnvInt('GNOSIS_CONFIRMATION_DEPTH', 12),
