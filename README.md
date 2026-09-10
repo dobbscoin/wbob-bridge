@@ -1,3 +1,12 @@
+<!-- home-banner -->
+> ### 🏠 Home is [git.subgenius.finance](https://git.subgenius.finance/SubGeniusFinance/wbob-bridge).
+>
+> The GitHub copy is a **mirror, pushed from here** — issues and pull requests opened there are not watched.
+> Builds and downloads: **[bridge.subgenius.finance](https://bridge.subgenius.finance)** — the bridge.
+>
+> **Have a fork or a clone?** Point it home with `git remote set-url origin https://git.subgenius.finance/SubGeniusFinance/wbob-bridge.git`
+
+---
 # wBOB Bridge
 
 > *Backed By Nothing, Powered By Everything.*
