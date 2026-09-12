@@ -45,6 +45,22 @@ For listing context see https://support.coingecko.com/hc/en-us/sections/32146983
 
 Active trading venues on Gnosis:
 
+
+> ⚠️ **LIQUIDITY STATUS — 2026-08-31. Do not submit until this block is removed.**
+>
+> Both venues below are currently **empty**. Combined TVL across every known wBOB
+> pool is **$0.0038**, 24h volume is **$0.00**, and CoW Swap's aggregator returns
+> `NoLiquidity - no route found` for wBOB. A reviewer clicking either link sees no
+> market, which fails CoinGecko's and CMC's "active pair with real volume" bar and
+> reads as misrepresentation rather than an oversight.
+>
+> Cause is not a fault: the sole LP seeded ~169,972 wBOB + 1,691 WXDAI into the
+> Uniswap v3 pool in May, withdrew it 27-29 May, and burned 169,999 wBOB back to
+> (BOB) on 9 June. Total lifetime trading against it was about **$11**.
+>
+> **Re-seed a pool, let real volume accrue, then re-check these links and delete
+> this block.** Live figures: <https://subgenius.finance/pools.json>
+
 - **CoW Swap** (default direction wBOB → WXDAI):
   https://swap.cow.fi/#/100/swap/wBOB/WXDAI
 - **Oku** (default direction WXDAI → wBOB):

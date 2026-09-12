@@ -91,10 +91,29 @@ BOB does not currently trade on any centralized exchange. Price
 discovery happens on the Gnosis Chain via the wBOB wrapped variant,
 which is backed 1:1 by escrowed BOB:
 
+
+> ⚠️ **LIQUIDITY STATUS — 2026-08-31. Do not submit until this block is removed.**
+>
+> Both venues below are currently **empty**. Combined TVL across every known wBOB
+> pool is **$0.0038**, 24h volume is **$0.00**, and CoW Swap's aggregator returns
+> `NoLiquidity - no route found` for wBOB. A reviewer clicking either link sees no
+> market, which fails CoinGecko's and CMC's "active pair with real volume" bar and
+> reads as misrepresentation rather than an oversight.
+>
+> Cause is not a fault: the sole LP seeded ~169,972 wBOB + 1,691 WXDAI into the
+> Uniswap v3 pool in May, withdrew it 27-29 May, and burned 169,999 wBOB back to
+> (BOB) on 9 June. Total lifetime trading against it was about **$11**.
+>
+> **Re-seed a pool, let real volume accrue, then re-check these links and delete
+> this block.** Live figures: <https://subgenius.finance/pools.json>
+
 - **CoW Swap (Gnosis)** — wBOB → WXDAI:
   https://swap.cow.fi/#/100/swap/wBOB/WXDAI
 - **Oku (Gnosis)** — WXDAI → wBOB:
-  https://oku.trade/swap?inputChain=gnosis
+  https://oku.trade/swap?inputChain=gnosis&inToken=0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d&outToken=0x13550ae65f22A36f60A50d625B70b58666488263
+  (the bare `?inputChain=gnosis` form opens Oku's default pair, NOT wBOB)
+- **Swapr (Gnosis)** — the only pool currently holding wBOB:
+  https://www.geckoterminal.com/xdai/pools/0xd89d7549d9a00ec1f426683d4fbddb502a37e4e2
 
 Because wBOB is 1:1 redeemable for native BOB through the bridge at
 https://bridge.subgenius.finance, the WXDAI/wBOB market on Gnosis is
