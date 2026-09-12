@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { CowSwapWidget } from '@/components/CowSwapWidget';
 import { OkuSwapWidget } from '@/components/OkuSwapWidget';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
+import { EmptyMarketNotice } from '@/components/EmptyMarketNotice';
 import { CopyAddress } from '@/components/CopyAddress';
 import { WBOB_ADDRESS } from '@/lib/contracts';
 import { WXDAI_ADDRESS } from '@/lib/onboarding';
@@ -30,6 +31,8 @@ export default function TradePage() {
           </Link>
         </p>
       </div>
+
+      <EmptyMarketNotice />
 
       <NFADisclaimer />
 

@@ -1,5 +1,6 @@
 'use client';
 
+import { InFlightDeposit } from '@/components/InFlightDeposit';
 import { useCallback, useEffect, useState } from 'react';
 import { useAccount } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
@@ -61,7 +62,9 @@ export default function TestBedPage() {
   const { data: history } = useQuery({
     queryKey: ['orders-by-recipient', address],
     queryFn: () => listOrdersByRecipient(address!),
-    enabled: !!address && confirmed,
+    // NOT gated on `confirmed`: that is useState(false) and resets on reload,
+    // which hid in-flight deposits from anyone who refreshed the page.
+    enabled: !!address,
     refetchInterval: (query) => {
       const anyActive = query.state.data?.orders.some(
         (o) => o.orderType === 'inbound' && ACTIVE_STATES.has(o.state),
@@ -76,6 +79,11 @@ export default function TestBedPage() {
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   }, [depositInfo]);
+
+  // The most recent inbound order still moving -- drives the landing-zone receipt.
+  const activeOrder = history?.orders
+    ?.filter((o) => o.orderType === 'inbound' && ACTIVE_STATES.has(o.state))
+    ?.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -117,6 +125,8 @@ export default function TestBedPage() {
               </ConnectButton.Custom>
             )}
           </div>
+
+          {activeOrder && <InFlightDeposit order={activeOrder} />}
 
           <InboundConfirmationBanner />
 
