@@ -12,6 +12,19 @@
 import { spawn } from 'node:child_process';
 import type { Alert } from './types.js';
 
+/*
+ * SENDER: must be a domain this host is allowed to send as.
+ *
+ * This was bridge-alerts@bridge.subgenius.finance until 2026-09-12. That is a
+ * non-sending domain -- SPF -all and DMARC p=reject -- so Gmail refused every
+ * alert with 550-5.7.26, and because local sendmail accepts and exits 0 the
+ * monitor logged nothing and believed it had delivered. Ten alerts were lost
+ * between 2026-08-29 and 2026-09-11, including six consecutive hourly ones.
+ *
+ * subgenius.vip lists this host in SPF (ip4:159.198.79.74) and its DMARC is
+ * p=none, so mail from here authenticates. Do not point this back at a
+ * subgenius.finance address to make it look tidier -- that is the bug.
+ */
 const SENDMAIL_PATH = '/usr/sbin/sendmail';
 
 export interface AlertDispatcherOptions {
@@ -30,11 +43,11 @@ export class AlertDispatcher {
     if (options === null || typeof options === 'string') {
       this.webhookUrl = options ?? null;
       this.emailTo = null;
-      this.emailFrom = 'bridge-alerts@bridge.subgenius.finance';
+      this.emailFrom = 'bridge-alerts@subgenius.vip';
     } else {
       this.webhookUrl = options.webhookUrl ?? null;
       this.emailTo = options.emailTo ?? null;
-      this.emailFrom = options.emailFrom ?? 'bridge-alerts@bridge.subgenius.finance';
+      this.emailFrom = options.emailFrom ?? 'bridge-alerts@subgenius.vip';
     }
   }
 
