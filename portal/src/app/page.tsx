@@ -13,7 +13,6 @@ import {
   type OrderResponse,
 } from '@/lib/api';
 import { satsToBob } from '@/lib/utils';
-import Link from 'next/link';
 import { OnboardingPanel } from '@/components/OnboardingPanel';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
 import { InboundConfirmationBanner } from '@/components/ConfirmationNotice';
@@ -209,8 +208,10 @@ export default function TestBedPage() {
         {/* Right column: Step 2 on top (mobile flow 0→1→2 stays in order), One-click setup grows to fill */}
         <div className="flex flex-col gap-6">
           {/* Step 2 — trade link, natural height */}
-          <Link
-            href="/trade"
+          <a
+            href="https://oku.trade/swap?inputChain=gnosis&inToken=0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d&outToken=0x13550ae65f22A36f60A50d625B70b58666488263"
+            target="_blank"
+            rel="noopener noreferrer"
             className="card flex flex-col justify-between gap-3 group hover:border-bob-600 transition-colors"
           >
           <div>
@@ -218,20 +219,21 @@ export default function TestBedPage() {
               Step 2 — Trade wBOB
             </h2>
             <p className="mt-1 text-xs text-gray-500">
-              Once your wBOB lands and your wallet has gas, head over to the
-              trade page — embedded CoW Swap and Oku, both routed on Gnosis.
-              Bridge takes no fee.
+              Once your wBOB lands and your wallet has gas, trading happens
+              somewhere else. This bridge does not run a venue and never did
+              take a fee. Whatever you find out there is whatever is actually
+              in the pool, which is not much.
             </p>
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
-            <li>• CoW Swap — wBOB → WXDAI</li>
-            <li>• Oku — WXDAI → wBOB</li>
-            <li>• Both need xDAI for gas (see below).</li>
+            <li>• Oku — WXDAI → wBOB, on Gnosis.</li>
+            <li>• You need xDAI for gas (see below).</li>
+            <li>• Liquidity is measured in cents. Check before you swing.</li>
           </ul>
           <p className="text-xs text-bob-400 group-hover:underline">
-            Open trade page →
+            Trade on Oku ↗
           </p>
-          </Link>
+          </a>
 
           {/* One-click setup — grows to fill remaining right-column height */}
           <OnboardingPanel className="flex-1" />
