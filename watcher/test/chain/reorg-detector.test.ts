@@ -176,6 +176,18 @@ describe('ReorgDetector', () => {
       expect(result!.added.map((h) => h.height)).toEqual([3, 4, 5]);
     });
 
+    it('throws instead of walking further than maxWalk', async () => {
+      const chain = buildChain(20);
+      const d = new ReorgDetector();
+      d.addBlock(chain[5]!);
+      await expect(
+        d.computeDiff(chain[19]!.hash, makeFetch(chain), chain[5]!.hash, 10),
+      ).rejects.toThrow('no known block within 10 blocks');
+      // 14 blocks back reaches the known one: allowed
+      const diff = await d.computeDiff(chain[19]!.hash, makeFetch(chain), chain[5]!.hash, 14);
+      expect(diff!.added).toHaveLength(14);
+    });
+
     it('orphaned blocks are sorted height-desc', async () => {
       const base = buildChain(3);
       const a2 = base[2]!;

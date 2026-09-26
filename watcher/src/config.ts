@@ -33,6 +33,8 @@ export interface WatcherConfig {
   dobbscoinChainId: bigint;
   /** How many blocks to keep in the reorg window. */
   reorgDepth: number;
+  /** Most blocks to replay automatically on startup; above this, refuse to start. */
+  catchupMaxBlocks: number;
 }
 
 function requireEnv(key: string): string {
@@ -73,5 +75,6 @@ export function loadConfig(): WatcherConfig {
     dobbscoinNetwork:        network,
     dobbscoinChainId:        DOBBSCOIN_CHAIN_IDS[network],
     reorgDepth:              optionalEnvInt('REORG_DEPTH', 200),
+    catchupMaxBlocks:        optionalEnvInt('WATCHER_CATCHUP_MAX_BLOCKS', 2_000),
   };
 }
