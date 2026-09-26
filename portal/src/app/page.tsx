@@ -206,21 +206,22 @@ export default function TestBedPage() {
           )}
         </div>
 
-        {/* Right column: Step 2 on top (mobile flow 0→1→2 stays in order), One-click setup grows to fill */}
+        {/* Right column: the wBOB-on-Gnosis note on top, One-click setup grows to fill */}
         <div className="flex flex-col gap-6">
-          {/* Step 2 — trade link, natural height */}
+          {/* Not a step: trading is possible, not suggested (btcbob, 2026-09-26). Natural height. */}
           <Link
             href="/trade"
             className="card flex flex-col justify-between gap-3 group hover:border-bob-600 transition-colors"
           >
           <div>
             <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400 group-hover:text-bob-400 transition-colors">
-              Step 2 — Trade wBOB
+              wBOB on Gnosis
             </h2>
             <p className="mt-1 text-xs text-gray-500">
-              Once your wBOB lands and your wallet has gas, head over to the
-              trade page — embedded CoW Swap and Oku, both routed on Gnosis.
-              Bridge takes no fee.
+              wBOB is an ordinary token on Gnosis Chain, so it can be traded
+              like one. There is a trade page with CoW Swap and Oku built in,
+              if you want it. Nothing here suggests you should. The bridge
+              takes no fee.
             </p>
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
@@ -229,7 +230,10 @@ export default function TestBedPage() {
             <li>• Both need xDAI for gas (see below).</li>
           </ul>
           <p className="text-xs text-bob-400 group-hover:underline">
-            Open trade page →
+            Trade page →
+          </p>
+          <p className="text-[10px] uppercase tracking-wide text-gray-600">
+            Not financial advisors. Not financial advice.
           </p>
           </Link>
 
