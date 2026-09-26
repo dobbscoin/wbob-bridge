@@ -220,8 +220,8 @@ export default function TestBedPage() {
             <p className="mt-1 text-xs text-gray-500">
               wBOB is an ordinary token on Gnosis Chain, so it can be traded
               like one. There is a trade page with CoW Swap and Oku built in,
-              if you want it. Nothing here suggests you should. The bridge
-              takes no fee.
+              if you want it. Nothing here suggests you should.
+              SubGenius.Finance takes no fee.
             </p>
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
