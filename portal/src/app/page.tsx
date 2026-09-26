@@ -17,6 +17,7 @@ import Link from 'next/link';
 import { OnboardingPanel } from '@/components/OnboardingPanel';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
 import { InboundConfirmationBanner } from '@/components/ConfirmationNotice';
+import { ReservesTicker } from '@/components/ReservesTicker';
 
 const ACTIVE_STATES = new Set([
   'DEPOSIT_SEEN_MEMPOOL',
@@ -87,6 +88,9 @@ export default function TestBedPage() {
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
+      {/* Proof of reserves: first thing on the page, full width, one slim line (btcbob, 2026-09-26). */}
+      <ReservesTicker />
+
       {/* Single 2-col grid: left = hero + step0 + step1 + drip + history, right = One-click setup + Step 2 (fills) */}
       <div className="grid md:grid-cols-2 gap-6">
         <div className="space-y-6">

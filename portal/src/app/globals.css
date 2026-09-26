@@ -35,3 +35,35 @@
     @apply block text-xs font-medium uppercase tracking-wide text-gray-400 mb-1.5;
   }
 }
+
+/* ─── Proof-of-reserves ticker ────────────────────────────────────────────────
+   Four lines plus a repeat of the first, stepped upward. Each line holds for
+   most of its slot, then slides; the last step lands on the repeat, which
+   looks identical to the start, so the loop has no visible jump. Height is
+   fixed, so the card never resizes. Pauses on hover. Hidden entirely under
+   prefers-reduced-motion (the component shows a static row instead). */
+.reserves-ticker {
+  height: 1.25rem;
+  overflow: hidden;
+}
+.reserves-ticker-track {
+  animation: reserves-ticker 16s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+}
+.reserves-ticker:hover .reserves-ticker-track {
+  animation-play-state: paused;
+}
+.reserves-ticker-item {
+  @apply truncate font-mono text-xs text-gray-300;
+  height: 1.25rem;
+  line-height: 1.25rem;
+}
+@keyframes reserves-ticker {
+  0%, 21%   { transform: translateY(0); }
+  25%, 46%  { transform: translateY(-1.25rem); }
+  50%, 71%  { transform: translateY(-2.5rem); }
+  75%, 96%  { transform: translateY(-3.75rem); }
+  100%      { transform: translateY(-5rem); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reserves-ticker-track { animation: none; }
+}

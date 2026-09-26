@@ -7,6 +7,7 @@ const TABS = [
   { href: '/',         label: 'Bridge'   },
   { href: '/trade',    label: 'Trade'    },
   { href: '/withdraw', label: 'Withdraw' },
+  { href: '/reserves', label: 'Reserves' },
 ];
 
 export function NavTabs() {
