@@ -109,12 +109,14 @@ class MockPublicClient {
 
 // ─── test harness ────────────────────────────────────────────────────────────
 
-const DATABASE_URL = process.env['DATABASE_URL_TEST'] ?? process.env['DATABASE_URL'];
+// Never fall back to DATABASE_URL: this suite TRUNCATEs bridge tables, and with the
+// production .env loaded that fallback pointed it at the live bridge database.
+const DATABASE_URL = process.env['DATABASE_URL_TEST'];
 
 let sql: Sql;
 
 beforeAll(async () => {
-  if (!DATABASE_URL) throw new Error('DATABASE_URL_TEST (or DATABASE_URL) must be set');
+  if (!DATABASE_URL) throw new Error('DATABASE_URL_TEST must be set to a disposable test database');
   sql = postgres(DATABASE_URL, { max: 2, types: { bigint: postgres.BigInt } });
 });
 
