@@ -261,7 +261,7 @@ export default function TestBedPage() {
               </a>
               .
             </li>
-            <li>• Trades on the trade page are routed by third-party DEXs (CoW Swap, Oku). The bridge takes no fee on swaps.</li>
+            <li>• Trades are routed by third-party DEXs (CoW Swap, Oku). SubGenius.Finance takes no fee on swaps.</li>
             <li>• (BOB) is not for sale — it is for trade.</li>
           </ul>
           <NFADisclaimer compact />
