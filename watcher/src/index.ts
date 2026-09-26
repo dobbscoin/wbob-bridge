@@ -15,7 +15,8 @@
 
 import postgres from 'postgres';
 import { DobbscoinRpcClient } from './rpc/client.js';
-import { BlockPoller } from './chain/block-poller.js';
+import { BlockPoller, CatchUpTooFarError } from './chain/block-poller.js';
+import { loadCursor, saveCursor } from './chain/cursor-store.js';
 import { createBlockHandlers } from './deposits/block-handler.js';
 import type { ConfirmationConfig } from './deposits/confirmation-tracker.js';
 import { MintAuthorizer } from './signing/authorizer.js';
@@ -27,6 +28,7 @@ import {
   type Hex,
   type Address,
 } from '@wbob/shared';
+import type { RpcBlock } from './rpc/types.js';
 
 // ─── BYTEA helper ────────────────────────────────────────────────────────────
 
@@ -138,10 +140,30 @@ async function main(): Promise<void> {
     }
   }
 
+  // ── Block cursor ──────────────────────────────────────────────────────────
+  // After each block's work is done, record it as this instance's cursor.
+  // If a deposit in a block failed to record, stop advancing the cursor for
+  // the rest of this run, so the next start replays from that block.
+
+  const watcherId = authorizer.address.toLowerCase();
+  let cursorHeldAt: number | null = null;
+
+  async function onBlock(block: RpcBlock): Promise<void> {
+    const complete = await handleBlock(block);
+    if (!complete && cursorHeldAt === null) {
+      cursorHeldAt = block.height;
+      console.error(
+        `[watcher] CURSOR HELD: a deposit in block ${block.height} failed to record (see error above). ` +
+        `The cursor stays below this block until restart; restarting this watcher replays from here.`,
+      );
+    }
+    if (cursorHeldAt === null) await saveCursor(sql, watcherId, { height: block.height, hash: block.hash });
+  }
+
   // ── Start polling ─────────────────────────────────────────────────────────
 
   const poller = new BlockPoller(rpc, {
-    onBlock:  handleBlock,
+    onBlock,
     onOrphan: handleOrphan,
     onError:  (err) => { console.error('[watcher] polling error:', err); return false; },
   }, config.reorgDepth);
@@ -158,10 +180,35 @@ async function main(): Promise<void> {
     }
   }
 
+  // Signing needs only the DB, so it starts now and runs through catch-up.
+  const signing = signingLoop();
+
+  // Catch up on blocks mined while this watcher was down, then poll normally.
+  for (;;) {
+    const cursor = await loadCursor(sql, watcherId);
+    try {
+      if (cursor === null) {
+        console.warn(
+          `[watcher] WARNING: no block cursor for watcher ${watcherId}. Starting at the current tip; ` +
+          `NO blocks before it were replayed. Deposits mined while this watcher was down are not checked.`,
+        );
+      } else {
+        console.log(`[watcher] catch-up: last processed block ${cursor.height} ${cursor.hash}`);
+      }
+      const r = await poller.catchUp(cursor, config.catchupMaxBlocks);
+      console.log(`[watcher] catch-up done: replayed ${r.replayed} block(s), orphaned ${r.orphaned}, tip ${r.tipHeight}`);
+      break;
+    } catch (err) {
+      if (err instanceof CatchUpTooFarError) throw err;
+      console.error('[watcher] catch-up error, retrying:', err);
+      await new Promise<void>((resolve) => setTimeout(resolve, config.pollIntervalMs));
+    }
+  }
+
   console.log(`[watcher] polling every ${config.pollIntervalMs}ms`);
   await Promise.all([
     poller.start(config.pollIntervalMs),
-    signingLoop(),
+    signing,
   ]);
 }
 

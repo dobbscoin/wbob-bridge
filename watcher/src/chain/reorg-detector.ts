@@ -63,6 +63,8 @@ export class ReorgDetector {
    * @param newTipHash   The hash returned by getBestBlockHash()
    * @param fetchHeader  Async function to retrieve a BlockHeader by hash
    * @param oldTipHash   Our previously recorded tip hash
+   * @param maxWalk      Give up (throw) after fetching this many headers
+   *                     without reaching a known block. Default: unbounded.
    * @returns null if newTipHash === oldTipHash (nothing changed)
    *          ReorgResult describing what was orphaned and what was added
    */
@@ -70,6 +72,7 @@ export class ReorgDetector {
     newTipHash: string,
     fetchHeader: (hash: string) => Promise<BlockHeader>,
     oldTipHash: string,
+    maxWalk = Infinity,
   ): Promise<ReorgResult | null> {
     if (newTipHash === oldTipHash) return null;
 
@@ -78,6 +81,9 @@ export class ReorgDetector {
     let cursor = newTipHash;
 
     while (!this.window.has(cursor)) {
+      if (added.length >= maxWalk) {
+        throw new Error(`ReorgDetector: no known block within ${maxWalk} blocks of the tip`);
+      }
       const header = await fetchHeader(cursor);
       added.push(header);
       cursor = header.previousblockhash;

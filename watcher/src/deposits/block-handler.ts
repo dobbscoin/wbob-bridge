@@ -40,6 +40,16 @@ interface ActiveDepositRow {
   vout:              number | null;
 }
 
+// Outputs of zero value can't be recorded (amount_sat must be > 0) or minted.
+// Skip them up front rather than fail on every replay of their block.
+function payingMatches(block: RpcBlock, watched: ReadonlySet<string>) {
+  return matchBlock(block, watched).filter((m) => {
+    if (m.amountSat > 0n) return true;
+    console.warn(`[watcher] ignoring zero-value output txid=${m.txid} vout=${m.vout} to ${m.depositAddress}`);
+    return false;
+  });
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationConfig: ConfirmationConfig) {
@@ -53,8 +63,21 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
   //      SEEN_MEMPOOL / CONFIRMED, compute confirmations from the tip height
   //      vs. its home block_height and drive SEEN → CONFIRMED → FINALIZED as
   //      thresholds are crossed. Also refreshes source_deposits.confirmations.
+  //
+  // Safe to replay (startup catch-up re-runs blocks): A only acts on orders
+  // still in DEPOSIT_ADDRESS_ASSIGNED, A2 skips a (txid, vout) already
+  // recorded, and B only moves states forward and never lowers the stored
+  // confirmation count.
+  //
+  // Returns false if a deposit in this block matched but failed to record
+  // (A/A2 errors are logged and swallowed per deposit). The caller must then
+  // not mark the block processed: A and A2 only ever see a payment in its
+  // own block, so nothing later would pick it up. B needs no such care, it
+  // recomputes from the tip on every block.
 
-  async function handleBlock(block: RpcBlock): Promise<void> {
+  async function handleBlock(block: RpcBlock): Promise<boolean> {
+    let complete = true;
+
     // ── A. First-sighting ──────────────────────────────────────────────────
     const pendingFirst = await sql<ActiveDepositRow[]>`
       SELECT
@@ -76,7 +99,7 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
 
     if (pendingFirst.length > 0) {
       const watchedSet = new Set(pendingFirst.map((d) => d.deposit_address));
-      const matches = matchBlock(block, watchedSet);
+      const matches = payingMatches(block, watchedSet);
       const depositsByAddress = new Map<string, ActiveDepositRow>();
       for (const d of pendingFirst) depositsByAddress.set(d.deposit_address, d);
 
@@ -139,6 +162,7 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
           });
           console.log(`[watcher] first-sight orderId=${deposit.order_id} txid=${match.txid} height=${block.height}`);
         } catch (err) {
+          complete = false;
           console.error(`[watcher] first-sight error txid=${match.txid}:`, err);
         }
       }
@@ -162,7 +186,7 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
     `;
     if (tracked.length > 0) {
       const trackedSet = new Set(tracked.map((a) => a.dobbscoin_address));
-      const matches = matchBlock(block, trackedSet);
+      const matches = payingMatches(block, trackedSet);
       const addrMap = new Map<string, TrackedAddress>();
       for (const a of tracked) addrMap.set(a.dobbscoin_address, a);
 
@@ -231,6 +255,13 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
           });
           console.log(`[watcher] auto-ingested deposit orderId=new txid=${match.txid} amount=${match.amountSat} recipient=${addrInfo.recipient_gnosis_address}`);
         } catch (err) {
+          if ((err as { code?: string }).code === '23505') {
+            // Unique violation on deposit_id: another watcher recorded this
+            // same deposit between our check and our insert. Nothing lost.
+            console.log(`[watcher] auto-ingest: txid=${match.txid} vout=${match.vout} already recorded by another watcher`);
+            continue;
+          }
+          complete = false;
           console.error(`[watcher] auto-ingest error txid=${match.txid}:`, err);
         }
       }
@@ -264,7 +295,7 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
 
           await tx`
             UPDATE source_deposits
-            SET confirmations = ${confs}, updated_at = now()
+            SET confirmations = GREATEST(confirmations, ${confs}), updated_at = now()
             WHERE order_id = ${row.order_id}
           `;
 
@@ -310,6 +341,8 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
         console.error(`[watcher] advance error orderId=${row.order_id}:`, err);
       }
     }
+
+    return complete;
   }
 
   // ── Orphan handler ────────────────────────────────────────────────────────
