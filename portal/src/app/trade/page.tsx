@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { CowSwapWidget } from '@/components/CowSwapWidget';
 import { OkuSwapWidget } from '@/components/OkuSwapWidget';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
+import { TradeNotice } from '@/components/TradeNotice';
 import { EmptyMarketNotice } from '@/components/EmptyMarketNotice';
 import { CopyAddress } from '@/components/CopyAddress';
 import { WBOB_ADDRESS } from '@/lib/contracts';
@@ -21,8 +22,8 @@ export default function TradePage() {
         </h1>
         <p className="text-sm text-gray-400">
           Two embedded venues, both on Gnosis chain. CoW Swap defaults to
-          wBOB → WXDAI; Oku defaults to WXDAI → wBOB. The bridge takes no fee
-          on either. Routes and pricing are entirely the venue&rsquo;s.
+          wBOB → WXDAI; Oku defaults to WXDAI → wBOB. SubGenius.Finance takes
+          no fee on either. Routes and pricing are entirely the venue&rsquo;s.
         </p>
         <p className="text-xs text-gray-500">
           ←{' '}
@@ -34,7 +35,7 @@ export default function TradePage() {
 
       <EmptyMarketNotice />
 
-      <NFADisclaimer />
+      <TradeNotice />
 
       <div className="grid lg:grid-cols-2 gap-6 items-start">
         <CowSwapWidget />
@@ -46,7 +47,7 @@ export default function TradePage() {
           What this page is
         </h3>
         <ul className="text-xs text-gray-500 space-y-1">
-          <li>• Two third-party swap UIs, embedded as iframes. Bridge takes no fee.</li>
+          <li>• Two third-party swap UIs, embedded as iframes. SubGenius.Finance takes no fee.</li>
           <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span>• Verify the token addresses in your wallet before signing —</span>
             <span className="inline-flex items-center gap-1">
