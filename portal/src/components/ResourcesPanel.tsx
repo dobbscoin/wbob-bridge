@@ -6,14 +6,18 @@ type ResourceLink = {
   sub: string;
 };
 
+// 🪤 Do NOT point these back at github.com/SubGeniusFinance/*. That org is flagged and
+// every path under it is 404 to a logged-out visitor, which is how the Full Node, Qt
+// Wallet and repo links silently broke. Forgejo is canonical; /releases/latest always
+// redirects to the newest tag, so it cannot go stale the way the old /tag/v0.11.0 pin did.
 const RESOURCES: ResourceLink[] = [
   { href: 'https://subgenius.finance/',                                         label: 'SubGenius.Finance', sub: 'Where SubCulture\nBecomes Capital'       },
   { href: 'https://dobbscoin.info/',                                            label: 'Dobbscoin.info',    sub: 'Backed by NOTHING,\nPowered by Everything'},
   { href: 'https://explorer.dobbscoin.info/',                                   label: 'Explorer',          sub: 'Where They At?'                          },
   { href: 'https://pool.dobbscoin.info/',                                       label: 'Mining Pool',       sub: 'Get Slack NOW,\nWhile Difficulty is LOW' },
-  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source/releases',             label: 'Full Node',         sub: 'Full Node Wallet'                        },
-  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source/releases/tag/v0.11.0', label: 'Qt Wallet',         sub: 'Windows Dobbscoin Client'                },
-  { href: 'https://github.com/SubGeniusFinance/dobbscoin-source',                      label: 'GitHub REPO',       sub: 'Daemon + Qt repo'                        },
+  { href: 'https://dobbscoin.info/downloads/',                                  label: 'Full Node',         sub: 'Full Node Wallet'                        },
+  { href: 'https://git.subgenius.finance/SubGeniusFinance/dobbscoin-source/releases/latest', label: 'Qt Wallet', sub: 'Windows Dobbscoin Client'            },
+  { href: 'https://git.subgenius.finance/SubGeniusFinance/dobbscoin-source',           label: 'Source REPO',       sub: 'Daemon + Qt repo'                        },
   { href: 'https://subgenius.vip/dobbscoin.apk',                                label: 'Android Wallet',    sub: '.apk download'                           },
   { href: 'https://dobbscoin.info/faucet',                                      label: 'FAUCET',            sub: 'Something 4 Nothing'                     },
 ];
