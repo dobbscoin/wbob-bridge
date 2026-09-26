@@ -15,7 +15,11 @@ export function NavTabs() {
   return (
     <div className="mx-auto max-w-5xl px-4 -mb-px">
       <nav className="flex items-end justify-end gap-1">
-        {TABS.map((t) => {
+        {TABS
+          // /trade stays reachable by its address, but only shows as a tab while
+          // you are on it: the bridge is not a trade venue (btcbob, 2026-09-26).
+          .filter((t) => t.href !== '/trade' || pathname === '/trade' || pathname.startsWith('/trade/'))
+          .map((t) => {
           const active = t.href === '/'
             ? pathname === '/'
             : pathname === t.href || pathname.startsWith(t.href + '/');
