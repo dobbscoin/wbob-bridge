@@ -53,7 +53,7 @@ export function OrderProgress({ order }: Props) {
             {/* Extra detail for confirming state */}
             {active && order.confirmations !== null && !isOutbound && (
               <p className="mt-1 text-xs text-gray-400">
-                {order.confirmations} / 6 confirmations
+                {order.confirmations} / 60 confirmations
               </p>
             )}
           </li>
