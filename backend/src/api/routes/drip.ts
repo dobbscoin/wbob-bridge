@@ -9,6 +9,7 @@
  *   - status=sent        → "drip received: <tx>"
  *   - status=failed      → "drip transaction reverted — see public faucet"
  *   - status=wallet_dry  → "drip pool empty right now — use public faucet"
+ *   - status=recipient_has_gas → "not needed: wallet already has X xDAI"
  *
  * The route also reports whether DRIP is globally enabled, so the portal can
  * skip the section entirely when the feature is off.
@@ -30,6 +31,8 @@ interface DripResponse {
   amountWei: string | null;
   gnosisTxHash: string | null;
   sentAt: string | null;
+  /** Native xDAI (wei) the recipient held when the drip was skipped; status recipient_has_gas only. */
+  recipientBalanceWei: string | null;
 }
 
 function isValidAddress(addr: string): boolean {
@@ -65,6 +68,7 @@ export async function dripRoute(
         amountWei: null,
         gnosisTxHash: null,
         sentAt: null,
+        recipientBalanceWei: null,
       };
       return reply.status(200).send(response);
     }
@@ -75,8 +79,9 @@ export async function dripRoute(
         amount_wei: string | null;
         gnosis_tx_hash: string | null;
         sent_at: Date | null;
+        recipient_balance_wei: string | null;
       }[]>`
-        SELECT status, amount_wei, gnosis_tx_hash, sent_at
+        SELECT status, amount_wei, gnosis_tx_hash, sent_at, recipient_balance_wei
         FROM gas_drips
         WHERE recipient_gnosis_address = ${recipient}
       `;
@@ -89,6 +94,7 @@ export async function dripRoute(
         amountWei: row?.amount_wei ?? null,
         gnosisTxHash: row?.gnosis_tx_hash ?? null,
         sentAt: row?.sent_at ? new Date(row.sent_at).toISOString() : null,
+        recipientBalanceWei: row?.status === 'recipient_has_gas' ? (row.recipient_balance_wei ?? null) : null,
       };
       return reply.status(200).send(response);
     } catch (err) {

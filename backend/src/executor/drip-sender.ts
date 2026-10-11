@@ -11,6 +11,10 @@
  *   - Drip wallet balance < amount → mark `wallet_dry`, fire alert, do not
  *     mark drip as sent (so a refill makes the user eligible again).
  *   - Drip wallet key never logged.
+ *   - Recipient already holds >= dripSkipIfRecipientBalanceWei native xDAI →
+ *     no drip, status `recipient_has_gas` (non-terminal: the one-ever drip is
+ *     kept for a later mint when the wallet may be low). If that balance read
+ *     fails, fall through and send as before — never block on it.
  */
 
 import {
@@ -35,6 +39,7 @@ export interface DripDecision {
     | 'already_done'   // status was already 'sent' or 'failed'
     | 'below_min'      // amount_sat < dripMinDepositSat
     | 'wallet_dry'     // drip wallet balance < drip amount
+    | 'recipient_has_gas' // recipient already holds enough xDAI; drip kept for later
     | 'tx_reverted'    // sent but on-chain reverted
     | 'error';         // unexpected throw — see message
   txHash?: string;
@@ -108,11 +113,41 @@ export class DripSender {
       if (existing.status === 'sent' || existing.status === 'failed') {
         return { recipient, outcome: 'already_done' };
       }
-      // status is now opted_in or wallet_dry — both eligible for a (re)try.
+      // status is now opted_in, wallet_dry or recipient_has_gas — all eligible
+      // for a (re)try.
 
       // 2. Min-deposit gate.
       if (amountSat < this.config.dripMinDepositSat) {
         return { recipient, outcome: 'below_min' };
+      }
+
+      // 2b. Recipient already has gas? Then a drip is wasted xDAI. Read failure
+      //     is not a reason to withhold it: log and send as before.
+      let recipientBalance: bigint | null = null;
+      try {
+        recipientBalance = await this.publicClient.getBalance({ address: recipient as ViemHex });
+      } catch (err) {
+        console.warn(
+          `[drip] recipient balance read failed for ${recipient}; sending the drip anyway:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      const threshold = this.config.dripSkipIfRecipientBalanceWei;
+      if (recipientBalance !== null && recipientBalance >= threshold) {
+        await this.sql`
+          UPDATE gas_drips
+          SET status                = 'recipient_has_gas',
+              recipient_balance_wei = ${recipientBalance.toString()},
+              order_id              = ${orderId},
+              error                 = ${`recipient balance=${recipientBalance} >= skip threshold=${threshold}`},
+              updated_at            = now()
+          WHERE recipient_gnosis_address = ${recipient}
+        `;
+        return {
+          recipient,
+          outcome: 'recipient_has_gas',
+          message: `recipient already holds ${recipientBalance} wei >= ${threshold} wei; drip kept for a later mint`,
+        };
       }
 
       // 3. Balance check.
