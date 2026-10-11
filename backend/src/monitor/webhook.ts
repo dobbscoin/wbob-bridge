@@ -27,6 +27,41 @@ import type { Alert } from './types.js';
  */
 const SENDMAIL_PATH = '/usr/sbin/sendmail';
 
+/**
+ * True for a Discord incoming-webhook URL. Discord rejects a payload with no
+ * `content`/`embeds` (HTTP 400 "Cannot send an empty message"), which is what
+ * the raw Alert JSON is: every alert to the production webhook failed that way
+ * until 2026-10-11 (journal: "webhook delivery failed HTTP 400").
+ */
+export function isDiscordWebhook(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return /(^|\.)discord(app)?\.com$/.test(u.hostname) && u.pathname.startsWith('/api/webhooks/');
+  } catch {
+    return false;
+  }
+}
+
+const DISCORD_LIMIT = 2000;
+const LEVEL_MARK: Record<Alert['level'], string> = {
+  critical: '🚨',
+  warning:  '⚠️',
+  info:     'ℹ️',
+};
+
+/** Discord message text for an alert: one line of type, then the message. */
+export function formatDiscordContent(alert: Alert): string {
+  const text = `${LEVEL_MARK[alert.level]} **wBOB bridge — ${alert.type}**\n${alert.message}`;
+  return text.length > DISCORD_LIMIT ? `${text.slice(0, DISCORD_LIMIT - 1)}…` : text;
+}
+
+/** The POST body for a webhook URL: Discord-shaped for Discord, raw Alert JSON otherwise. */
+export function webhookBody(url: string, alert: Alert): unknown {
+  if (!isDiscordWebhook(url)) return alert;
+  // allowed_mentions: none — an alert must never ping @everyone or a role by accident.
+  return { content: formatDiscordContent(alert), allowed_mentions: { parse: [] } };
+}
+
 export interface AlertDispatcherOptions {
   webhookUrl?: string | null;
   emailTo?: string | null;
@@ -72,7 +107,7 @@ export class AlertDispatcher {
       const res = await fetch(this.webhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(alert),
+        body: JSON.stringify(webhookBody(this.webhookUrl, alert)),
         signal: AbortSignal.timeout(10_000),
       });
       if (!res.ok) {

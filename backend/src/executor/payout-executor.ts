@@ -18,6 +18,7 @@ import { OutboundState, assertOutboundTransition } from '@wbob/shared';
 import type { DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
 import { DobbscoinTxBuilder, type UtxoInput } from '../dobbscoin/tx-builder.js';
 import type { BackendConfig } from '../config.js';
+import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 
 const PAYOUT_MIN_CONFIRMATIONS = 3;
 
@@ -62,6 +63,11 @@ export class PayoutExecutor {
     private readonly sql: Sql,
     private readonly rpc: DobbscoinBackendRpc,
     private readonly config: BackendConfig,
+    /**
+     * Over-cap deposit refunds. Run inside this executor's poll, after payouts,
+     * so payouts and refunds never pick bridge UTXOs at the same time.
+     */
+    private readonly refunds: RefundExecutor | null = null,
   ) {
     this.txBuilder = new DobbscoinTxBuilder(
       config.hdWalletXpriv,
@@ -70,9 +76,14 @@ export class PayoutExecutor {
   }
 
   async poll(): Promise<void> {
-    await this.processQueued();
-    await this.broadcastSigned();
-    await this.confirmBroadcast();
+    try {
+      await this.processQueued();
+      await this.broadcastSigned();
+      await this.confirmBroadcast();
+    } finally {
+      // Refunds run even when a payout step throws; same loop, never concurrent.
+      if (this.refunds) await this.refunds.poll();
+    }
   }
 
   async start(): Promise<void> {
@@ -138,10 +149,8 @@ export class PayoutExecutor {
     // Allocate the next change index from DB (not an in-memory counter — that
     // resets on restart and would reuse the same change address, and also
     // desyncs across multiple backend instances).
-    const changeIdxRows = await this.sql<{ max: number | null }[]>`
-      SELECT MAX(hd_index) AS max FROM bridge_utxos WHERE derivation_path = 'change'
-    `;
-    const changeIndex = (changeIdxRows[0]?.max ?? -1) + 1;
+    // Also skips indexes held by signed-not-yet-broadcast refunds.
+    const changeIndex = await nextChangeIndex(this.sql);
     const changeAddress = this.txBuilder.deriveChangeAddress(changeIndex);
 
     const result = await this.txBuilder.buildPayoutTx(

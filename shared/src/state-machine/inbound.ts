@@ -9,6 +9,8 @@
  *               └─ DEPOSIT_CONFIRMED ←──────────────────────┐
  *                    ├─ DEPOSIT_CONFIRMED → DEPOSIT_SEEN_MEMPOOL (reorg)
  *                    └─ DEPOSIT_FINALIZED
+ *                         ├─ REFUNDED  (nothing left under today's mint cap:
+ *                         │             the whole deposit goes back to the sender)
  *                         └─ MINT_AUTH_CREATED
  *                              └─ MINT_SUBMITTED
  *                                   └─ MINT_CONFIRMED
@@ -42,6 +44,7 @@ export const INBOUND_TRANSITIONS: Readonly<Record<InboundState, readonly Inbound
   ],
   [InboundState.DEPOSIT_FINALIZED]: [
     InboundState.MINT_AUTH_CREATED,
+    InboundState.REFUNDED,                // daily mint cap already spent: all of it is refunded
     InboundState.FAILED,
   ],
   [InboundState.MINT_AUTH_CREATED]: [

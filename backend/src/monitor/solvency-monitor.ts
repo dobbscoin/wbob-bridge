@@ -29,8 +29,9 @@ import type { DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
 
 const TOTAL_SUPPLY_ABI = parseAbiItem('function totalSupply() view returns (uint256)');
 
-// Terminal states that do not count as "stuck".
-const TERMINAL_STATES = `('COMPLETED', 'FAILED', 'MANUAL_REVIEW')`;
+// Terminal states that do not count as "stuck". REFUNDED is the inbound
+// terminal for a deposit refunded whole (daily mint cap already spent).
+const TERMINAL_STATES = `('COMPLETED', 'FAILED', 'MANUAL_REVIEW', 'REFUNDED')`;
 
 export class SolvencyMonitor {
   private readonly publicClient;
@@ -90,10 +91,24 @@ export class SolvencyMonitor {
     // 2b. Cumulative payout fees the bridge has subsidised. Anything past
     // broadcast (txid is set) has actually left the pool. Adding this to the
     // pool side prevents fee drift from looking like a solvency breach.
+    //
+    // Over-cap deposit refunds pay their own fee out of the refunded excess,
+    // so only bridge_fee_sat (a dust change remainder folded into the fee) is
+    // a bridge-paid fee. The excess itself needs no term: it entered the pool
+    // with the deposit and never entered wBOB supply, so while it is held the
+    // pool simply runs that much over supply, and the refund takes it back out.
     const feeRows = await this.sql<{ total: bigint }[]>`
-      SELECT COALESCE(SUM(fee_sat), 0)::bigint AS total
-      FROM payouts
-      WHERE txid IS NOT NULL AND fee_sat IS NOT NULL
+      SELECT (
+        COALESCE((
+          SELECT SUM(fee_sat) FROM payouts
+          WHERE txid IS NOT NULL AND fee_sat IS NOT NULL
+        ), 0)
+        +
+        COALESCE((
+          SELECT SUM(bridge_fee_sat) FROM deposit_refunds
+          WHERE status IN ('broadcast', 'confirmed')
+        ), 0)
+      )::bigint AS total
     `;
     const cumulativeFeesPaidSat = feeRows[0]!.total;
 
@@ -115,7 +130,7 @@ export class SolvencyMonitor {
     }[]>`
       SELECT id, state, updated_at
       FROM bridge_orders
-      WHERE state NOT IN ('COMPLETED', 'FAILED', 'MANUAL_REVIEW')
+      WHERE state NOT IN ('COMPLETED', 'FAILED', 'MANUAL_REVIEW', 'REFUNDED')
     `;
     const stuckIds = checkStuckOrders(
       nonTerminal.map((r) => ({ id: r.id, state: r.state, updatedAt: r.updated_at })),
@@ -349,7 +364,9 @@ export class SolvencyMonitor {
 
   /**
    * Estimate wBOB supply from DB:
-   *   inbound COMPLETED amounts − outbound COMPLETED amounts.
+   *   inbound COMPLETED minted amounts − outbound COMPLETED amounts.
+   * Minted = mint_requests.amount_sat, which is less than the deposit when the
+   * daily cap split it (bridge_orders.amount_sat stays the deposited amount).
    * This diverges from chain state if mints/burns happen outside the bridge,
    * but is always available without a chain RPC call.
    */
@@ -357,9 +374,10 @@ export class SolvencyMonitor {
     const rows = await this.sql<{ supply: bigint }[]>`
       SELECT (
         COALESCE((
-          SELECT SUM(amount_sat)
-          FROM bridge_orders
-          WHERE order_type = 'inbound' AND state = 'COMPLETED'
+          SELECT SUM(COALESCE(mr.amount_sat, bo.amount_sat))
+          FROM bridge_orders bo
+          LEFT JOIN mint_requests mr ON mr.order_id = bo.id
+          WHERE bo.order_type = 'inbound' AND bo.state = 'COMPLETED'
         ), 0)
         -
         COALESCE((

@@ -67,8 +67,53 @@ export interface MintRequestRow {
   gnosis_tx_hash:      string | null;
   gnosis_block_number: bigint | null;
   confirmed_at:        Date | null;
+  /** What arrived; amount_sat (the minted part) is less when the daily cap split it. NULL = pre-012 row. */
+  deposit_amount_sat:  bigint | null;
+  cap_decision:        unknown | null;  // JSON snapshot of the cap state the split was decided on
+  regenerated_count:   number;
+  last_submit_error:   string | null;
+  last_submit_error_at: Date | null;
   created_at:          Date;
   updated_at:          Date;
+}
+
+// ─── deposit_refunds ─────────────────────────────────────────────────────────
+
+export type DepositRefundStatus =
+  | 'queued'
+  | 'signed'
+  | 'broadcast'
+  | 'confirmed'
+  | 'needs_attention'
+  | 'too_small';
+
+export interface DepositRefundRow {
+  id:                 string;
+  order_id:           string;
+  deposit_txid:       string;
+  deposit_vout:       number;
+  deposit_amount_sat: bigint;
+  mint_amount_sat:    bigint;
+  excess_sat:         bigint;
+  refund_address:     string | null;
+  sender_detail:      unknown | null;
+  status:             DepositRefundStatus;
+  reason:             string | null;
+  amount_sat:         bigint | null;   // paid to the sender (excess − fee share)
+  fee_sat:            bigint | null;
+  bridge_fee_sat:     bigint;
+  signed_hex:         string | null;
+  txid:               string | null;
+  change_sat:         bigint | null;
+  change_address:     string | null;
+  change_index:       number | null;
+  confirmations:      number;
+  split_alerted_at:   Date | null;
+  signed_at:          Date | null;
+  broadcast_at:       Date | null;
+  confirmed_at:       Date | null;
+  created_at:         Date;
+  updated_at:         Date;
 }
 
 // ─── withdrawal_requests ─────────────────────────────────────────────────────
@@ -117,6 +162,7 @@ export interface BridgeUtxoRow {
   hd_index:        number;
   status:          'available' | 'reserved' | 'spent';
   spent_payout_id: string | null;
+  spent_refund_id: string | null;
   created_at:      Date;
   updated_at:      Date;
 }
@@ -136,7 +182,8 @@ export type GasDripStatus =
   | 'opted_out'
   | 'sent'
   | 'failed'
-  | 'wallet_dry';
+  | 'wallet_dry'
+  | 'recipient_has_gas';   // skipped: recipient already had xDAI; still eligible later
 
 export interface GasDripRow {
   recipient_gnosis_address: string;
@@ -145,6 +192,7 @@ export interface GasDripRow {
   amount_wei:               string | null; // NUMERIC(78,0) → string
   gnosis_tx_hash:           string | null;
   error:                    string | null;
+  recipient_balance_wei:    string | null; // NUMERIC → string; balance seen at the last skip
   created_at:               Date;
   updated_at:               Date;
   sent_at:                  Date | null;

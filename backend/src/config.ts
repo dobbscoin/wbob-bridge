@@ -129,8 +129,21 @@ export interface BackendConfig {
   dripMinDepositSat: bigint;
   /** Drip wallet balance (wei) below which the monitor pages ops. Default 1e18 = 1 xDAI. */
   dripLowWaterMarkWei: bigint;
+  /**
+   * Skip the drip when the RECIPIENT already holds at least this much native
+   * xDAI (wei). The drip stays available for a later mint. Default = dripAmountWei.
+   */
+  dripSkipIfRecipientBalanceWei: bigint;
   /** Email recipient for ops alerts (drip wallet low, etc.). Sent via local sendmail. */
   alertEmailTo: string | null;
+
+  // ── Daily mint cap refunds ────────────────────────────────────────────────
+  /**
+   * When true (default) the refund executor signs and broadcasts refunds of
+   * over-cap excess on its own. When false refunds stop at 'queued' with the
+   * sender resolved and announced, for an operator to release.
+   */
+  refundsAutoSend: boolean;
 }
 
 function requireEnv(key: string): string {
@@ -198,6 +211,8 @@ export function loadConfig(): BackendConfig {
   // fallback().
   const gnosisRpcUrls = parseGnosisRpcUrls();
 
+  const dripAmountWei = optionalEnvBigInt('DRIP_AMOUNT_WEI', 50_000_000_000_000_000n);
+
   return {
     databaseUrl:                requireEnv('DATABASE_URL'),
     port:                       optionalEnvInt('PORT', 3000),
@@ -236,9 +251,12 @@ export function loadConfig(): BackendConfig {
 
     dripEnabled:                optionalEnvBool('DRIP_ENABLED', false),
     dripHotWalletPrivateKey:    (process.env['DRIP_HOT_WALLET_PRIVATE_KEY'] ?? null) as Hex | null,
-    dripAmountWei:              optionalEnvBigInt('DRIP_AMOUNT_WEI', 50_000_000_000_000_000n),
+    dripAmountWei,
     dripMinDepositSat:          optionalEnvBigInt('DRIP_MIN_DEPOSIT_SAT', 1_000_000n),
     dripLowWaterMarkWei:        optionalEnvBigInt('DRIP_LOW_WATER_MARK_WEI', 1_000_000_000_000_000_000n),
+    dripSkipIfRecipientBalanceWei: optionalEnvBigInt('DRIP_SKIP_IF_RECIPIENT_BALANCE_WEI', dripAmountWei),
     alertEmailTo:               process.env['ALERT_EMAIL_TO'] ?? null,
+
+    refundsAutoSend:            optionalEnvBool('REFUNDS_AUTO_SEND', true),
   };
 }

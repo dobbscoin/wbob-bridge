@@ -13,7 +13,14 @@ export type AlertType =
   | 'DRIP_WALLET_DRY'     // gas-drip hot wallet has < drip amount; users being skipped
   | 'GNOSIS_SCAN_HALTED'   // log-scan stuck on a failing event past consecutive-poll threshold
   | 'SUPPLY_READ_STALE'    // chain totalSupply unreadable; solvency verdict withheld
-  | 'CHAIN_STALLED';       // no new Dobbscoin block past threshold -- deposits cannot confirm
+  | 'CHAIN_STALLED'        // no new Dobbscoin block past threshold -- deposits cannot confirm
+  // ── Daily mint cap (event alerts: sent once per event, no cooldown) ──
+  | 'MINT_CAP_SPLIT'       // a deposit exceeded today's remaining cap: part minted, rest refunded
+  | 'REFUND_BROADCAST'     // refund of the excess broadcast to Dobbscoin
+  | 'REFUND_CONFIRMED'     // refund reached the confirmation threshold
+  | 'REFUND_NEEDS_ATTENTION' // refund parked: sender undeterminable or tx refused
+  | 'MINT_SUBMIT_BLOCKED'  // executeMint simulation reverted; mint held, reason recorded
+  | 'MINT_AUTH_REGENERATED'; // an expired / stale-nonce authorization was reissued
 
 export interface Alert {
   level: AlertLevel;

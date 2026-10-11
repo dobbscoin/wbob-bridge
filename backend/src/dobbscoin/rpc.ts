@@ -32,6 +32,28 @@ export interface RpcVout {
   scriptPubKey: { asm: string; hex: string; type: string; address?: string };
 }
 
+/** getrawtransaction <txid> 1 — the fields the bridge reads. */
+export interface RpcVerboseTx {
+  txid: string;
+  confirmations?: number;
+  vin: Array<{
+    coinbase?: string;
+    txid?: string;
+    vout?: number;
+  }>;
+  vout: Array<{
+    value: number;
+    n: number;
+    scriptPubKey: {
+      hex: string;
+      type: string;
+      /** Dobbscoin 0.14 (and Bitcoin Core < 22) report addresses[]; newer report address. */
+      addresses?: string[];
+      address?: string;
+    };
+  }>;
+}
+
 export interface RpcUnspent {
   txid: string;
   vout: number;
@@ -83,6 +105,16 @@ export class DobbscoinBackendRpc {
    */
   getRawTransactionHex(txid: string): Promise<string> {
     return this.call<string>('getrawtransaction', [txid, 0]);
+  }
+
+  /**
+   * Decoded transaction. Works for any txid because the bridge's node runs
+   * with txindex=1 (checked 2026-10-11 on vps3's dobbscoind on :19984);
+   * without txindex this only finds wallet and mempool transactions and a
+   * refund's sender lookup fails with RPC -5 (→ needs attention, not a guess).
+   */
+  getRawTransactionVerbose(txid: string): Promise<RpcVerboseTx> {
+    return this.call<RpcVerboseTx>('getrawtransaction', [txid, 1]);
   }
 
   /** Returns current chain tip info. */

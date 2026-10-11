@@ -13,12 +13,17 @@ import { healthRoute } from './routes/health.js';
 import { dripRoute } from './routes/drip.js';
 import type { BackendConfig } from '../config.js';
 import type { SolvencyMonitor } from '../monitor/solvency-monitor.js';
+import { mintCapRoute } from './routes/mint-cap.js';
+import { ViemMintCapReader, type MintCapReader } from '../executor/mint-capacity.js';
+import { createPublicClient, fallback, http, type PublicClient } from 'viem';
+import { gnosis } from 'viem/chains';
 
 export async function buildServer(opts: {
   sql: Sql;
   wallet: HdWallet;
   config: BackendConfig;
   monitor: SolvencyMonitor;
+  capReader?: MintCapReader;
 }) {
   const fastify = Fastify({ logger: true });
 
@@ -30,6 +35,17 @@ export async function buildServer(opts: {
   await fastify.register(ordersRoute, { sql: opts.sql });
   await fastify.register(healthRoute, { monitor: opts.monitor });
   await fastify.register(dripRoute, { sql: opts.sql, config: opts.config });
+
+  // Daily mint cap for the deposit page. READ path → fallback() like every other reader.
+  const capReader = opts.capReader ?? new ViemMintCapReader(
+    createPublicClient({
+      chain: gnosis,
+      transport: fallback(opts.config.gnosisRpcUrls.map((u) => http(u))),
+    }) as unknown as PublicClient,
+    opts.config.wBobAddress,
+    opts.config.bridgeControllerAddress,
+  );
+  await fastify.register(mintCapRoute, { sql: opts.sql, capReader });
 
   // Legacy liveness probe (kept for backwards compat)
   fastify.get('/health', async () => ({ status: 'ok' }));

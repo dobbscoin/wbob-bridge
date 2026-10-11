@@ -5,7 +5,8 @@
  *   1. HTTP API server (Fastify)
  *   2. Mint executor (polls DB, calls executeMint on Gnosis)
  *   3. Gnosis event watcher (polls WithdrawalRequested events)
- *   4. Payout executor (builds/signs/broadcasts Dobbscoin payout txs)
+ *   4. Payout executor (builds/signs/broadcasts Dobbscoin payout txs, and
+ *      refunds of deposit excess over the daily mint cap)
  *   5. Solvency monitor (periodic collateral health checks + alerting)
  */
 
@@ -17,6 +18,7 @@ import { MintExecutor } from './executor/mint-executor.js';
 import { DripSender } from './executor/drip-sender.js';
 import { GnosisEventWatcher } from './gnosis/event-watcher.js';
 import { PayoutExecutor } from './executor/payout-executor.js';
+import { RefundExecutor } from './executor/refund-executor.js';
 import { DobbscoinBackendRpc } from './dobbscoin/rpc.js';
 import { BridgeGuard } from './gnosis/bridge-guard.js';
 import { SolvencyMonitor } from './monitor/solvency-monitor.js';
@@ -62,7 +64,10 @@ async function main(): Promise<void> {
   const server         = await buildServer({ sql, wallet, config, monitor });
   const mintExecutor   = new MintExecutor(sql, config, dripSender);
   const gnosisWatcher  = new GnosisEventWatcher(sql, config);
-  const payoutExecutor = new PayoutExecutor(sql, rpc, config);
+  // Refunds of over-cap deposit excess ride the payout loop (no concurrent UTXO selection).
+  const refundExecutor = new RefundExecutor(sql, rpc, config);
+  const payoutExecutor = new PayoutExecutor(sql, rpc, config, refundExecutor);
+  console.log(`[backend] RefundExecutor: auto-send ${config.refundsAutoSend ? 'ON' : 'OFF (REFUNDS_AUTO_SEND=false)'}`);
 
   // Graceful shutdown
   const shutdown = async (): Promise<void> => {
