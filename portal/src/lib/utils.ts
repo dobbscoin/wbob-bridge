@@ -54,3 +54,27 @@ export function dobbscoinExplorerTx(txid: string): string {
 export function dobbscoinExplorerAddress(addr: string): string {
   return `${DOBBSCOIN_EXPLORER}/address/${addr}`;
 }
+
+/**
+ * Satoshis → grouped BOB with trailing zeros trimmed, exact (bigint, no float):
+ * "100000000000000" → "1,000,000", "1" → "0.00000001".
+ */
+export function fmtBob(sats: bigint | string | number): string {
+  const n = BigInt(sats);
+  const neg = n < 0n;
+  const v = neg ? -n : n;
+  const whole = (v / 100_000_000n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  const frac = (v % 100_000_000n).toString().padStart(8, '0').replace(/0+$/, '');
+  return `${neg ? '-' : ''}${whole}${frac ? `.${frac}` : ''}`;
+}
+
+/** Seconds → "5h 07m 09s" (hours omitted under an hour). */
+export function fmtCountdown(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? `${h}h ${mm}m ${ss}s` : `${m}m ${ss}s`;
+}

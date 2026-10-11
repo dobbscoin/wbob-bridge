@@ -11,8 +11,11 @@ import {
   listOrdersByRecipient,
   type DripStatusResponse,
   type OrderResponse,
+  refundInFlight,
 } from '@/lib/api';
 import { satsToBob } from '@/lib/utils';
+import { MintCapPanel } from '@/components/MintCapPanel';
+import { RefundBanner } from '@/components/RefundBanner';
 import Link from 'next/link';
 import { OnboardingPanel } from '@/components/OnboardingPanel';
 import { NFADisclaimer } from '@/components/NFADisclaimer';
@@ -67,7 +70,7 @@ export default function TestBedPage() {
     enabled: !!address,
     refetchInterval: (query) => {
       const anyActive = query.state.data?.orders.some(
-        (o) => o.orderType === 'inbound' && ACTIVE_STATES.has(o.state),
+        (o) => o.orderType === 'inbound' && (ACTIVE_STATES.has(o.state) || refundInFlight(o)),
       );
       return anyActive ? 10_000 : 60_000;
     },
@@ -80,9 +83,10 @@ export default function TestBedPage() {
     setTimeout(() => setCopied(false), 2000);
   }, [depositInfo]);
 
-  // The most recent inbound order still moving -- drives the landing-zone receipt.
+  // The most recent inbound order still moving (mint or over-cap refund) --
+  // drives the landing-zone receipt.
   const activeOrder = history?.orders
-    ?.filter((o) => o.orderType === 'inbound' && ACTIVE_STATES.has(o.state))
+    ?.filter((o) => o.orderType === 'inbound' && (ACTIVE_STATES.has(o.state) || refundInFlight(o) || o.refundState === 'needs_attention'))
     ?.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
 
   return (
@@ -138,10 +142,12 @@ export default function TestBedPage() {
               </h2>
               <p className="mt-1 text-xs text-gray-500">
                 Connect a wallet to get a permanent Dobbscoin deposit address.
-                Send any amount; wBOB lands on Gnosis after 60 confirmations
-                (~2 hours, at 2-minute Dobbscoin blocks).
+                wBOB lands on Gnosis after 60 confirmations (~2 hours, at
+                2-minute Dobbscoin blocks), up to today&apos;s mint cap.
               </p>
             </div>
+
+            <MintCapPanel />
 
             {!address ? (
               <p className="text-xs text-gray-500">Connect above to continue.</p>
@@ -171,8 +177,8 @@ export default function TestBedPage() {
                   </div>
                 </div>
                 <div className="text-xs text-gray-400 space-y-1 border-t border-gray-800 pt-3">
-                  <p>• Send <span className="text-gray-200 font-medium">any amount</span> of (BOB).</p>
-                  <p>• wBOB will mint to {depositInfo.recipientAddress.slice(0, 10)}… on Gnosis.</p>
+                  <p>• Up to <span className="text-gray-200 font-medium">today&apos;s remaining cap</span> mints as wBOB to {depositInfo.recipientAddress.slice(0, 10)}… on Gnosis.</p>
+                  <p>• Anything over the cap is <span className="text-amber-300 font-medium">refunded to the address you sent from</span>, minus the network fee. Send from a wallet you control, not an exchange.</p>
                   <p>• Reusable forever. No approval. No expiry.</p>
                 </div>
               </>
@@ -380,6 +386,14 @@ function DripAlreadyReceivedBanner({ txHash }: { txHash?: string | null }) {
 
 // ─── DripStatusCard ───────────────────────────────────────────────────────────
 
+/** wei → xDAI with up to 4 decimals, exact (bigint). */
+function formatXdai(wei: string): string {
+  const v = BigInt(wei);
+  const whole = v / 10n ** 18n;
+  const frac = ((v % 10n ** 18n) / 10n ** 14n).toString().padStart(4, '0').replace(/0+$/, '');
+  return frac ? `${whole}.${frac}` : whole.toString();
+}
+
 function DripStatusCard({ status }: { status: DripStatusResponse }) {
   const variant: { tone: string; title: string; body: React.ReactNode } = (() => {
     switch (status.status) {
@@ -430,6 +444,21 @@ function DripStatusCard({ status }: { status: DripStatusResponse }) {
                 public Gnosis faucet
               </a>{' '}
               hands out a small amount of xDAI to any address.
+            </>
+          ),
+        };
+      case 'recipient_has_gas':
+        return {
+          tone: 'neutral',
+          title: 'Gas drip not needed',
+          body: (
+            <>
+              This wallet already has{' '}
+              {status.recipientBalanceWei
+                ? <span className="font-semibold text-gray-200">{formatXdai(status.recipientBalanceWei)} xDAI</span>
+                : 'xDAI'}
+              , so no drip was sent. Your drip is kept: if the wallet runs low,
+              it goes out with a later wBOB mint.
             </>
           ),
         };
@@ -524,15 +553,28 @@ function DripStatusCard({ status }: { status: DripStatusResponse }) {
 function OrderRow({ order }: { order: OrderResponse }) {
   const displayState = order.state.replace(/_/g, ' ').toLowerCase();
   const isDone = order.state === 'COMPLETED';
-  const isFailed = ['FAILED', 'REFUNDED', 'MANUAL_REVIEW'].includes(order.state);
+  const isFailed = ['FAILED', 'MANUAL_REVIEW'].includes(order.state);
   const stateColor = isDone
     ? 'text-bob-400'
-    : isFailed
-      ? 'text-red-400'
-      : 'text-yellow-400';
+    : order.state === 'REFUNDED'
+      ? 'text-amber-400'
+      : isFailed
+        ? 'text-red-400'
+        : 'text-yellow-400';
 
+  const split = order.refundState !== null;
   return (
-    <li className="rounded-lg border border-gray-800 bg-gray-900/40 px-3 py-2 text-xs">
+    <li
+      className={`rounded-lg border bg-gray-900/40 px-3 py-2 text-xs ${
+        order.refundState === 'needs_attention' ? 'border-red-500/70'
+          : split ? 'border-amber-400/70' : 'border-gray-800'
+      }`}
+    >
+      {split && (
+        <div className="mb-2">
+          <RefundBanner order={order} compact />
+        </div>
+      )}
       <div className="flex items-baseline justify-between gap-2">
         <span className="font-mono text-bob-300">
           {order.amountSat ? satsToBob(order.amountSat) : '—'} BOB

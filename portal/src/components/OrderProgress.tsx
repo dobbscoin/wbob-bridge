@@ -13,7 +13,9 @@ export function OrderProgress({ order }: Props) {
   const isOutbound = order.orderType === 'outbound';
   const steps = isOutbound ? OUTBOUND_STEPS : INBOUND_STEPS;
   const currentIdx = stateIndex(order.state, isOutbound);
-  const isError = ERROR_STATES.has(order.state);
+  // REFUNDED by the daily mint cap is not a failure: the deposit is going home.
+  const capRefund = order.state === 'REFUNDED' && order.refundState !== null;
+  const isError = ERROR_STATES.has(order.state) && !capRefund;
   const isDone = order.state === 'COMPLETED';
 
   return (
@@ -57,6 +59,17 @@ export function OrderProgress({ order }: Props) {
           </li>
         );
       })}
+
+      {capRefund && (
+        <li className="ml-6">
+          <span className="absolute -left-3 flex h-6 w-6 items-center justify-center rounded-full ring-4 ring-gray-950 bg-amber-400 text-[11px] font-black text-gray-950">
+            ↩
+          </span>
+          <p className="text-sm font-semibold text-amber-300">
+            Returned to sender — today&apos;s mint cap was already used
+          </p>
+        </li>
+      )}
 
       {isError && (
         <li className="ml-6">

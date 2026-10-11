@@ -2,9 +2,10 @@
 
 import { useParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
-import { getOrder } from '@/lib/api';
-import { satsToBob, shortHash, gnosisExplorerTx } from '@/lib/utils';
+import { getOrder, refundInFlight } from '@/lib/api';
+import { satsToBob, shortHash, gnosisExplorerTx, dobbscoinExplorerTx, fmtBob } from '@/lib/utils';
 import { OrderProgress } from '@/components/OrderProgress';
+import { RefundBanner, hasRefund } from '@/components/RefundBanner';
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'MANUAL_REVIEW', 'REFUNDED']);
 
@@ -16,8 +17,9 @@ export default function OrderPage() {
     queryFn: () => getOrder(id),
     enabled: !!id,
     refetchInterval: (query) => {
-      const state = query.state.data?.state;
-      return state && TERMINAL.has(state) ? false : 12_000;
+      const data = query.state.data;
+      // A terminal order can still have its over-cap refund on the way.
+      return data && TERMINAL.has(data.state) && !refundInFlight(data) ? false : 12_000;
     },
   });
 
@@ -55,11 +57,15 @@ export default function OrderPage() {
           ${order.state === 'COMPLETED'     ? 'bg-bob-500/20 text-bob-300' : ''}
           ${order.state === 'FAILED'        ? 'bg-red-500/20 text-red-400' : ''}
           ${order.state === 'MANUAL_REVIEW' ? 'bg-orange-500/20 text-orange-400' : ''}
-          ${!['COMPLETED','FAILED','MANUAL_REVIEW'].includes(order.state) ? 'bg-gray-700 text-gray-300' : ''}
+          ${order.state === 'REFUNDED'      ? 'bg-amber-500/20 text-amber-300' : ''}
+          ${!['COMPLETED','FAILED','MANUAL_REVIEW','REFUNDED'].includes(order.state) ? 'bg-gray-700 text-gray-300' : ''}
         `}>
           {order.state.replace(/_/g, ' ')}
         </span>
       </div>
+
+      {/* Over-cap split: first thing on the page, loud */}
+      {hasRefund(order) && <RefundBanner order={order} />}
 
       {/* Progress */}
       <div className="card space-y-4">
@@ -74,6 +80,37 @@ export default function OrderPage() {
         <DetailRow label="Amount">
           {order.amountSat ? `${satsToBob(order.amountSat)} ${isOutbound ? 'wBOB → BOB' : 'BOB → wBOB'}` : '—'}
         </DetailRow>
+
+        {hasRefund(order) && (
+          <>
+            <DetailRow label="Deposited">{order.depositedSat ? `${fmtBob(order.depositedSat)} (BOB)` : '—'}</DetailRow>
+            <DetailRow label="Minted">{`${fmtBob(order.mintedSat ?? '0')} wBOB`}</DetailRow>
+            <DetailRow label="Over cap">{`${fmtBob(order.refundSat!)} (BOB)`}</DetailRow>
+            {order.refundSentSat && (
+              <DetailRow label="Refund paid">
+                {`${fmtBob(order.refundSentSat)} (BOB)`}
+                {order.refundFeeSat && <span className="text-gray-500"> (fee {fmtBob(order.refundFeeSat)})</span>}
+              </DetailRow>
+            )}
+            {order.refundAddress && (
+              <DetailRow label="Refund to">
+                <code className="text-xs font-mono text-amber-300 break-all">{order.refundAddress}</code>
+              </DetailRow>
+            )}
+            {order.refundTxid && (
+              <DetailRow label="Refund tx">
+                <a
+                  href={dobbscoinExplorerTx(order.refundTxid)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-amber-300 hover:underline text-sm font-mono"
+                >
+                  {shortHash(order.refundTxid, 10)} ↗
+                </a>
+              </DetailRow>
+            )}
+          </>
+        )}
 
         {!isOutbound && order.depositAddress && (
           <DetailRow label="Deposit address">

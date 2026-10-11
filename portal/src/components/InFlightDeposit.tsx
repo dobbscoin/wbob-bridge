@@ -11,10 +11,11 @@
 // receipt. Someone who has just pushed real money at an address needs to be told,
 // prominently and in the first place they look, that it ARRIVED and is moving.
 //
-// Renders only while an inbound order is mid-flight. Once COMPLETED it disappears
-// and the ledger row is the right home for it.
+// Renders only while an inbound order is mid-flight (or its over-cap refund is).
+// Once both are done it disappears and the ledger row is the right home for it.
 
 import type { OrderResponse } from '@/lib/api';
+import { RefundBanner, hasRefund } from './RefundBanner';
 
 const SAT = 100_000_000;
 
@@ -40,6 +41,28 @@ function fmt(amountSat: string | null | undefined) {
 }
 
 export function InFlightDeposit({ order }: { order: OrderResponse }) {
+  // Mint side finished (COMPLETED) or never started (REFUNDED: today's cap was
+  // already spent) while the over-cap refund is still moving. The confirmation
+  // ladder would only mislead; the refund is the story.
+  if (!STAGES.some((s) => s.state === order.state)) {
+    const alarm = order.refundState === 'needs_attention';
+    return (
+      <div
+        className={`relative overflow-hidden rounded-lg border-2 bg-black px-4 py-3 space-y-2 ${
+          alarm ? 'border-red-500/90' : 'border-amber-400/90'
+        }`}
+      >
+        <RefundBanner order={order} />
+        <p className="text-xs leading-relaxed text-amber-100/80">
+          {order.state === 'REFUNDED'
+            ? <>Nothing was minted for this deposit: today&apos;s wBOB mint cap was already
+                used up when it finalized. Send again after the reset to bridge it.</>
+            : <>{fmt(order.mintedSat ?? order.amountSat)} wBOB is minted and in your wallet on Gnosis.</>}
+        </p>
+      </div>
+    );
+  }
+
   const idx = Math.max(0, STAGES.findIndex((s) => s.state === order.state));
   const stage = STAGES[idx] ?? STAGES[0];
   const confs = order.confirmations ?? 0;
@@ -50,8 +73,14 @@ export function InFlightDeposit({ order }: { order: OrderResponse }) {
   const remaining = Math.max(0, target - confs);
 
   return (
-    <div className="relative overflow-hidden rounded-lg border-2 border-emerald-500/80 bg-black px-4 py-3">
+    <div
+      className={`relative overflow-hidden rounded-lg border-2 bg-black px-4 py-3 ${
+        hasRefund(order) ? 'border-amber-400/90' : 'border-emerald-500/80'
+      }`}
+    >
       <div className="space-y-2">
+        {hasRefund(order) && <RefundBanner order={order} />}
+
         <p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-emerald-400">
           <span aria-hidden>✓</span>
           Your deposit is in processing
@@ -61,6 +90,11 @@ export function InFlightDeposit({ order }: { order: OrderResponse }) {
           {fmt(order.amountSat) === null
             ? 'Deposit received'
             : fmt(order.amountSat) + ' (BOB) received'}
+          {hasRefund(order) && order.mintedSat !== null && (
+            <span className="block text-sm text-emerald-200/90">
+              {fmt(order.mintedSat)} of it is minting as wBOB
+            </span>
+          )}
         </p>
 
         <p className="text-xs leading-relaxed text-emerald-100/90">
