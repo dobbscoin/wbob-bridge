@@ -20,12 +20,11 @@ import { RefundBanner, hasRefund } from './RefundBanner';
 const SAT = 100_000_000;
 
 // MIN_CONFIRMATIONS=30 -> DEPOSIT_CONFIRMED ; FINAL_CONFIRMATIONS=60 -> mint.
-const MIN_CONFS = 30;
 const FINAL_CONFS = 60;
 
 const STAGES = [
-  { state: 'DEPOSIT_SEEN_MEMPOOL', label: 'Received',        blurb: 'Your transaction is on the Dobbscoin chain.' },
-  { state: 'DEPOSIT_CONFIRMED',    label: 'Confirmed',       blurb: 'Past 30 confirmations. Now hardening to 60.' },
+  { state: 'DEPOSIT_SEEN_MEMPOOL', label: 'Received',        blurb: 'Your transaction is on the Dobbscoin chain. Minting starts at 60 confirmations, about 2 hours.' },
+  { state: 'DEPOSIT_CONFIRMED',    label: 'Confirmed',       blurb: 'Halfway there: past 30 of the 60 confirmations.' },
   { state: 'DEPOSIT_FINALIZED',    label: 'Finalized',       blurb: 'Past 60. The watchers are signing your mint.' },
   { state: 'MINT_AUTH_CREATED',    label: 'Mint authorized', blurb: 'Enough watchers signed. Minting on Gnosis.' },
   { state: 'MINT_SUBMITTED',       label: 'Minting',         blurb: 'Mint submitted to Gnosis. Nearly there.' },
@@ -67,8 +66,8 @@ export function InFlightDeposit({ order }: { order: OrderResponse }) {
   const stage = STAGES[idx] ?? STAGES[0];
   const confs = order.confirmations ?? 0;
 
-  // Before 30 we're climbing to "confirmed"; after, we're climbing to the mint.
-  const target = confs < MIN_CONFS ? MIN_CONFS : FINAL_CONFS;
+  // One count, straight to the mint. A 30-then-60 bar read as the goalposts moving.
+  const target = FINAL_CONFS;
   const pct = Math.min(100, Math.round((confs / target) * 100));
   const remaining = Math.max(0, target - confs);
 
@@ -108,7 +107,7 @@ export function InFlightDeposit({ order }: { order: OrderResponse }) {
             <span className="font-semibold uppercase tracking-wider">{stage.label}</span>
             <span>
               {confs} / {target} confirmations
-              {remaining > 0 ? ` · ${remaining} to go` : ' · done'}
+              {remaining > 0 ? ` · ${remaining} to go, about ${remaining * 2} min` : ' · done'}
             </span>
           </div>
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-emerald-950">
