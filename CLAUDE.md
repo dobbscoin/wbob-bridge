@@ -107,7 +107,7 @@ bridge.executeMint(auth, sigs);
 | THRESHOLD | 3 |
 | wBOB decimals | 8 |
 | MAX_SUPPLY | wBOB ERC-20 deploy-time ceiling, set at deployment as a defence-in-depth cap. **Not** a reflection of (BOB)'s chain supply — the (BOB) chain has no hard supply cap; see `~/claude/dobbscoin-facts.md`. |
-| Daily mint limit | 1,000,000 BOB/day (admin-adjustable) |
+| Daily mint limit | 250,000 BOB/day since 2026-10-11 (was 1,000,000; admin-adjustable via the Safe, tx 0x12f89409) |
 | Confirmation threshold | 6 (Dobbscoin, configurable via FINAL_CONFIRMATIONS env) |
 | Min confirmations | 3 (configurable via MIN_CONFIRMATIONS env) |
 | Reorg depth | 200 (configurable via REORG_DEPTH env) |
