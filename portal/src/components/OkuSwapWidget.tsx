@@ -40,9 +40,9 @@ export function OkuSwapWidget() {
         <img
           src="/oku-trade.png"
           alt="Oku swap box: sell WXDAI, buy wBOB. Click to open Oku.trade."
-          width={589}
-          height={698}
-          className="block w-full h-auto lg:h-[640px] lg:object-cover lg:object-left-top"
+          width={455}
+          height={620}
+          className="block w-full h-auto"
         />
       </a>
 
