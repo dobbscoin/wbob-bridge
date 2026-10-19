@@ -21,9 +21,9 @@ export default function TradePage() {
           Trade wBOB on Gnosis
         </h1>
         <p className="text-sm text-gray-400">
-          Two embedded venues, both on Gnosis chain. CoW Swap defaults to
-          wBOB → WXDAI; Oku defaults to WXDAI → wBOB. SubGenius.Finance takes
-          no fee on either. Routes and pricing are entirely the venue&rsquo;s.
+          Swap wBOB on Gnosis. CoW Swap runs right on this page (wBOB → WXDAI)
+          and Oku opens in a new tab (WXDAI → wBOB). Every wBOB pool they trade
+          against is ours, and so is the 1% pool fee.
         </p>
         <p className="text-xs text-gray-500">
           ←{' '}
@@ -47,7 +47,7 @@ export default function TradePage() {
           What this page is
         </h3>
         <ul className="text-xs text-gray-500 space-y-1">
-          <li>• Two third-party swap UIs, embedded as iframes. SubGenius.Finance takes no fee.</li>
+          <li>• CoW Swap embedded here, Oku linked out. We add no fee on top; the 1% pool fee goes to the liquidity provider, which is us.</li>
           <li className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span>• Verify the token addresses in your wallet before signing —</span>
             <span className="inline-flex items-center gap-1">
@@ -57,7 +57,7 @@ export default function TradePage() {
               WXDAI <CopyAddress address={WXDAI_ADDRESS} label="WXDAI token address" />
             </span>
           </li>
-          <li>• Both venues need xDAI for gas. If you have none, check the gas-drip status on the home page or use the public Gnosis faucet.</li>
+          <li>• You need a little xDAI for gas. CoW Swap needs it once, to approve wBOB. Oku needs it on every swap. If you have none, check the gas-drip status on the home page or use the public Gnosis faucet.</li>
           <li>• (BOB) is not for sale — it is for trade.</li>
         </ul>
         <NFADisclaimer compact />

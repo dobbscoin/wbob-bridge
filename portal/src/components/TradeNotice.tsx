@@ -1,18 +1,20 @@
-// The /trade page notice (btcbob, 2026-09-26): (BOB) is worthless on purpose,
-// SubGenius.Finance is not the market, provides no liquidity, fronts nothing,
-// and is not responsible for prices or for anyone's own decisions.
+// The /trade page notice (btcbob, 2026-09-26; liquidity clauses corrected
+// 2026-10-19): (BOB) is worthless on purpose. SubGenius.Finance does not run the
+// exchanges but IS the only wBOB liquidity provider (unlocked, at-risk money,
+// 1% pool fee to us), fronts nothing, and is not responsible for prices or for
+// anyone's own decisions.
 const CLAUSES: { title: string; body: string }[] = [
   {
     title: "(BOB) is worthless on purpose.",
     body: "(BOB) and wBOB are Monetized Slack: a joke with a working blockchain behind it. They are not an investment, not a security, not a store of value, and not a promise of anything. DO NOT INVEST. Do not buy (BOB) or wBOB expecting it to go up. It may go to zero. It may already be there.",
   },
   {
-    title: "We are not the market.",
-    body: "Trades on this page are carried out by third-party decentralized exchanges (CoW Swap, Oku, and the pools they route through). SubGenius.Finance, the (BOB) developers and the Church of the SubGenius are not affiliated with those protocols, their operators, or any liquidity pool or liquidity provider, and have no control over prices, fees, routing, slippage or execution.",
+    title: "We are not the exchange.",
+    body: "CoW Swap and Oku are third-party apps. We don't run them and have no say over their routing, fees, slippage or execution. They trade against pools on Gnosis, and the wBOB pools are ours (see 3).",
   },
   {
-    title: "We do not provide the liquidity.",
-    body: "Nobody here supplies, props up, manages or guarantees liquidity for wBOB. Nobody here fronts (BOB) or wBOB to promoters, shillers, influencers, market makers or anyone else. If someone tells you otherwise, they are selling you something, and it isn't us.",
+    title: "We are the liquidity.",
+    body: "Every wBOB pool on Gnosis was seeded by us from the treasury wallet subgeniusfinance.eth: as much wBOB as we cared to part with, paired against whatever real money we could wrangle, at a price so low it's hard to take seriously. The 1% pool fee on every trade comes to us. None of it is locked, and locking it would prove nothing: it would only lock up the real money. wBOB could be torpedoed tomorrow and the (BOB) would still be here. The plan is to swap our own at-risk stake out for 4-year locked liquidity as NFT sales and other projects pay for it. None of that is a promise to hold the price anywhere. Nobody here fronts (BOB) or wBOB to promoters, shillers, influencers or market makers. If someone tells you otherwise, they are selling you something, and it isn't us.",
   },
   {
     title: "Prices move. That is your problem.",

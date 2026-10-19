@@ -46,7 +46,7 @@ For listing context see https://support.coingecko.com/hc/en-us/sections/32146983
 Active trading venues on Gnosis:
 
 
-> ⚠️ **LIQUIDITY STATUS — 2026-08-31. Do not submit until this block is removed.**
+> ⚠️ **HISTORICAL SNAPSHOT, 2026-08-31. Out of date, kept for the record.** Do not submit until this block is removed.
 >
 > Both venues below are currently **empty**. Combined TVL across every known wBOB
 > pool is **$0.0038**, 24h volume is **$0.00**, and CoW Swap's aggregator returns
@@ -60,6 +60,12 @@ Active trading venues on Gnosis:
 >
 > **Re-seed a pool, let real volume accrue, then re-check these links and delete
 > this block.** Live figures: <https://subgenius.finance/pools.json>
+>
+> **Update 2026-10-19:** SubGenius.Finance re-seeded wBOB liquidity in October 2026 from its
+> treasury, subgeniusfinance.eth: wBOB/GNO, wBOB/WXDAI, BILL/wBOB and wBOB/HONKLER, all owned
+> by `0xa829f0b553763d5b33b9e346f7da93bc0e5eca2c`. It is the only liquidity provider. The
+> liquidity is unlocked, at-risk money, the 1% pool fee goes to the treasury, and the wBOB price
+> is the price those pools set. Any submission must say so.
 
 - **CoW Swap** (default direction wBOB → WXDAI):
   https://swap.cow.fi/#/100/swap/wBOB/WXDAI
@@ -67,9 +73,9 @@ Active trading venues on Gnosis:
   https://oku.trade/swap?inputChain=gnosis&inToken=0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d&outToken=0x13550ae65f22A36f60A50d625B70b58666488263
 
 Quote currency: **WXDAI** (Wrapped xDai, USD-pegged stablecoin on Gnosis,
-contract `0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d`). This pair is the
-canonical price-discovery venue for both wBOB and (by 1:1 bridge backing)
-BOB itself.
+contract `0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d`). This pair, seeded by
+SubGenius.Finance from its treasury, sets the reference price for both wBOB
+and (by 1:1 bridge backing) BOB itself. It is not an independent market price.
 
 ## Social / community fields
 

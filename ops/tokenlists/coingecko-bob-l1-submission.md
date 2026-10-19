@@ -85,14 +85,16 @@ path. The wBOB submission uses the contract-address path.)
 > Chain, backed 1:1 by BOB locked in a 3-of-5 threshold-signed bridge.
 > See the paired CoinGecko submission for wBOB.
 
-## Markets / liquidity (price discovery)
+## Markets / liquidity
 
-BOB does not currently trade on any centralized exchange. Price
-discovery happens on the Gnosis Chain via the wBOB wrapped variant,
-which is backed 1:1 by escrowed BOB:
+BOB does not currently trade on any centralized exchange. Its only
+priced venue is the wBOB wrapped variant on Gnosis Chain, backed 1:1 by
+escrowed BOB. Every wBOB pool was seeded by SubGenius.Finance from its
+treasury (subgeniusfinance.eth), so the wBOB price is the price those
+balanced pools set, not an independent market price:
 
 
-> ⚠️ **LIQUIDITY STATUS — 2026-08-31. Do not submit until this block is removed.**
+> ⚠️ **HISTORICAL SNAPSHOT, 2026-08-31. Out of date, kept for the record.** Do not submit until this block is removed.
 >
 > Both venues below are currently **empty**. Combined TVL across every known wBOB
 > pool is **$0.0038**, 24h volume is **$0.00**, and CoW Swap's aggregator returns
@@ -106,6 +108,12 @@ which is backed 1:1 by escrowed BOB:
 >
 > **Re-seed a pool, let real volume accrue, then re-check these links and delete
 > this block.** Live figures: <https://subgenius.finance/pools.json>
+>
+> **Update 2026-10-19:** SubGenius.Finance re-seeded wBOB liquidity in October 2026 from its
+> treasury, subgeniusfinance.eth: wBOB/GNO, wBOB/WXDAI, BILL/wBOB and wBOB/HONKLER, all owned
+> by `0xa829f0b553763d5b33b9e346f7da93bc0e5eca2c`. It is the only liquidity provider. The
+> liquidity is unlocked, at-risk money, the 1% pool fee goes to the treasury, and the wBOB price
+> is the price those pools set. Any submission must say so.
 
 - **CoW Swap (Gnosis)** — wBOB → WXDAI:
   https://swap.cow.fi/#/100/swap/wBOB/WXDAI

@@ -73,8 +73,8 @@ export function OkuSwapWidget() {
         >
           Oku.trade
         </a>{' '}
-        on Gnosis. The bridge does not custody, route, or take a fee on this
-        trade. Verify token addresses in your wallet before signing.
+        on Gnosis. The bridge does not custody or route this trade. The pool it
+        trades against is ours, and its 1% fee comes to us. Verify token addresses in your wallet before signing.
       </p>
     </div>
   );

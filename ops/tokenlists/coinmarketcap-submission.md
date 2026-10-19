@@ -69,7 +69,7 @@ fall back to CoW Swap as the primary cited venue. Note both are empty - see
 the status block above.)
 
 
-> ⚠️ **LIQUIDITY STATUS — 2026-08-31. Do not submit until this block is removed.**
+> ⚠️ **HISTORICAL SNAPSHOT, 2026-08-31. Out of date, kept for the record.** Do not submit until this block is removed.
 >
 > Both venues below are currently **empty**. Combined TVL across every known wBOB
 > pool is **$0.0038**, 24h volume is **$0.00**, and CoW Swap's aggregator returns
@@ -83,6 +83,12 @@ the status block above.)
 >
 > **Re-seed a pool, let real volume accrue, then re-check these links and delete
 > this block.** Live figures: <https://subgenius.finance/pools.json>
+>
+> **Update 2026-10-19:** SubGenius.Finance re-seeded wBOB liquidity in October 2026 from its
+> treasury, subgeniusfinance.eth: wBOB/GNO, wBOB/WXDAI, BILL/wBOB and wBOB/HONKLER, all owned
+> by `0xa829f0b553763d5b33b9e346f7da93bc0e5eca2c`. It is the only liquidity provider. The
+> liquidity is unlocked, at-risk money, the 1% pool fee goes to the treasury, and the wBOB price
+> is the price those pools set. Any submission must say so.
 
 - **CoW Swap** (Gnosis):
   https://swap.cow.fi/#/100/swap/wBOB/WXDAI

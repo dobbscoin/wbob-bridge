@@ -20,8 +20,8 @@ export function CowSwapWidget() {
           Trade wBOB → WXDAI
         </h2>
         <p className="mt-1 text-xs text-gray-500">
-          Peel off enough wBOB for gas. Gnosis fees are dust — even a few BOB
-          will fuel thousands of transactions. Trade what feels fair.
+          Sell a little wBOB for WXDAI, then unwrap it to xDAI for gas. Gnosis
+          fees are tiny; a dollar&rsquo;s worth lasts a long time. Trade what feels fair.
         </p>
       </div>
 
@@ -44,8 +44,8 @@ export function CowSwapWidget() {
         >
           CoW Swap
         </a>{' '}
-        on Gnosis. The bridge does not custody, route, or take a fee on this
-        trade. Verify the token addresses in your wallet before signing.
+        on Gnosis. The bridge does not custody or route this trade. The pool it
+        trades against is ours, and its 1% fee comes to us. Verify the token addresses in your wallet before signing.
       </p>
     </div>
   );

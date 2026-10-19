@@ -225,9 +225,10 @@ export default function TestBedPage() {
             </h2>
             <p className="mt-1 text-xs text-gray-500">
               wBOB is an ordinary token on Gnosis Chain, so it can be traded
-              like one. There is a trade page with CoW Swap and Oku built in,
-              if you want it. Nothing here suggests you should.
-              SubGenius.Finance takes no fee.
+              like one. There is a trade page with CoW Swap built in and a link
+              to Oku, if you want it. Nothing here suggests you should.
+              SubGenius.Finance adds no fee of its own, but it supplied every
+              wBOB pool, so their 1% trading fee comes to us.
             </p>
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
@@ -267,7 +268,7 @@ export default function TestBedPage() {
               </a>
               .
             </li>
-            <li>• Trades are routed by third-party DEXs (CoW Swap, Oku). SubGenius.Finance takes no fee on swaps.</li>
+            <li>• Trades run on third-party DEXs (CoW Swap, Oku) against pools SubGenius.Finance funded. We add no fee of our own; the pools&rsquo; 1% fee comes to us.</li>
             <li>• (BOB) is not for sale — it is for trade.</li>
           </ul>
           <NFADisclaimer compact />

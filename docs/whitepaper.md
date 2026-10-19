@@ -254,13 +254,21 @@ working names — pick whichever you can say without smirking:
 - **The Church of the SubGenius DAO — CoSG-DAO**
 - **The Conspiracy of Slack** (turning their own word against them, classic move)
 
-This sibling DAO holds a community treasury — funded by donations, an
-opt-in slice of bridge tip-jar revenue, Devival merch, and whatever
-else members vote to direct toward it. Membership is rooted in (BOB)
-and wBOB holdings, with a contribution multiplier for ordained clergy
-and verified pool / explorer / merchant operators. Members vote on:
+None of this DAO is built yet. Today the only treasury is the
+SubGenius.Finance wallet subgeniusfinance.eth
+(`0xa829f0b553763d5b33b9e346f7da93bc0e5eca2c`) on Gnosis. It supplied all
+of the current wBOB liquidity (wBOB/GNO, wBOB/WXDAI, BILL/wBOB and
+wBOB/HONKLER) from its own at-risk money. None of that liquidity is
+locked, the pools' 1% fee goes to the treasury, and the wBOB price is the
+price those balanced pools set.
 
-- **Liquidity-pool seeding** — bootstrapping additional pairs beyond the current Oku liquidity; market-maker rebates; impermanent-loss buffers for early LPs.
+The planned DAO would hold a community treasury, funded by donations, an
+opt-in slice of bridge tip-jar revenue, Devival merch, and whatever
+else members vote to direct toward it. Membership would be rooted in (BOB)
+and wBOB holdings, with a contribution multiplier for ordained clergy
+and verified pool / explorer / merchant operators. Members would vote on:
+
+- **Liquidity-pool seeding** — bootstrapping additional pairs beyond the treasury's own pools; replacing the treasury's at-risk stake with 4-year locked liquidity; impermanent-loss buffers for future LPs.
 - **Loss-reimbursement / mutual aid** — coordinated, vote-gated reimbursement when a frontend gets phished or an LP eats an honest IL bath. *Not a guarantee, a mutual-aid layer.*
 - **Grants** — second pool operators, alternate explorers, merchant integrations, Android wallet work. Ordained clergy preferred, not required.
 - **Treasury-funded buy-back-and-burn** — proposals to bridge wBOB out and cold-store the underlying (BOB), voted on like any other treasury allocation.
@@ -297,9 +305,11 @@ non-binding aspirations:
 
 - **Shipped (Q2 2026):** Bridge live on Gnosis mainnet. Contracts
   verified on Gnosisscan. Five watchers running on independent
-  infrastructure. wBOB liquidity established on Oku (primary) with
-  execution available via CoW Swap at
-  `swap.cow.fi/#/100/swap/xDAI/wBOB` (secondary).
+  infrastructure. wBOB trades on Uniswap v3 pools (via Oku) and CoW Swap
+  at `swap.cow.fi/#/100/swap/xDAI/wBOB`. Since October 2026 every wBOB
+  pool has been seeded by SubGenius.Finance from its treasury,
+  subgeniusfinance.eth. That liquidity is unlocked, at-risk money, and
+  the 1% pool fee goes to the treasury.
 - **Q3 2026:** Solicit and complete an independent contract audit.
   Publish the report verbatim, findings and remediations alongside.
   Submit wBOB to Gnosis-ecosystem token registries. Coordinate the bridge
@@ -342,7 +352,7 @@ The Conspiracy will not approve. That's how we know we got it right.
 | Bridge UI | https://bridge.subgenius.finance | — |
 | Source: bridge | https://github.com/dobbscoin/wbob-bridge | — |
 | Source: contracts | https://github.com/dobbscoin/wbob-contracts | — |
-| Trading venue | Oku (liquidity) + CoW Swap: `https://swap.cow.fi/#/100/swap/xDAI/wBOB` | Gnosis |
+| Trading venue | Uniswap v3 pools seeded by SubGenius.Finance (subgeniusfinance.eth), traded via Oku and CoW Swap: `https://swap.cow.fi/#/100/swap/xDAI/wBOB` | Gnosis |
 
 ## Appendix B: DepositId Canonical Formula
 
