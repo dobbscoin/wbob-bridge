@@ -100,7 +100,7 @@ export class DripSender {
       // 1. Read current gas_drips row.
       const rows = await this.sql<{ status: GasDripStatus }[]>`
         SELECT status FROM gas_drips
-        WHERE recipient_gnosis_address = ${recipient}
+        WHERE lower(recipient_gnosis_address) = lower(${recipient})
       `;
       const existing = rows[0];
 
@@ -141,7 +141,7 @@ export class DripSender {
               order_id              = ${orderId},
               error                 = ${`recipient balance=${recipientBalance} >= skip threshold=${threshold}`},
               updated_at            = now()
-          WHERE recipient_gnosis_address = ${recipient}
+          WHERE lower(recipient_gnosis_address) = lower(${recipient})
         `;
         return {
           recipient,
@@ -158,7 +158,7 @@ export class DripSender {
           SET status = 'wallet_dry',
               error  = ${`balance=${balance} < drip=${this.config.dripAmountWei}`},
               updated_at = now()
-          WHERE recipient_gnosis_address = ${recipient}
+          WHERE lower(recipient_gnosis_address) = lower(${recipient})
         `;
         return {
           recipient,
@@ -181,7 +181,7 @@ export class DripSender {
             amount_wei     = ${this.config.dripAmountWei.toString()},
             gnosis_tx_hash = ${txHash},
             updated_at     = now()
-        WHERE recipient_gnosis_address = ${recipient}
+        WHERE lower(recipient_gnosis_address) = lower(${recipient})
       `;
 
       // 6. Wait for receipt (up to 60s — Gnosis ~5s blocks).
@@ -196,7 +196,7 @@ export class DripSender {
           SET status     = 'failed',
               error      = 'tx reverted on-chain',
               updated_at = now()
-          WHERE recipient_gnosis_address = ${recipient}
+          WHERE lower(recipient_gnosis_address) = lower(${recipient})
         `;
         return { recipient, outcome: 'tx_reverted', txHash };
       }
@@ -206,7 +206,7 @@ export class DripSender {
         SET status     = 'sent',
             sent_at    = now(),
             updated_at = now()
-        WHERE recipient_gnosis_address = ${recipient}
+        WHERE lower(recipient_gnosis_address) = lower(${recipient})
       `;
       return { recipient, outcome: 'sent', txHash };
     } catch (err) {
@@ -218,7 +218,7 @@ export class DripSender {
           UPDATE gas_drips
           SET error      = ${message.slice(0, 500)},
               updated_at = now()
-          WHERE recipient_gnosis_address = ${recipient}
+          WHERE lower(recipient_gnosis_address) = lower(${recipient})
         `;
       } catch {
         /* swallow — we already failed once */

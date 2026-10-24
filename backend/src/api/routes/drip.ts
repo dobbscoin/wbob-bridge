@@ -83,7 +83,7 @@ export async function dripRoute(
       }[]>`
         SELECT status, amount_wei, gnosis_tx_hash, sent_at, recipient_balance_wei
         FROM gas_drips
-        WHERE recipient_gnosis_address = ${recipient}
+        WHERE lower(recipient_gnosis_address) = lower(${recipient})
       `;
 
       const row = rows[0];
