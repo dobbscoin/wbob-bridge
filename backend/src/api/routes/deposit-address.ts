@@ -75,11 +75,17 @@ export async function depositAddressRoute(
         // Always record drip preference on first call. ON CONFLICT preserves
         // the *first* preference set — calls after that are no-ops, regardless
         // of optInDrip value, so users can't flip-flop their decision.
+        // Addresses compare case-insensitively everywhere: 0xAbC… and 0xabc… are one
+        // wallet, and an exact match handed the treasury a second deposit address
+        // and a second drip row (2026-10-11 / 10-13).
         if (opts.config.dripEnabled) {
           const status = dripOptIn ? 'opted_in' : 'opted_out';
           await tx`
             INSERT INTO gas_drips (recipient_gnosis_address, status)
-            VALUES (${recipient}, ${status})
+            SELECT ${recipient}, ${status}
+            WHERE NOT EXISTS (
+              SELECT 1 FROM gas_drips WHERE lower(recipient_gnosis_address) = lower(${recipient})
+            )
             ON CONFLICT (recipient_gnosis_address) DO NOTHING
           `;
         }
@@ -88,7 +94,7 @@ export async function depositAddressRoute(
         const existing = await tx<DepositAddressRow[]>`
           SELECT recipient_gnosis_address, source_chain_name, dobbscoin_address, hd_index, created_at
           FROM deposit_addresses
-          WHERE recipient_gnosis_address = ${recipient}
+          WHERE lower(recipient_gnosis_address) = lower(${recipient})
             AND source_chain_name = ${chain}
           ORDER BY created_at DESC
           LIMIT 1
