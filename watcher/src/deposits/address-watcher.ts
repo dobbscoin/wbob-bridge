@@ -30,7 +30,7 @@ export interface DepositMatch {
  * Extract the single address from a scriptPubKey, if present.
  * Returns undefined for non-standard outputs (OP_RETURN, multisig, etc.).
  */
-function outputAddress(vout: RpcVout): string | undefined {
+export function outputAddress(vout: RpcVout): string | undefined {
   return vout.scriptPubKey.address ?? vout.scriptPubKey.addresses?.[0];
 }
 

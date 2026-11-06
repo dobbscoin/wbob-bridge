@@ -52,7 +52,22 @@ function payingMatches(block: RpcBlock, watched: ReadonlySet<string>) {
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationConfig: ConfirmationConfig) {
+/** Where our own node says a tx is. null = node has never heard of it. */
+export interface TxChainStatus {
+  confirmations: number;      // 0 = mempool or orphaned block
+  blockHash: string | null;
+  /** Height of blockHash when the node knows it (re-mines move this). */
+  blockHeight?: number | null;
+  /** The tx's outputs as the node decodes them: used to re-verify before signing. */
+  outputs?: { n: number; address: string | undefined; valueSat: bigint }[];
+}
+export type TxStatusFn = (txid: string) => Promise<TxChainStatus | null>;
+
+export function createBlockHandlers(
+  sql: Sql<{ bigint: bigint }>,
+  confirmationConfig: ConfirmationConfig,
+  txStatus: TxStatusFn,
+) {
   // ── Block handler ─────────────────────────────────────────────────────────
   //
   // Runs on every new canonical block. Two passes:
@@ -60,9 +75,12 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
   //      addresses. First match records txid/vout/amount/depositId/block_*
   //      and advances DEPOSIT_ADDRESS_ASSIGNED → DEPOSIT_SEEN_MEMPOOL.
   //   B) Confirmation advancement — for every deposit already matched and in
-  //      SEEN_MEMPOOL / CONFIRMED, compute confirmations from the tip height
-  //      vs. its home block_height and drive SEEN → CONFIRMED → FINALIZED as
-  //      thresholds are crossed. Also refreshes source_deposits.confirmations.
+  //      SEEN_MEMPOOL / CONFIRMED, confirmations = min(tip height − block_height + 1,
+  //      what OUR NODE reports for the txid), and drive SEEN → CONFIRMED → FINALIZED
+  //      as thresholds are crossed. If the node says the tx is not in the active
+  //      chain (0 confs, or unknown), nothing advances, CONFIRMED rolls back to
+  //      SEEN_MEMPOOL, and confirmations is reset to 0 (2026-11-05 reorg fix: height
+  //      arithmetic alone kept "confirming" double-spent / orphaned deposits).
   //
   // Safe to replay (startup catch-up re-runs blocks): A only acts on orders
   // still in DEPOSIT_ADDRESS_ASSIGNED, A2 skips a (txid, vout) already
@@ -268,9 +286,12 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
     }
 
     // ── B. Confirmation advancement ────────────────────────────────────────
-    type AdvanceRow = { order_id: string; state: InboundState; block_height: number };
+    type AdvanceRow = {
+      order_id: string; state: InboundState; block_height: number;
+      block_hash: string | null; txid: string | null;
+    };
     const pendingAdvance = await sql<AdvanceRow[]>`
-      SELECT bo.id AS order_id, bo.state AS state, sd.block_height
+      SELECT bo.id AS order_id, bo.state AS state, sd.block_height, sd.block_hash, sd.txid
       FROM bridge_orders bo
       JOIN source_deposits sd ON sd.order_id = bo.id
       WHERE bo.order_type = 'inbound'
@@ -279,9 +300,82 @@ export function createBlockHandlers(sql: Sql<{ bigint: bigint }>, confirmationCo
     `;
 
     for (const row of pendingAdvance) {
-      const confs = block.height - row.block_height + 1;
-      if (confs < 1) continue;
+      const heightConfs = block.height - row.block_height + 1;
+      if (heightConfs < 1) continue;
 
+      // Height arithmetic alone says nothing about whether the deposit tx is still
+      // in the ACTIVE chain: after a reorg (or a double-spend on a rented-hash fork)
+      // the recorded block_height keeps "confirming" a tx that no longer exists.
+      // Ask our own node. A tx in an orphaned block reports confirmations 0; an
+      // unknown tx is RPC -5. Either way: do not advance, and undo CONFIRMED.
+      if (!row.txid) continue;
+      let chain: TxChainStatus | null;
+      try {
+        chain = await txStatus(row.txid);
+      } catch (err) {
+        console.error(`[watcher] cannot verify txid=${row.txid} on our node; not advancing orderId=${row.order_id}:`, err);
+        continue;
+      }
+      const nodeConfs = chain?.confirmations ?? 0;
+
+      if (nodeConfs < 1) {
+        console.error(
+          `[watcher] DEPOSIT NOT IN ACTIVE CHAIN orderId=${row.order_id} txid=${row.txid} ` +
+          `(recorded block ${row.block_height}, node says ${chain === null ? 'unknown tx' : '0 confirmations'}); holding`,
+        );
+        const back = computeReorgRollback(row.state, 0, confirmationConfig);
+        try {
+          await sql.begin(async (tx) => {
+            const rows = await tx<{ state: InboundState }[]>`
+              SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
+            `;
+            if (rows.length === 0 || rows[0]!.state !== row.state) return;
+            await tx`
+              UPDATE source_deposits SET confirmations = 0, updated_at = now()
+              WHERE order_id = ${row.order_id}
+            `;
+            if (back === null) return;
+            assertInboundTransition(row.state, back);
+            await tx`
+              UPDATE bridge_orders SET state = ${back}, updated_at = now() WHERE id = ${row.order_id}
+            `;
+            await tx`
+              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (
+                ${row.order_id}, 'TX_LEFT_ACTIVE_CHAIN', ${row.state}, ${back}, 'watcher',
+                ${tx.json({ txid: row.txid, recordedBlockHash: row.block_hash, recordedBlockHeight: row.block_height,
+                            nodeBlockHash: chain?.blockHash ?? null, atHeight: block.height })}
+              )
+            `;
+            console.log(`[watcher] reorg rollback orderId=${row.order_id} ${row.state} → ${back}`);
+          });
+        } catch (err) {
+          console.error(`[watcher] tx-left-chain rollback error orderId=${row.order_id}:`, err);
+        }
+        continue;
+      }
+
+      // Re-mined in a different block: record where it lives now.
+      if (chain && chain.blockHash && row.block_hash && chain.blockHash !== row.block_hash) {
+        console.warn(`[watcher] txid=${row.txid} moved block ${row.block_hash} → ${chain.blockHash} (reorg); following the node`);
+        try {
+          await sql`
+            UPDATE source_deposits
+            SET block_hash   = ${chain.blockHash},
+                block_height = COALESCE(${chain.blockHeight ?? null}::int, block_height),
+                confirmations = ${nodeConfs},
+                updated_at   = now()
+            WHERE order_id = ${row.order_id}
+          `;
+        } catch (err) {
+          console.error(`[watcher] re-mine record error orderId=${row.order_id}:`, err);
+          continue;
+        }
+      }
+
+      // Never count more than the node does. min() also keeps catch-up replay
+      // advancing at the replayed block, as before.
+      const confs = Math.min(heightConfs, nodeConfs);
       const intent = computeConfirmationTransition(row.state, confs, confirmationConfig);
 
       try {

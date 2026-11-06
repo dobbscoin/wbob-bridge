@@ -14,7 +14,9 @@
  */
 
 import postgres from 'postgres';
-import { DobbscoinRpcClient } from './rpc/client.js';
+import { DobbscoinRpcClient, RpcCallError, btcToSatoshis } from './rpc/client.js';
+import { outputAddress } from './deposits/address-watcher.js';
+import type { TxChainStatus } from './deposits/block-handler.js';
 import { BlockPoller, CatchUpTooFarError } from './chain/block-poller.js';
 import { loadCursor, saveCursor } from './chain/cursor-store.js';
 import { createBlockHandlers } from './deposits/block-handler.js';
@@ -75,7 +77,35 @@ async function main(): Promise<void> {
     finalConfirmations: config.finalConfirmations,
   };
 
-  const { handleBlock, handleOrphan } = createBlockHandlers(sql, confirmationConfig);
+  // Source of truth for "is this deposit still in the active chain": our own node.
+  // -5 = "No information available about transaction" → unknown (null).
+  // Any other failure throws, and the deposit simply isn't advanced this block.
+  // Cached ~5s: catch-up replays many blocks in a row and the node's answer
+  // (relative to ITS tip) does not change between them.
+  const txCache = new Map<string, { at: number; v: TxChainStatus | null }>();
+  const txStatus = async (txid: string): Promise<TxChainStatus | null> => {
+    const hit = txCache.get(txid);
+    if (hit && Date.now() - hit.at < 5_000) return hit.v;
+    let v: TxChainStatus | null;
+    try {
+      const t = await rpc.getRawTransaction(txid);
+      const confirmations = t.confirmations ?? 0;
+      const blockHash = t.blockhash ?? null;
+      const blockHeight = blockHash && confirmations > 0 ? (await rpc.getBlockHeader(blockHash)).height : null;
+      v = {
+        confirmations, blockHash, blockHeight,
+        outputs: t.vout.map((o) => ({ n: o.n, address: outputAddress(o), valueSat: btcToSatoshis(o.value) })),
+      };
+    } catch (err) {
+      if (err instanceof RpcCallError && err.code === -5) v = null;
+      else throw err;
+    }
+    if (txCache.size > 10_000) txCache.clear();
+    txCache.set(txid, { at: Date.now(), v });
+    return v;
+  };
+
+  const { handleBlock, handleOrphan } = createBlockHandlers(sql, confirmationConfig, txStatus);
 
   // ── Signing loop ──────────────────────────────────────────────────────────
   // Polls for MINT_AUTH_CREATED orders that the backend executor created.
@@ -110,6 +140,24 @@ async function main(): Promise<void> {
       if (alreadySigned) continue;
 
       try {
+        // Independent check, per signer, at the moment of signing: our own node
+        // must show the deposit tx in the active chain at final depth, paying the
+        // recorded deposit address at least the amount we are about to authorize.
+        // The DB row alone is not evidence (2026-11-05 review).
+        const st = await txStatus(row.txid);
+        const out = st?.outputs?.find((o) => o.n === row.vout);
+        const why =
+          st === null                                         ? 'node does not know the tx' :
+          st.confirmations < config.finalConfirmations        ? `node shows ${st.confirmations} confirmations (< ${config.finalConfirmations})` :
+          out === undefined                                   ? `tx has no output ${row.vout}` :
+          out.address !== row.deposit_address                 ? `output ${row.vout} pays ${out.address}, not ${row.deposit_address}` :
+          out.valueSat < BigInt(row.amount_sat)               ? `output ${row.vout} is ${out.valueSat} sat, less than ${row.amount_sat} to mint` :
+          null;
+        if (why !== null) {
+          console.error(`[watcher] REFUSING TO SIGN orderId=${row.order_id} txid=${row.txid}: ${why}`);
+          continue;
+        }
+
         const depositIdHex = bufferToHex(row.deposit_id);
 
         // Dobbscoin txids are stored in the DB as raw 64-char hex (no 0x prefix —
