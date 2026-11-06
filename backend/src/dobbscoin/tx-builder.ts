@@ -220,6 +220,11 @@ export class DobbscoinTxBuilder {
     feeRateSatPerVbyte: number,
     rpc: DobbscoinBackendRpc,
   ): Promise<BuildTxResult> {
+    // A dust recipient output is refused by every node; never sign one (the
+    // caller would reserve the largest coins for a tx that can't be sent).
+    if (payoutAmountSat <= DUST_THRESHOLD_SAT) {
+      throw new Error(`payout of ${payoutAmountSat} sat is at or under dust (${DUST_THRESHOLD_SAT} sat); not signing`);
+    }
     const { selected, feeSat } = selectUtxos(utxos, payoutAmountSat, feeRateSatPerVbyte);
     const inputTotal = selected.reduce((s, u) => s + u.amountSat, 0n);
     const changeSat = inputTotal - payoutAmountSat - feeSat;

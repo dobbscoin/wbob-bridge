@@ -15,11 +15,49 @@
 
 import type { Sql } from 'postgres';
 import { OutboundState, assertOutboundTransition } from '@wbob/shared';
-import type { DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
-import { DobbscoinTxBuilder, type UtxoInput } from '../dobbscoin/tx-builder.js';
+import { RpcCallError, type DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
+import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, type UtxoInput } from '../dobbscoin/tx-builder.js';
 import type { BackendConfig } from '../config.js';
 import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 import { unpayableDestinationReason } from '../gnosis/destination.js';
+
+/** A selected UTXO was reserved by someone else before we could reserve it. */
+export class UtxoRaceError extends Error {
+  constructor(outpoint: string) { super(`UTXO ${outpoint} was taken before it could be reserved`); this.name = 'UtxoRaceError'; }
+}
+
+/** Reason to park a withdrawal too small to pay, before any UTXO is touched; null if payable. */
+export function belowPayoutMinimumReason(amountSat: bigint, minSat: bigint): string | null {
+  if (amountSat > minSat) return null;
+  return `withdrawal of ${amountSat} sat is at or under the payout minimum (${minSat} sat; ` +
+    `dust is ${DUST_THRESHOLD_SAT}); not signed. Re-mint the burned wBOB to the sender, or pay by hand.`;
+}
+
+/**
+ * True only when the node refused the tx for a reason that proves it is in NO
+ * mempool and its inputs are not spent by anything else, so they are safe to
+ * reuse. ALLOWLIST (fails safe): any reason not listed, including RBF
+ * replacement refusals ("insufficient fee, rejecting replacement", "too many
+ * potential replacements", ...), mempool conflicts, missing/spent inputs and
+ * "already known", keeps the reservation. Codes: -26 RPC_VERIFY_REJECTED,
+ * -22 deserialization (the hex never parsed, so nothing was relayed).
+ */
+const SAFE_REJECTION = new RegExp([
+  '\\bdust\\b', 'min relay fee not met', 'insufficient priority', 'mempool min fee not met',
+  'rate limited free transaction', 'non-mandatory-script-verify-flag', 'mandatory-script-verify-flag-failed',
+  'scriptsig-size', 'scriptsig-not-pushonly', 'scriptpubkey', 'bare-multisig', 'multi-op-return',
+  '\\bversion\\b', 'tx-size', 'absurdly-high-fee', 'bad-txns-vout-negative', 'bad-txns-vout-toolarge',
+  'bad-txns-oversize', 'bad-txns-txouttotal-toolarge', 'non-final',
+].join('|'), 'i');
+const UNSAFE_HINT = /replace|conflict|missing|spent|already|known|exists/i;
+
+export function isDefiniteRejection(err: unknown): boolean {
+  if (!(err instanceof RpcCallError) || err.method !== 'sendrawtransaction') return false;
+  if (err.code === -22) return true;
+  if (err.code !== -26) return false;
+  return SAFE_REJECTION.test(err.message) && !UNSAFE_HINT.test(err.message);
+}
+
 
 const PAYOUT_MIN_CONFIRMATIONS = 3;
 
@@ -114,7 +152,8 @@ export class PayoutExecutor {
     `;
 
     for (const row of queued) {
-      const unpayable = unpayableDestinationReason(row.dobbscoin_address);
+      const unpayable = unpayableDestinationReason(row.dobbscoin_address)
+        ?? belowPayoutMinimumReason(row.amount_sat, this.config.payoutMinSat);
       if (unpayable !== null) {
         console.error(`[payout-executor] orderId=${row.order_id}: ${unpayable}`);
         try {
@@ -129,6 +168,10 @@ export class PayoutExecutor {
       try {
         await this._buildAndSignPayout(row);
       } catch (err) {
+        if (err instanceof UtxoRaceError) {
+          console.warn(`[payout-executor] ${err.message}; retrying orderId=${row.order_id} next poll`);
+          continue;
+        }
         console.error(`[payout-executor] processQueued error orderId=${row.order_id}:`, err);
         await this._transitionOutbound(
           row.order_id, OutboundState.PAYOUT_QUEUED, OutboundState.MANUAL_REVIEW,
@@ -222,11 +265,14 @@ export class PayoutExecutor {
       const usedTxids = result.inputs.map((u) => u.txid);
       const usedVouts = result.inputs.map((u) => u.vout);
       for (let i = 0; i < usedTxids.length; i++) {
-        await tx`
+        const got = await tx`
           UPDATE bridge_utxos
           SET status = 'reserved', spent_payout_id = ${payoutId}, updated_at = now()
-          WHERE txid = ${usedTxids[i]!} AND vout = ${usedVouts[i]!}
+          WHERE txid = ${usedTxids[i]!} AND vout = ${usedVouts[i]!} AND status = 'available'
+          RETURNING id
         `;
+        // Someone reserved/spent it since selection: roll back and retry next poll.
+        if (got.length !== 1) throw new UtxoRaceError(`${usedTxids[i]}:${usedVouts[i]}`);
       }
 
       await tx`
@@ -253,7 +299,11 @@ export class PayoutExecutor {
       FROM bridge_orders bo
       JOIN withdrawal_requests wr ON wr.order_id = bo.id
       JOIN payouts p ON p.withdrawal_request_id = wr.id
+      -- Only the signed hex recorded for THIS payout row. An order re-signed
+      -- after a release has older PAYOUT_SIGNED rows whose inputs may be free
+      -- again; broadcasting one of those would pay the recipient twice.
       JOIN audit_events ae ON ae.order_id = bo.id AND ae.event_type = 'PAYOUT_SIGNED'
+                          AND ae.metadata->>'payoutId' = p.id::text
       WHERE bo.state = ${OutboundState.PAYOUT_SIGNED}
         AND p.txid IS NULL
       ORDER BY ae.id DESC
@@ -261,6 +311,16 @@ export class PayoutExecutor {
 
     for (const row of signed) {
       if (!row.signed_hex) continue;
+      // Record the attempt BEFORE sending. If an earlier attempt exists, that
+      // send may have reached peers even though we never recorded success (crash
+      // between send and commit), so a later rejection must not free the inputs.
+      let priorAttempts: number;
+      try {
+        priorAttempts = await this._recordBroadcastAttempt(row.order_id, row.payout_id);
+      } catch (err) {
+        console.error(`[payout-executor] could not record broadcast attempt orderId=${row.order_id}; not sending:`, err);
+        continue;
+      }
       try {
         const txid = await this.rpc.sendRawTransaction(row.signed_hex);
 
@@ -268,7 +328,21 @@ export class PayoutExecutor {
           const rows = await tx<{ state: string }[]>`
             SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
           `;
-          if (rows.length === 0 || rows[0]!.state !== OutboundState.PAYOUT_SIGNED) return;
+          if (rows.length === 0 || rows[0]!.state !== OutboundState.PAYOUT_SIGNED) {
+            // The node ACCEPTED this tx, but the order moved meanwhile (another
+            // poller parked it, or a hand edit). The coins are spent either way:
+            // record that, never leave them 'available'.
+            await tx`UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now() WHERE id = ${row.payout_id}`;
+            await tx`UPDATE bridge_utxos SET status = 'spent', updated_at = now() WHERE spent_payout_id = ${row.payout_id}`;
+            await tx`
+              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${row.order_id}, 'PAYOUT_SENT_OUT_OF_STATE', ${rows[0]?.state ?? null}, ${rows[0]?.state ?? 'UNKNOWN'},
+                      'payout-executor', ${tx.json({ txid, payoutId: row.payout_id })})
+            `;
+            console.error(`[payout-executor] CRITICAL: payout txid=${txid} was accepted but order ${row.order_id} is ` +
+              `${rows[0]?.state ?? 'missing'}; recorded the txid and marked inputs spent. Reconcile by hand.`);
+            return;
+          }
 
           await tx`
             UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now()
@@ -311,10 +385,24 @@ export class PayoutExecutor {
         console.log(`[payout-executor] broadcast txid=${txid} orderId=${row.order_id}`);
       } catch (err) {
         console.error(`[payout-executor] broadcastSigned error orderId=${row.order_id}:`, err);
-        await this._transitionOutbound(
-          row.order_id, OutboundState.PAYOUT_SIGNED, OutboundState.MANUAL_REVIEW,
-          { error: String(err) },
-        );
+        if (isDefiniteRejection(err) && priorAttempts === 0) {
+          // The node refused the tx outright (dust, fee, non-standard, ...): it is
+          // in no mempool, so its inputs are still ours. Free them, or every such
+          // payout permanently locks the largest coins (selection is largest-first).
+          await this._parkAndRelease(row.order_id, row.payout_id, String(err));
+        } else {
+          // Timeout, "already in mempool", missing inputs, ...: the tx may be out
+          // there. Keep the inputs reserved; releasing them could double-spend.
+          await this._transitionOutbound(
+            row.order_id, OutboundState.PAYOUT_SIGNED, OutboundState.MANUAL_REVIEW,
+            {
+              error: String(err),
+              inputsHeld: isDefiniteRejection(err)
+                ? `node refused it, but ${priorAttempts} earlier broadcast attempt(s) exist: verify the tx is not on the network before releasing its reserved UTXOs`
+                : 'the tx may be on the network: reserved UTXOs kept',
+            },
+          );
+        }
       }
     }
   }
@@ -355,6 +443,57 @@ export class PayoutExecutor {
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /** Append a PAYOUT_BROADCAST_ATTEMPT audit row; returns how many existed before it. */
+  private async _recordBroadcastAttempt(orderId: string, payoutId: string): Promise<number> {
+    return this.sql.begin(async (tx) => {
+      // Serialize concurrent pollers on this order, so two cannot both count 0.
+      await tx`SELECT id FROM bridge_orders WHERE id = ${orderId} FOR UPDATE`;
+      const [c] = await tx<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM audit_events
+        WHERE order_id = ${orderId} AND event_type = 'PAYOUT_BROADCAST_ATTEMPT'
+          AND metadata->>'payoutId' = ${payoutId}
+      `;
+      await tx`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (${orderId}, 'PAYOUT_BROADCAST_ATTEMPT', ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.PAYOUT_SIGNED},
+                'payout-executor', ${tx.json({ payoutId, attempt: c!.n + 1 })})
+      `;
+      return c!.n;
+    });
+  }
+
+  /** PAYOUT_SIGNED → MANUAL_REVIEW and return this payout's reserved inputs to the pool, atomically. */
+  private async _parkAndRelease(orderId: string, payoutId: string, error: string): Promise<void> {
+    assertOutboundTransition(OutboundState.PAYOUT_SIGNED, OutboundState.MANUAL_REVIEW);
+    try {
+      await this.sql.begin(async (tx) => {
+        const rows = await tx<{ state: string }[]>`
+          SELECT state FROM bridge_orders WHERE id = ${orderId} FOR UPDATE
+        `;
+        if (rows.length === 0 || rows[0]!.state !== OutboundState.PAYOUT_SIGNED) return;
+        const released = await tx<{ txid: string; vout: number }[]>`
+          UPDATE bridge_utxos SET status = 'available', spent_payout_id = NULL, updated_at = now()
+          WHERE spent_payout_id = ${payoutId} AND status = 'reserved'
+          RETURNING txid, vout
+        `;
+        await tx`
+          UPDATE bridge_orders SET state = ${OutboundState.MANUAL_REVIEW}, updated_at = now() WHERE id = ${orderId}
+        `;
+        await tx`
+          INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+          VALUES (
+            ${orderId}, 'STATE_TRANSITION', ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.MANUAL_REVIEW},
+            'payout-executor',
+            ${tx.json({ error, rejectedByNode: true, utxosReleased: released.map((u) => `${u.txid}:${u.vout}`) })}
+          )
+        `;
+        console.error(`[payout-executor] node rejected payout orderId=${orderId}; released ${released.length} reserved UTXO(s)`);
+      });
+    } catch (err) {
+      console.error(`[payout-executor] park+release error orderId=${orderId}:`, err);
+    }
+  }
 
   private async _transitionOutbound(
     orderId: string,

@@ -127,6 +127,12 @@ export interface BackendConfig {
   dripAmountWei: bigint;
   /** Minimum bridged amount (sat) to qualify for a drip. Default 1_000_000 = 0.01 BOB. */
   dripMinDepositSat: bigint;
+  /**
+   * Withdrawals at or under this many sat are never signed: parked in MANUAL_REVIEW
+   * up front. Must exceed dust (546). Default 100_000 = 0.001 BOB (the bridge pays
+   * ~2-3k sat network fee per payout; the smallest real withdrawal to date is 0.2 BOB).
+   */
+  payoutMinSat: bigint;
   /** Drip wallet balance (wei) below which the monitor pages ops. Default 1e18 = 1 xDAI. */
   dripLowWaterMarkWei: bigint;
   /**
@@ -188,6 +194,13 @@ function optionalEnvBool(key: string, def: boolean): boolean {
   const val = process.env[key];
   if (val === undefined) return def;
   return val.toLowerCase() === 'true' || val === '1';
+}
+
+function payoutMinSat(): bigint {
+  const v = optionalEnvBigInt('PAYOUT_MIN_SAT', 100_000n);
+  // 546 = DUST_THRESHOLD_SAT in dobbscoin/tx-builder.ts (not imported: config stays dependency-free).
+  if (v <= 546n) throw new Error(`PAYOUT_MIN_SAT must be above dust (546 sat), got ${v}`);
+  return v;
 }
 
 function optionalEnvBigInt(key: string, def: bigint): bigint {
@@ -253,6 +266,7 @@ export function loadConfig(): BackendConfig {
     dripHotWalletPrivateKey:    (process.env['DRIP_HOT_WALLET_PRIVATE_KEY'] ?? null) as Hex | null,
     dripAmountWei,
     dripMinDepositSat:          optionalEnvBigInt('DRIP_MIN_DEPOSIT_SAT', 1_000_000n),
+    payoutMinSat:               payoutMinSat(),
     dripLowWaterMarkWei:        optionalEnvBigInt('DRIP_LOW_WATER_MARK_WEI', 1_000_000_000_000_000_000n),
     dripSkipIfRecipientBalanceWei: optionalEnvBigInt('DRIP_SKIP_IF_RECIPIENT_BALANCE_WEI', dripAmountWei),
     alertEmailTo:               process.env['ALERT_EMAIL_TO'] ?? null,
