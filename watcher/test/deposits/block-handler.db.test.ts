@@ -33,7 +33,7 @@ const IN_CHAIN = async () => ({ confirmations: 1_000_000, blockHash: null });
 function payment(txid: string, address: string, value: number): RpcRawTransaction {
   return {
     txid, hash: txid, version: 1, size: 0, vsize: 0, weight: 0, locktime: 0, vin: [], hex: '',
-    vout: [{ value, n: 0, scriptPubKey: { asm: '', hex: '', type: 'pubkeyhash', address } }],
+    vout: [{ value, n: 0, scriptPubKey: { asm: '', hex: '76a914' + '00'.repeat(20) + '88ac', type: 'pubkeyhash', address } }],
   };
 }
 
