@@ -35,6 +35,10 @@ export interface WatcherConfig {
   reorgDepth: number;
   /** Most blocks to replay automatically on startup; above this, refuse to start. */
   catchupMaxBlocks: number;
+  /** The bridge's deposit xpub + path + P2PKH version, to derive its addresses locally. */
+  hdWalletXpub: string;
+  hdDerivationPath: string;
+  dobbscoinAddressVersion: number;
 }
 
 function requireEnv(key: string): string {
@@ -76,5 +80,8 @@ export function loadConfig(): WatcherConfig {
     dobbscoinChainId:        DOBBSCOIN_CHAIN_IDS[network],
     reorgDepth:              optionalEnvInt('REORG_DEPTH', 200),
     catchupMaxBlocks:        optionalEnvInt('WATCHER_CATCHUP_MAX_BLOCKS', 2_000),
+    hdWalletXpub:            requireEnv('HD_WALLET_XPUB'),
+    hdDerivationPath:        process.env['HD_DERIVATION_PATH'] || 'm/0',
+    dobbscoinAddressVersion: optionalEnvInt('DOBBSCOIN_ADDRESS_VERSION', 0),
   };
 }

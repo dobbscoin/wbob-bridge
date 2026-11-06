@@ -19,7 +19,8 @@ function id(recipient: string, valueSat = 100_000_000n, address = ADDR, vout = 0
 function row(over: Partial<MintCheckRow> = {}): MintCheckRow {
   return {
     txid: TXID, vout: 0, deposit_address: ADDR, source_chain_name: 'dobbscoin-mainnet',
-    recipient_address: RECIPIENT, amount_sat: 100_000_000n, deposit_id_hex: id(RECIPIENT), ...over,
+    recipient_address: RECIPIENT, amount_sat: 100_000_000n, deposit_id_hex: id(RECIPIENT),
+    expected_deposit_address: ADDR, ...over,
   };
 }
 
@@ -76,5 +77,16 @@ describe('checkMintAgainstNode', () => {
   it('refuses a depositId computed for a bigger output than the node shows', () => {
     expect(checkMintAgainstNode(row({ deposit_id_hex: id(RECIPIENT, 900_000_000n), amount_sat: 50_000_000n }), node(), FINAL))
       .toMatch(/does not match/);
+  });
+
+  it('refuses a row whose deposit address is NOT the bridge address at its hd_index (DB-forged row)', () => {
+    // Attacker pays their own address and writes a row pointing at it: output and row agree, the xpub does not.
+    const r = row({ deposit_address: '1AttackerOwnAddressxxxxxxxxxxxxx', expected_deposit_address: ADDR,
+                    deposit_id_hex: id(RECIPIENT, 100_000_000n, '1AttackerOwnAddressxxxxxxxxxxxxx') });
+    expect(checkMintAgainstNode(r, node({ address: '1AttackerOwnAddressxxxxxxxxxxxxx' }), FINAL)).toMatch(/is not the bridge's address/);
+  });
+
+  it('refuses when the bridge address cannot be derived (no hd_index)', () => {
+    expect(checkMintAgainstNode(row({ expected_deposit_address: null }), node(), FINAL)).toMatch(/cannot derive/);
   });
 });
