@@ -1,0 +1,71 @@
+/**
+ * Independent pre-signing check (2026-11-05 review).
+ *
+ * Each signer asks ITS OWN node about the deposit tx at the moment of signing.
+ * The mint_requests row alone is not evidence. Returns null when it is safe to
+ * sign, otherwise a human-readable reason to refuse.
+ *
+ * Checks:
+ *   - the node knows the tx and shows it at >= finalConfirmations in the active chain
+ *   - output `vout` exists, pays the recorded deposit address, and is worth at least
+ *     the amount about to be authorized (a daily-cap split mints less than the deposit)
+ *   - the depositId in the row is exactly what computeDepositId gives for the
+ *     node's view of that output plus the row's recipient
+ *
+ * NOT covered: a DB writer can still pair a real output with a different
+ * recipient and a matching freshly computed depositId. The contract keys replay
+ * protection on depositId only, so that needs a controller that also records
+ * (sourceTxHash, sourceVout). Rebuild item.
+ */
+
+import { computeDepositId } from '../deposits/deposit-id.js';
+import type { TxChainStatus } from '../deposits/block-handler.js';
+import type { Address } from '@wbob/shared';
+
+export interface MintCheckRow {
+  txid: string;
+  vout: number;
+  deposit_address: string;
+  source_chain_name: string;
+  recipient_address: string;
+  amount_sat: bigint | string | number;
+  deposit_id_hex: string;
+}
+
+export function checkMintAgainstNode(
+  row: MintCheckRow,
+  st: TxChainStatus | null,
+  finalConfirmations: number,
+): string | null {
+  if (st === null) return 'node does not know the tx';
+  if (st.confirmations < finalConfirmations) {
+    return `node shows ${st.confirmations} confirmations (< ${finalConfirmations})`;
+  }
+  const out = st.outputs?.find((o) => o.n === row.vout);
+  if (out === undefined) return `tx has no output ${row.vout}`;
+  if (out.address !== row.deposit_address) {
+    return `output ${row.vout} pays ${out.address}, not ${row.deposit_address}`;
+  }
+  const amount = BigInt(row.amount_sat);
+  if (amount <= 0n) return `non-positive amount ${amount}`;
+  if (out.valueSat < amount) {
+    return `output ${row.vout} is ${out.valueSat} sat, less than ${amount} to mint`;
+  }
+  let expected: string;
+  try {
+    expected = computeDepositId({
+      sourceChainName:        row.source_chain_name,
+      dobbscoinTxid:          row.txid,
+      vout:                   row.vout,
+      depositAddress:         out.address,
+      rawAmountSat:           out.valueSat,
+      recipientGnosisAddress: row.recipient_address as Address,
+    });
+  } catch (err) {
+    return `cannot recompute depositId: ${(err as Error).message}`;
+  }
+  if (expected.toLowerCase() !== row.deposit_id_hex.toLowerCase()) {
+    return `depositId ${row.deposit_id_hex} does not match the node's output (expected ${expected})`;
+  }
+  return null;
+}
