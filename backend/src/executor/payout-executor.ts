@@ -20,6 +20,8 @@ import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, txidFromRawHex, txInputsFromRaw
 import type { BackendConfig } from '../config.js';
 import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 import { unpayableDestinationReason } from '../gnosis/destination.js';
+import { BurnVerifier, type BurnVerifierLike } from '../gnosis/burn-verifier.js';
+import { AlertDispatcher } from '../monitor/webhook.js';
 
 /** A selected UTXO was reserved by someone else before we could reserve it. */
 export class UtxoRaceError extends Error {
@@ -93,6 +95,13 @@ interface QueuedPayoutRow {
   payout_txid:       string | null;
   held_utxos:        number;   // bridge_utxos still reserved by that payout
   spent_utxos:       number;   // bridge_utxos marked spent by that payout
+  withdrawal_id:     string | null;
+  burn_tx_hash:      string | null;
+  sender_address:    string | null;
+  wr_amount_sat:     bigint | null;
+  wr_dobbscoin_address: string | null;
+  /** Other withdrawal_requests rows claiming the same withdrawal_id or burn log (must be 0). */
+  same_burn_rows:    number;
 }
 
 interface SignedPayoutRow {
@@ -127,6 +136,8 @@ export class PayoutExecutor {
   private readonly txBuilder: DobbscoinTxBuilder;
   /** payoutId → last re-send of a forgotten payout, and consecutive refusals. */
   private readonly resendState = new Map<string, { last: number; failures: number }>();
+  private readonly burnVerifier: BurnVerifierLike;
+
   constructor(
     private readonly sql: Sql,
     private readonly rpc: DobbscoinBackendRpc,
@@ -136,7 +147,10 @@ export class PayoutExecutor {
      * so payouts and refunds never pick bridge UTXOs at the same time.
      */
     private readonly refunds: RefundExecutor | null = null,
+    /** Re-reads each burn on Gnosis before its payout is signed (review round 5 #1). */
+    burnVerifier: BurnVerifierLike | null = null,
   ) {
+    this.burnVerifier = burnVerifier ?? new BurnVerifier(config);
     this.txBuilder = new DobbscoinTxBuilder(
       config.hdWalletXpriv,
       config.dobbscoinAddressVersion,
@@ -174,11 +188,17 @@ export class PayoutExecutor {
         p.id                      AS payout_id,
         p.txid                    AS payout_txid,
         (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'reserved') AS held_utxos,
-        (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'spent')    AS spent_utxos
+        (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'spent')    AS spent_utxos,
+        wr.withdrawal_id::text    AS withdrawal_id,
+        wr.burn_tx_hash,
+        wr.sender_address,
+        wr.amount_sat             AS wr_amount_sat,
+        wr.dobbscoin_address      AS wr_dobbscoin_address,
+        (SELECT count(*)::int FROM withdrawal_requests o
+          WHERE o.id <> wr.id AND o.withdrawal_id = wr.withdrawal_id) AS same_burn_rows
       FROM bridge_orders bo
-      LEFT JOIN payouts p ON p.withdrawal_request_id = (
-        SELECT id FROM withdrawal_requests wr WHERE wr.order_id = bo.id
-      )
+      LEFT JOIN withdrawal_requests wr ON wr.order_id = bo.id
+      LEFT JOIN payouts p ON p.withdrawal_request_id = wr.id
       WHERE bo.order_type = 'outbound'
         AND bo.state = ${OutboundState.PAYOUT_QUEUED}
     `;
@@ -231,6 +251,18 @@ export class PayoutExecutor {
         }
       }
 
+      // ── The burn must exist on Gnosis exactly as we are about to pay it ──
+      // (only here: this is the one place a NEW payout signature is created).
+      const bad = await this._burnNotBackedReason(row);
+      if (bad !== null) {
+        if (bad.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${bad.reason}`); continue; }
+        await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, bad.reason);
+        await this._alertCritical(`Payout REFUSED for order ${row.order_id}: ${bad.reason}. ` +
+          `The DB does not match the chain: possible tampering. Do not pay by hand without checking the burn tx.`,
+          { orderId: row.order_id, reason: bad.reason });
+        continue;
+      }
+
       try {
         await this._buildAndSignPayout(row);
       } catch (err) {
@@ -241,6 +273,34 @@ export class PayoutExecutor {
         console.error(`[payout-executor] processQueued error orderId=${row.order_id}:`, err);
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, String(err));
       }
+    }
+  }
+
+  /** Null if the burn on Gnosis backs this payout exactly; else why not (defer = retry later). */
+  private async _burnNotBackedReason(row: QueuedPayoutRow): Promise<{ defer: boolean; reason: string } | null> {
+    if (row.withdrawal_id === null || row.sender_address === null || row.wr_amount_sat === null) {
+      return { defer: false, reason: 'burn check failed: no withdrawal_requests row for this order' };
+    }
+    if (row.same_burn_rows > 0) {
+      return { defer: false, reason: `burn check failed: ${row.same_burn_rows} other withdrawal row(s) claim withdrawalId ${row.withdrawal_id}` };
+    }
+    if (row.wr_amount_sat !== row.amount_sat || row.wr_dobbscoin_address !== row.dobbscoin_address) {
+      return { defer: false, reason: 'burn check failed: order and withdrawal rows disagree on amount or destination' };
+    }
+    const v = await this.burnVerifier.verify({
+      withdrawalId: row.withdrawal_id, burnTxHash: row.burn_tx_hash, senderAddress: row.sender_address,
+      amountSat: row.amount_sat, dobbscoinAddress: row.dobbscoin_address,
+    });
+    return v.ok ? null : { defer: v.defer, reason: v.reason };
+  }
+
+  private async _alertCritical(message: string, data: Record<string, unknown>): Promise<void> {
+    try {
+      await new AlertDispatcher({ webhookUrl: this.config.alertWebhookUrl, emailTo: this.config.alertEmailTo }).dispatch({
+        level: 'critical', type: 'MANUAL_REVIEW_ORDERS', timestamp: new Date().toISOString(), message, data,
+      });
+    } catch (err) {
+      console.error('[payout-executor] alert dispatch failed:', err);
     }
   }
 

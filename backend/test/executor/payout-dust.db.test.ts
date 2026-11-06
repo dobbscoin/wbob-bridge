@@ -22,6 +22,7 @@ import { OutboundState } from '@wbob/shared';
 import type { BackendConfig } from '../../src/config.js';
 import { PayoutExecutor, belowPayoutMinimumReason, isDefiniteRejection } from '../../src/executor/payout-executor.js';
 import { RpcCallError, RpcNetworkError } from '../../src/dobbscoin/rpc.js';
+import type { BurnVerifierLike, BurnClaim } from '../../src/gnosis/burn-verifier.js';
 import { DobbscoinTxBuilder, txidFromRawHex, txInputsFromRawHex } from '../../src/dobbscoin/tx-builder.js';
 
 const URL = process.env['PAYOUT_TEST_DATABASE_URL'];
@@ -129,7 +130,8 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   function executor(
     sendRawTransaction: (hex: string) => Promise<string>,
     more: { getConfirmations?: (txid: string) => Promise<number>; getRawTransactionHex?: (txid: string) => Promise<string>;
-            isInMempool?: (txid: string) => Promise<boolean> } = {},
+            isInMempool?: (txid: string) => Promise<boolean>;
+            burn?: BurnVerifierLike } = {},
   ) {
     const rpc = {
       sendRawTransaction,
@@ -137,7 +139,8 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       getConfirmations: more.getConfirmations ?? (async () => -1),
       isInMempool: more.isInMempool ?? (async () => false),
     };
-    return new PayoutExecutor(sql as never, rpc as never, config) as unknown as {
+    const burn = more.burn ?? { verify: async () => ({ ok: true as const }) };
+    return new PayoutExecutor(sql as never, rpc as never, config, null, burn) as unknown as {
       processQueued(): Promise<void>; broadcastSigned(): Promise<void>; confirmBroadcast(): Promise<void>;
     };
   }
@@ -300,6 +303,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       VALUES (${orderId}, ${coin}, 0, 5000000000, ${ADDR}, 0, 'available')`;
     const recipient = new DobbscoinTxBuilder(ROOT.privateExtendedKey, 0).deriveChangeAddress(99);   // a decodable address
     await sql`UPDATE bridge_orders SET state = 'PAYOUT_QUEUED', user_dobbscoin_address = ${recipient} WHERE id = ${orderId}`;
+    await sql`UPDATE withdrawal_requests SET dobbscoin_address = ${recipient} WHERE order_id = ${orderId}`;   // as ingested
 
     const sent: string[] = [];
     const ex = executor(async (h) => { sent.push(h); return txidFromRawHex(h); },
@@ -391,5 +395,42 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await executor(async () => { throw new RpcCallError('sendrawtransaction', -26, '64: too-long-mempool-chain'); }).broadcastSigned();
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
     await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;   // keep later tests clean
+  });
+
+  // ── Review round 5 #1: the burn must back the payout ─────────────────────
+  it('a payout the chain does not back is parked before any coin is touched', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const big = await utxo(orderId, 5_000_000_000n);
+    const seen: BurnClaim[] = [];
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async (c) => { seen.push(c); return { ok: false, defer: false, reason: 'burn check failed: amount on-chain 1 != payout amount 200000' }; } },
+    }).processQueued();
+    expect(seen[0]!.amountSat).toBe(200_000n);
+    expect(seen[0]!.dobbscoinAddress).toBe(ADDR);
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+    expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
+    const [p] = await sql<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM payouts p JOIN withdrawal_requests wr ON wr.id = p.withdrawal_request_id WHERE wr.order_id = ${orderId}`;
+    expect(p!.n).toBe(0);
+  });
+
+  it('an unreachable node or a shallow burn only defers: the order stays queued, nothing is signed', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const big = await utxo(orderId, 5_000_000_000n);
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => ({ ok: false, defer: true, reason: 'Gnosis node unreachable' }) },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
+    expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  it('an order whose amount was raised after ingest (order != withdrawal row) is parked without asking the chain', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`UPDATE bridge_orders SET amount_sat = 900000000 WHERE id = ${orderId}`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
   });
 });
