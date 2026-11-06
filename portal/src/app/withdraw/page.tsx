@@ -10,7 +10,7 @@ import {
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 import { useQuery } from '@tanstack/react-query';
 import { parseEventLogs } from 'viem';
-import { getOrder, getOrderByWithdrawal, type OrderResponse } from '@/lib/api';
+import { getOrder, getOrderByWithdrawal, getWithdrawLimits, type OrderResponse } from '@/lib/api';
 import { satsToBob, bobToSats, gnosisExplorerTx, dobbscoinExplorerTx, shortHash } from '@/lib/utils';
 import { OutboundConfirmationNote } from '@/components/ConfirmationNotice';
 import { WBOB_ABI, BRIDGE_CONTROLLER_ABI, WBOB_ADDRESS, BRIDGE_CONTROLLER_ADDRESS } from '@/lib/contracts';
@@ -25,6 +25,10 @@ type Phase =
   | { tag: 'completed'; order: OrderResponse };
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'MANUAL_REVIEW']);
+
+// The backend's default PAYOUT_MIN_SAT, used only if /v1/withdraw-limits is
+// unreachable, so the form still refuses amounts the bridge would never pay.
+const FALLBACK_PAYOUT_MIN_SAT = 100_000n;
 
 // Validate Dobbscoin P2PKH address (starts with 1 or m/n, 25-34 chars)
 function isValidDobbscoinAddress(addr: string): boolean {
@@ -46,6 +50,15 @@ export default function WithdrawPage() {
     args: address ? [address] : undefined,
     query: { enabled: !!address && !!WBOB_ADDRESS },
   });
+
+  // ── Payout minimum (withdrawals at or under it are never paid out) ─────────
+  const { data: limits } = useQuery({
+    queryKey: ['withdraw-limits'],
+    queryFn: getWithdrawLimits,
+    staleTime: 5 * 60_000,
+    retry: 2,
+  });
+  const payoutMinSat = limits ? BigInt(limits.payoutMinSat) : FALLBACK_PAYOUT_MIN_SAT;
 
   // ── Write: requestWithdrawal ───────────────────────────────────────────────
   const { writeContractAsync, isPending: isSigning } = useWriteContract();
@@ -126,6 +139,14 @@ export default function WithdrawPage() {
       return;
     }
 
+    if (amountSat <= payoutMinSat) {
+      setFormError(
+        `Minimum withdrawal is more than ${satsToBob(payoutMinSat)} wBOB. Smaller amounts cost more in ` +
+        `network fees than they are worth and are not paid out automatically.`,
+      );
+      return;
+    }
+
     if (balanceSat !== undefined && amountSat > (balanceSat as bigint)) {
       setFormError(`Insufficient balance. You have ${satsToBob(balanceSat as bigint)} wBOB.`);
       return;
@@ -150,7 +171,7 @@ export default function WithdrawPage() {
       setFormError(msg.length > 120 ? msg.slice(0, 120) + '…' : msg);
       setPhase({ tag: 'form' });
     }
-  }, [amountBob, dobbscoinAddress, balanceSat, writeContractAsync]);
+  }, [amountBob, dobbscoinAddress, balanceSat, payoutMinSat, writeContractAsync]);
 
   // ── Completed ───────────────────────────────────────────────────────────────
   if (phase.tag === 'completed') {
@@ -343,15 +364,18 @@ export default function WithdrawPage() {
                 wBOB
               </span>
             </div>
-            {balanceSat !== undefined && (
-              <button
-                type="button"
-                onClick={() => setAmountBob(satsToBob(balanceSat as bigint))}
-                className="mt-1 text-xs text-bob-400 hover:text-bob-300"
-              >
-                Max: {satsToBob(balanceSat as bigint)}
-              </button>
-            )}
+            <div className="mt-1 flex items-center justify-between text-xs">
+              <span className="text-gray-500">Minimum: more than {satsToBob(payoutMinSat)} wBOB</span>
+              {balanceSat !== undefined && (
+                <button
+                  type="button"
+                  onClick={() => setAmountBob(satsToBob(balanceSat as bigint))}
+                  className="text-bob-400 hover:text-bob-300"
+                >
+                  Max: {satsToBob(balanceSat as bigint)}
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Dobbscoin address */}

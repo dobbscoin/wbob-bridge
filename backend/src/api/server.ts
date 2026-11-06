@@ -14,6 +14,7 @@ import { dripRoute } from './routes/drip.js';
 import type { BackendConfig } from '../config.js';
 import type { SolvencyMonitor } from '../monitor/solvency-monitor.js';
 import { mintCapRoute } from './routes/mint-cap.js';
+import { withdrawLimitsRoute } from './routes/withdraw-limits.js';
 import { ViemMintCapReader, type MintCapReader } from '../executor/mint-capacity.js';
 import { createPublicClient, fallback, http, type PublicClient } from 'viem';
 import { gnosis } from 'viem/chains';
@@ -46,6 +47,7 @@ export async function buildServer(opts: {
     opts.config.bridgeControllerAddress,
   );
   await fastify.register(mintCapRoute, { sql: opts.sql, capReader });
+  await fastify.register(withdrawLimitsRoute, { config: opts.config });
 
   // Legacy liveness probe (kept for backwards compat)
   fastify.get('/health', async () => ({ status: 'ok' }));

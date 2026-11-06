@@ -137,3 +137,14 @@ export interface MintCapResponse {
 export function getMintCap(): Promise<MintCapResponse> {
   return api<MintCapResponse>('/v1/mint-cap');
 }
+
+// ─── Withdrawal minimum ──────────────────────────────────────────────────────
+
+export interface WithdrawLimitsResponse {
+  /** Withdrawals must be STRICTLY greater than this (satoshis). */
+  payoutMinSat: string;
+}
+
+export function getWithdrawLimits(): Promise<WithdrawLimitsResponse> {
+  return api<WithdrawLimitsResponse>('/v1/withdraw-limits');
+}
