@@ -53,6 +53,7 @@ import {
   mintAuthorizationTypes,
 } from '@wbob/shared';
 import { bufferToHex } from '../db/hex.js';
+import { withRelayerLock } from '../gnosis/relayer-lock.js';
 import type { BackendConfig } from '../config.js';
 import type { DripSender } from './drip-sender.js';
 import { AlertDispatcher } from '../monitor/webhook.js';
@@ -761,7 +762,7 @@ export class MintExecutor {
     }
 
     // 3. Send.
-    const txHash = await this.walletClient.writeContract(request);
+    const txHash = await withRelayerLock(() => this.walletClient.writeContract(request));
 
     // Record tx hash and advance FSM
     await this.sql.begin(async (tx) => {

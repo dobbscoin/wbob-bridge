@@ -30,6 +30,7 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { gnosis } from 'viem/chains';
 import type { BackendConfig } from '../config.js';
+import { AlertDispatcher } from '../monitor/webhook.js';
 
 const MODULE_EVENTS_ABI = parseAbi([
   'event EmergencyPaused(address indexed triggeredBy, bool controllerPaused, bool tokenPaused)',
@@ -103,6 +104,7 @@ export class BridgeGuard {
       const rc = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
       if (rc.status !== 'success') {
         console.error(`[bridge-guard] PAUSE TX REVERTED (${txHash}): nothing was paused. Pause via the Safe NOW.`);
+        await this._alert(`Emergency pause tx REVERTED (${txHash}); nothing was paused. Pause via the Safe NOW. Reason: ${reason}`);
         return;
       }
       if (!this.v2) {
@@ -116,11 +118,24 @@ export class BridgeGuard {
       if (done?.controllerPaused && done?.tokenPaused) {
         console.error('[bridge-guard] BridgeControllerV2 + wBOB token PAUSED via module');
       } else {
-        console.error(`[bridge-guard] PARTIAL PAUSE: controller=${done?.controllerPaused ?? '?'} token=${done?.tokenPaused ?? '?'}` +
-          ` failed=[${failed.join(', ')}]. Pause the rest via the Safe NOW.`);
+        const msg = `PARTIAL PAUSE: controller=${done?.controllerPaused ?? '?'} token=${done?.tokenPaused ?? '?'}` +
+          ` failed=[${failed.join(', ')}]. Pause the rest via the Safe NOW.`;
+        console.error(`[bridge-guard] ${msg}`);
+        await this._alert(`${msg} Reason: ${reason}`);
       }
     } catch (err) {
       console.error('[bridge-guard] FAILED to pause via module:', err);
+      await this._alert(`Emergency pause FAILED to send: ${String(err).slice(0, 200)}. Pause via the Safe NOW. Reason: ${reason}`);
+    }
+  }
+
+  private async _alert(message: string): Promise<void> {
+    try {
+      await new AlertDispatcher({ webhookUrl: this.config.alertWebhookUrl, emailTo: this.config.alertEmailTo }).dispatch({
+        level: 'critical', type: 'MINT_SUBMIT_BLOCKED', timestamp: new Date().toISOString(), message, data: {},
+      });
+    } catch (err) {
+      console.error('[bridge-guard] alert dispatch failed:', err);
     }
   }
 

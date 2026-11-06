@@ -3,7 +3,9 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { matchTransaction, matchBlock } from '../../src/deposits/address-watcher.js';
+import { matchTransaction, matchBlock, outputAddress } from '../../src/deposits/address-watcher.js';
+
+const P2PKH_HEX = '76a914000000000000000000000000000000000000000088ac';
 import type { RpcRawTransaction, RpcBlock } from '../../src/rpc/types.js';
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -26,7 +28,7 @@ function makeTx(
       n,
       scriptPubKey: {
         asm: '',
-        hex: '',
+        hex: P2PKH_HEX,
         type: 'pubkeyhash',
         ...(o.address ? { address: o.address } : {}),
       },
@@ -156,5 +158,40 @@ describe('matchBlock', () => {
   it('returns empty for empty block', () => {
     const block = makeBlock([]);
     expect(matchBlock(block, WATCHED)).toHaveLength(0);
+  });
+});
+
+// ─── Only standard P2PKH counts as a deposit (review round 4) ───────────────
+
+describe('outputAddress', () => {
+  const A = '1L9YGqctBWaCmn7y8d8CBkTXzXXZ4EAECN';
+  const vout = (scriptPubKey: Record<string, unknown>) => ({ value: 1, n: 0, scriptPubKey: { asm: '', ...scriptPubKey } }) as never;
+
+  it('returns the address of a standard P2PKH output', () => {
+    expect(outputAddress(vout({ type: 'pubkeyhash', hex: P2PKH_HEX, address: A }))).toBe(A);
+    expect(outputAddress(vout({ type: 'pubkeyhash', hex: P2PKH_HEX, addresses: [A] }))).toBe(A);
+  });
+
+  it('ignores a bare multisig even when the node lists the deposit address first', () => {
+    const msig = '5121' + '02'.padEnd(66, '1') + '21' + '03'.padEnd(66, '2') + '52ae';
+    expect(outputAddress(vout({ type: 'multisig', hex: msig, addresses: [A, '1Attacker'] }))).toBeUndefined();
+  });
+
+  it('ignores P2SH, P2PK, OP_RETURN and non-standard scripts', () => {
+    expect(outputAddress(vout({ type: 'scripthash', hex: 'a914' + '00'.repeat(20) + '87', addresses: ['3x'] }))).toBeUndefined();
+    expect(outputAddress(vout({ type: 'pubkey', hex: '21' + '02'.padEnd(66, '1') + 'ac', addresses: [A] }))).toBeUndefined();
+    expect(outputAddress(vout({ type: 'nulldata', hex: '6a04deadbeef' }))).toBeUndefined();
+    expect(outputAddress(vout({ type: 'nonstandard', hex: '00', addresses: [A] }))).toBeUndefined();
+  });
+
+  it('rejects a "pubkeyhash" label on a script that is not exactly P2PKH', () => {
+    expect(outputAddress(vout({ type: 'pubkeyhash', hex: P2PKH_HEX + '00', address: A }))).toBeUndefined();
+    expect(outputAddress(vout({ type: 'pubkeyhash', hex: '', address: A }))).toBeUndefined();
+  });
+
+  it('a multisig deposit is never matched as a deposit', () => {
+    const tx = makeTx('t', [{ value: 5, address: A }]);
+    tx.vout[0]!.scriptPubKey.type = 'multisig';
+    expect(matchTransaction(tx, new Set([A]))).toEqual([]);
   });
 });

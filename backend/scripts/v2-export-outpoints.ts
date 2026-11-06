@@ -141,8 +141,9 @@ async function main(): Promise<void> {
       SELECT sd.txid, sd.vout, mr.gnosis_tx_hash, encode(mr.deposit_id, 'hex') AS deposit_id
       FROM mint_requests mr JOIN source_deposits sd ON sd.order_id = mr.order_id
     `,
-    await tx<{ txid: string; vout: number; state: string; order_id: string }[]>`
-      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id
+    await tx<{ txid: string; vout: number; state: string; order_id: string; created_at: Date; has_refund: boolean }[]>`
+      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id, bo.created_at,
+             EXISTS (SELECT 1 FROM deposit_refunds r WHERE r.order_id = bo.id) AS has_refund
       FROM source_deposits sd JOIN bridge_orders bo ON bo.id = sd.order_id
       WHERE bo.order_type = 'inbound' AND sd.txid IS NOT NULL AND sd.vout IS NOT NULL
     `,
@@ -172,7 +173,13 @@ async function main(): Promise<void> {
     const txidPlain = l.sourceTxHash.replace(/^0x/, '').toLowerCase();
     const op = `${txidPlain}:${l.vout}`;
     logTxHashes.add(l.txHash.toLowerCase());
-    if (l.chainId !== config.dobbscoinChainId) problem(op, `${op}: sourceChainId ${l.chainId} != ${config.dobbscoinChainId}`);
+    if (l.chainId !== config.dobbscoinChainId) {
+      problem(op, `${op}: sourceChainId ${l.chainId} != ${config.dobbscoinChainId}`);
+      // V2 pins SOURCE_CHAIN_ID: if this is allowed through, block the output
+      // under the canonical chain id too, or it stays mintable on V2.
+      const canonical = keyOf(txidPlain, l.vout);
+      if (!seen.has(canonical)) { seen.add(canonical); keys.push(canonical); }
+    }
     const key = outpointKey(l.chainId, l.sourceTxHash, l.vout);
     if (seen.has(key)) { problems.push(`${op}: MINTED TWICE by V1 (duplicate outpoint)`); continue; }
     seen.add(key);
@@ -225,20 +232,30 @@ async function main(): Promise<void> {
 
   // ── Settled pre-cutover deposits are blocked too ──
   // Refunds before the cutover never touched the chain, so a fully refunded
-  // deposit is not in the V1 logs. Everything recorded before the cutover is
-  // settled (minted or refunded) once in-flight orders are drained: import them
-  // all. An extra key can only block a mint.
-  const FINAL_STATES = new Set(['COMPLETED', 'REFUNDED', 'FAILED']);
+  // deposit is not in the V1 logs. Import every deposit that is SETTLED
+  // (COMPLETED, REFUNDED, or with a deposit_refunds row); an extra key can only
+  // block a mint. A FAILED order without a refund is not settled (FAILED →
+  // REFUNDED is still possible) and is left to V2. Orders created after --to
+  // arrived when V1 could no longer mint: they belong to V2, not in-flight.
+  const toTime = (await client.getBlock({ blockNumber: to })).timestamp;
   let settledAdded = 0;
   const inFlight: string[] = [];
+  const leftToV2: string[] = [];
   for (const d of deposits) {
-    if (!FINAL_STATES.has(d.state)) { inFlight.push(`${d.order_id} (${d.state})`); continue; }
+    const createdAfterTo = BigInt(Math.floor(d.created_at.getTime() / 1000)) > toTime;
+    const settled = d.state === 'COMPLETED' || d.state === 'REFUNDED' || d.has_refund;
+    if (!settled) {
+      if (createdAfterTo || d.state === 'FAILED') leftToV2.push(`${d.order_id} (${d.state})`);
+      else inFlight.push(`${d.order_id} (${d.state})`);
+      continue;
+    }
     const k = keyOf(d.txid, d.vout);
     if (!seen.has(k)) { seen.add(k); keys.push(k); settledAdded++; }
   }
   if (inFlight.length > 0) {
-    problems.push(`${inFlight.length} inbound order(s) still in flight — drain them before Safe tx 1: ${inFlight.slice(0, 5).join(', ')}`);
+    problems.push(`${inFlight.length} inbound order(s) created before --to are still in flight — drain them first: ${inFlight.slice(0, 5).join(', ')}`);
   }
+  if (leftToV2.length > 0) notes.push(`${leftToV2.length} unsettled order(s) left to V2 (not imported): ${leftToV2.slice(0, 5).join(', ')}`);
 
   const batches: Hex[][] = [];
   for (let i = 0; i < keys.length; i += BATCH) batches.push(keys.slice(i, i + BATCH));

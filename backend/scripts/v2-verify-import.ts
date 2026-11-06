@@ -17,7 +17,7 @@
  * closed; but never unpause with one open.)
  */
 import { readFileSync } from 'node:fs';
-import { createPublicClient, http, parseAbi, keccak256, toBytes, type Hex } from 'viem';
+import { createPublicClient, http, parseAbi, parseAbiItem, keccak256, toBytes, type Hex } from 'viem';
 import { gnosis } from 'viem/chains';
 
 const V2_ABI = parseAbi([
@@ -27,7 +27,10 @@ const V2_ABI = parseAbi([
   'function wBOB() view returns (address)',
   'function hasRole(bytes32, address) view returns (bool)',
 ]);
-const MODULE_ABI = parseAbi(['function safe() view returns (address)']);
+const MODULE_ABI = parseAbi(['function safe() view returns (address)', 'function operator() view returns (address)']);
+const MINT_EXECUTED = parseAbiItem(
+  'event MintExecuted(bytes32 indexed depositId, address indexed recipient, uint256 amount, uint256 sourceChainId, bytes32 sourceTxHash, uint32 sourceVout)',
+);
 const SAFE_ABI = parseAbi(['function isModuleEnabled(address) view returns (bool)']);
 const V1_ABI = parseAbi(['function paused() view returns (bool)']);
 const WBOB_ABI = parseAbi(['function hasRole(bytes32, address) view returns (bool)']);
@@ -40,7 +43,8 @@ function arg(name: string, fallback?: string): string {
 }
 
 async function main(): Promise<void> {
-  const file = JSON.parse(readFileSync(arg('file'), 'utf8')) as { final: boolean; keys: Hex[]; v1: Hex; count: number };
+  const file = JSON.parse(readFileSync(arg('file'), 'utf8')) as
+    { final: boolean; keys: Hex[]; v1: Hex; count: number; toBlock: string; wbob: Hex };
   const v2 = arg('v2') as Hex;
   const stage = arg('stage');
   if (stage !== 'pre-seal' && stage !== 'pre-unpause') throw new Error('--stage must be pre-seal or pre-unpause');
@@ -61,6 +65,29 @@ async function main(): Promise<void> {
     client.readContract({ address: wbob, abi: WBOB_ABI, functionName: 'hasRole', args: [role, v2] }),
   ]) as [boolean, boolean, boolean, boolean, boolean];
   if (!v1Paused || v1Role) problems.push(`V1 ${file.v1}: paused=${v1Paused}, BRIDGE_EXECUTOR_ROLE=${v1Role} (must be paused, role-less)`);
+
+  // Don't trust the file's "final" flag alone: re-check, on THIS rpc, that the
+  // export was made for this token and that V1 could not mint after its --to
+  // (catches an old export, or one made on a rehearsal fork).
+  if (!file.wbob || file.wbob.toLowerCase() !== wbob.toLowerCase()) {
+    problems.push(`export was made for wBOB ${file.wbob}, but this V2 mints ${wbob}`);
+  }
+  const toBlock = BigInt(file.toBlock ?? '0');
+  if (toBlock === 0n) problems.push('export file has no toBlock');
+  else {
+    const [pausedAtTo, roleAtTo] = await Promise.all([
+      client.readContract({ address: file.v1, abi: V1_ABI, functionName: 'paused', blockNumber: toBlock }),
+      client.readContract({ address: wbob, abi: WBOB_ABI, functionName: 'hasRole', args: [role, file.v1], blockNumber: toBlock }),
+    ]) as [boolean, boolean];
+    if (!pausedAtTo || roleAtTo) problems.push(`at the export's toBlock ${toBlock} V1 was paused=${pausedAtTo}, role=${roleAtTo}: the export is not final`);
+    const latest = await client.getBlockNumber();
+    for (let s = toBlock + 1n; s <= latest; s += 1000n) {
+      const e = s + 999n < latest ? s + 999n : latest;
+      for (const l of await client.getLogs({ address: file.v1, event: MINT_EXECUTED, fromBlock: s, toBlock: e })) {
+        problems.push(`V1 minted AFTER the export's toBlock (block ${l.blockNumber}, tx ${l.transactionHash}): re-export`);
+      }
+    }
+  }
   if (!v2Role) problems.push(`V2 does NOT hold BRIDGE_EXECUTOR_ROLE on wBOB: every mint and withdrawal would revert`);
   if (!paused) problems.push(`V2 is already UNPAUSED: unpause only as the very last step, after the backend scans V2 (else V2 burns are lost)`);
 
@@ -80,6 +107,10 @@ async function main(): Promise<void> {
     ]) as [boolean, boolean];
     if (!newOn) problems.push(`EmergencyPauseModule ${mod} is NOT enabled on Safe ${safe}`);
     if (oldOn) problems.push(`old module ${oldMod} is STILL enabled on Safe ${safe} (it can unpause V1's controller)`);
+    const op = await client.readContract({ address: mod, abi: MODULE_ABI, functionName: 'operator' }) as Hex;
+    if (op.toLowerCase() === relayer.toLowerCase()) {
+      problems.push(`the emergency module's operator is the relayer ${relayer}: a stolen relayer key could freeze the token. Set a separate operator.`);
+    }
   }
 
   let missing = 0;

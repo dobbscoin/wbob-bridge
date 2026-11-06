@@ -35,6 +35,9 @@ import { detectDepositSender } from '../dobbscoin/sender.js';
 import type { BackendConfig } from '../config.js';
 import { AlertDispatcher } from '../monitor/webhook.js';
 import type { RefundRecorder } from '../gnosis/refund-recorder.js';
+import { HDKey } from '@scure/bip32';
+import { sha256 } from '@noble/hashes/sha256';
+import { ripemd160 } from '@noble/hashes/ripemd160';
 import type { Alert } from '../monitor/types.js';
 import { fmtBob } from './mint-capacity.js';
 
@@ -97,7 +100,7 @@ export interface RefundExecutorOptions {
    * contract enforces minted + refunded <= value per output. When set, a refund
    * is NEVER broadcast until V2 shows it recorded. Null/absent = V1 behavior.
    */
-  recorder?: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded'> | null;
+  recorder?: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded' | 'mintedAmount' | 'isImported'> | null;
 }
 
 export class RefundExecutor {
@@ -121,7 +124,8 @@ export class RefundExecutor {
     this.recorder = opts.recorder ?? null;
   }
 
-  private readonly recorder: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded'> | null;
+  private readonly recorder: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded' | 'mintedAmount' | 'isImported'> | null;
+  private depositScripts: HDKey | null = null;
   /** Refund ids whose on-chain record we already confirmed (or alerted on) this process. */
   private readonly recordedIds = new Set<string>();
   private readonly recordAlerted = new Set<string>();
@@ -133,20 +137,35 @@ export class RefundExecutor {
   // writer could later mint against those coins. Recording can only block.
   async recordRefundsOnChain(): Promise<void> {
     if (!this.recorder) return;
-    const rows = await this.sql<{ id: string; order_id: string; deposit_txid: string; deposit_vout: number;
-                                  deposit_amount_sat: bigint; excess_sat: bigint }[]>`
-      SELECT id, order_id, deposit_txid, deposit_vout, deposit_amount_sat, excess_sat
-      FROM deposit_refunds
+    // Rows already broadcast/confirmed are done (and their outputs were imported
+    // at the cutover); re-recording them would only cost a tx each.
+    const rows = await this.sql<(RefundRow & { hd_index: number | null })[]>`
+      SELECT r.*, NULL::text AS user_gnosis_address, sd.hd_index
+      FROM deposit_refunds r
+      LEFT JOIN source_deposits sd ON sd.order_id = r.order_id
+      WHERE r.status NOT IN ('broadcast', 'confirmed')
     `;
     for (const r of rows) {
       if (this.recordedIds.has(r.id)) continue;
       const rec = { depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
                     depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat };
       try {
-        if (await this.recorder.ensureRecorded(rec)) {
-          this.recordedIds.add(r.id);
+        if (await this.recorder.isRecorded(rec)) { this.recordedIds.add(r.id); continue; }
+        // Never record (so never send) a refund the chain does not back. The
+        // row's numbers come from the DB; check them against our own node first.
+        const why = await this._refundNotBackedReason(r, r.hd_index);
+        if (why !== null) {
+          if (r.status === 'queued' || r.status === 'signed') {
+            await this._park(r, r.status, 'needs_attention', `refund refused: ${why}`, 'critical');
+          } else if (!this.recordAlerted.has(r.id)) {
+            this.recordAlerted.add(r.id);
+            await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+              message: `Refund ${r.id} (order ${r.order_id}) is not backed on-chain and will not be recorded or sent: ${why}`,
+              data: { refundId: r.id, orderId: r.order_id, reason: why } });
+          }
           continue;
         }
+        if (await this.recorder.ensureRecorded(rec)) this.recordedIds.add(r.id);
       } catch (err) {
         console.error(`[refund-executor] recordRefund failed refundId=${r.id}:`, err);
         if (!this.recordAlerted.has(r.id)) {
@@ -158,6 +177,35 @@ export class RefundExecutor {
         }
       }
     }
+  }
+
+  /**
+   * Does the chain back this refund? Our node must show the deposit output as
+   * the bridge's exact P2PKH script at hd_index (derived from HD_WALLET_XPUB),
+   * worth exactly deposit_amount_sat; V2 must not list it as imported from V1;
+   * and the refund must fit in value − what V2 already minted for it.
+   * Returns a reason to refuse, or null.
+   */
+  private async _refundNotBackedReason(r: RefundRow, hdIndex: number | null): Promise<string | null> {
+    if (hdIndex === null) return 'no hd_index for the deposit (cannot derive the bridge address)';
+    const t = await this.rpc.getRawTransactionVerbose(r.deposit_txid);
+    const out = t.vout.find((v) => v.n === r.deposit_vout);
+    if (!out) return `deposit tx has no output ${r.deposit_vout}`;
+    if (!this.depositScripts) this.depositScripts = HDKey.fromExtendedKey(this.config.hdWalletXpub);
+    const pub = this.depositScripts.derive(`${this.config.hdDerivationPath}/${hdIndex}`).publicKey;
+    if (!pub) return `cannot derive the bridge key at hd_index ${hdIndex}`;
+    const expected = `76a914${Buffer.from(ripemd160(sha256(pub))).toString('hex')}88ac`;
+    if (out.scriptPubKey.hex.toLowerCase() !== expected) {
+      return `output ${r.deposit_vout} is not the bridge's P2PKH at hd_index ${hdIndex}`;
+    }
+    const value = BigInt(Math.round(out.value * 1e8));
+    if (value !== r.deposit_amount_sat) return `output value ${value} != recorded deposit ${r.deposit_amount_sat}`;
+    const rec = { depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
+                  depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat };
+    if (await this.recorder!.isImported(rec)) return 'output was minted on V1 (imported); no refund can be owed on it';
+    const minted = await this.recorder!.mintedAmount(rec);
+    if (r.excess_sat + minted > value) return `refund ${r.excess_sat} + minted ${minted} exceeds the output's ${value}`;
+    return null;
   }
 
   async poll(): Promise<void> {

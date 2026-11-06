@@ -41,8 +41,10 @@ export class SolvencyMonitor {
   private lastKnownSolvent: boolean | null = null;
   /** Epoch-ms of the last dispatch per alert type (for cooldown). */
   private readonly alertCooldowns = new Map<AlertType, number>();
-  /** Highest WATCHER_REFUSED audit id seen (0 = not read yet; first read only arms). */
-  private lastWatcherRefusedId = 0n;
+  /** Start of the last successful WATCHER_REFUSED scan (null = not yet: look back an hour). */
+  private lastRefusalScan: Date | null = null;
+  /** WATCHER_REFUSED audit ids already alerted. */
+  private readonly alertedRefusals = new Set<string>();
   /** MANUAL_REVIEW count at the last successful read (null = not read yet). */
   private lastManualReviewCount: number | null = null;
 
@@ -273,27 +275,31 @@ export class SolvencyMonitor {
     }
 
     // ── Watcher refusals (watchers have no alert channel; they write audit rows) ──
+    // By time window, not id: BIGSERIAL ids are not in commit order. The first
+    // poll after a restart looks back an hour so refusals made just before are
+    // not lost; ids already alerted are remembered.
     try {
+      const since = this.lastRefusalScan ?? new Date(Date.now() - 3_600_000);
+      const scanStart = new Date();
       const refused = await this.sql<{ id: string; order_id: string; actor: string; reason: string | null }[]>`
         SELECT id::text, order_id::text, actor, metadata->>'reason' AS reason
         FROM audit_events
-        WHERE event_type = 'WATCHER_REFUSED' AND id > ${this.lastWatcherRefusedId.toString()}
-        ORDER BY id DESC LIMIT 20
+        WHERE event_type = 'WATCHER_REFUSED' AND created_at > ${new Date(since.getTime() - 120_000)}
+        ORDER BY id DESC LIMIT 50
       `;
-      if (refused.length > 0) {
-        const top = refused[0]!;
-        if (this.lastWatcherRefusedId > 0n) {      // not on the first poll after a restart (history)
-          alerts.push({
-            level: 'critical', type: 'WATCHER_REFUSED', timestamp: checkedAt,
-            message: `${refused.length} new watcher refusal(s); those mints stall until resolved. Latest: ` +
-              `${top.actor} on order ${top.order_id}: ${top.reason ?? '?'}`,
-            data: { count: refused.length, sample: refused.slice(0, 5) },
-          });
-        }
-        this.lastWatcherRefusedId = BigInt(top.id);
-      } else if (this.lastWatcherRefusedId === 0n) {
-        this.lastWatcherRefusedId = 1n;            // armed: the next refusal alerts
+      const fresh = refused.filter((r) => !this.alertedRefusals.has(r.id));
+      if (fresh.length > 0) {
+        for (const r of fresh) this.alertedRefusals.add(r.id);
+        if (this.alertedRefusals.size > 5_000) this.alertedRefusals.clear();
+        const top = fresh[0]!;
+        alerts.push({
+          level: 'critical', type: 'WATCHER_REFUSED', timestamp: checkedAt,
+          message: `${fresh.length} new watcher refusal(s); those mints stall until resolved. Latest: ` +
+            `${top.actor} on order ${top.order_id}: ${top.reason ?? '?'}`,
+          data: { count: fresh.length, sample: fresh.slice(0, 5) },
+        });
       }
+      this.lastRefusalScan = scanStart;
     } catch (err) {
       console.error('[solvency-monitor] watcher-refusal read failed:', err);
     }

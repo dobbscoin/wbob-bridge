@@ -26,12 +26,26 @@ export interface DepositMatch {
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
 
+/** Exactly OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG. */
+const P2PKH_SCRIPT = /^76a914[0-9a-f]{40}88ac$/i;
+
 /**
- * Extract the single address from a scriptPubKey, if present.
- * Returns undefined for non-standard outputs (OP_RETURN, multisig, etc.).
+ * The address an output pays, ONLY for a standard pay-to-pubkey-hash script.
+ * Anything else (bare multisig, P2SH, P2PK, OP_RETURN, non-standard) returns
+ * undefined, whatever the node lists under `addresses`.
+ *
+ * Why (2026-11 review round 4): a v0.14-era node reports a bare 1-of-2 multisig
+ * as type "multisig" with addresses = [P2PKH of each pubkey]. Taking
+ * addresses[0] let an attacker who knew a deposit address's pubkey (public once
+ * the bridge spends from it) send `1-of-2 {bridge pubkey, attacker key}`: it
+ * matched the deposit address, every watcher check passed, wBOB was minted,
+ * and the attacker spent the output back with their own key.
  */
 export function outputAddress(vout: RpcVout): string | undefined {
-  return vout.scriptPubKey.address ?? vout.scriptPubKey.addresses?.[0];
+  const spk = vout.scriptPubKey;
+  if (spk.type !== 'pubkeyhash' || !P2PKH_SCRIPT.test(spk.hex)) return undefined;
+  if (spk.address) return spk.address;
+  return spk.addresses?.length === 1 ? spk.addresses[0] : undefined;
 }
 
 /**

@@ -19,13 +19,16 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
 3. Deploy `BridgeControllerV2(wBOB, Safe, signers, mintLimitPerWindow, minWithdrawal, 1000001)`
    (born **paused**) and `EmergencyPauseModule(Safe, V2, wBOB, operator)`.
    `minWithdrawal` must be ≥ backend `PAYOUT_MIN_SAT` (100000).
-4. Merge `v2-integration` and deploy it **with V1 settings** (`BRIDGE_CONTROLLER_VERSION` unset).
-   Behavior is V1's; the backend startup check confirms the controller is V1.
+4. Merge `v2-integration` and deploy it **with V1 settings** (`BRIDGE_CONTROLLER_VERSION` unset)
+   **plus `LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V2>`**. Behavior is V1's; the backend startup
+   check confirms the controller is V1 and probes V2. From now on the backend also scans V2's
+   events, so even an accidentally early unpause of V2 can never lose a V2 withdrawal.
 
 ## Cutover
 
 5. **Drain.** Stop accepting new deposits on the portal; wait until no inbound order is
-   in flight and no V1 `executeMint` is pending. The export (step 8) refuses otherwise.
+   in flight and no V1 `executeMint` is pending. The export (step 8) refuses while an order
+   created before B1 is unsettled; deposits that arrive after B1 are left to V2.
 6. **Safe tx 1** — stop V1 for good:
    `V1.pause()` · `V1.incrementMintNonce()` · `wBOB.revokeRole(BRIDGE_EXECUTOR_ROLE, V1)`.
    Note the block number **B1**.
@@ -44,7 +47,8 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
 12. **Flip the services** (backend + all five watchers + portal):
     `BRIDGE_CONTROLLER_ADDRESS=<V2>` · `BRIDGE_CONTROLLER_VERSION=2` ·
     `LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V1>` · `BRIDGE_EXECUTOR_MODULE_ADDRESS=<new module>` ·
-    `EMERGENCY_OPERATOR_PRIVATE_KEY=<new key>` · portal `NEXT_PUBLIC_BRIDGE_CONTROLLER_ADDRESS=<V2>`,
+    `EMERGENCY_OPERATOR_PRIVATE_KEY=<new key>` (never the relayer key; verify checks) ·
+    portal `NEXT_PUBLIC_BRIDGE_CONTROLLER_ADDRESS=<V2>`,
     `NEXT_PUBLIC_BRIDGE_CONTROLLER_VERSION=2` (rebuild). Restart; the backend must log
     `controller … verified as V2` and no `BridgeGuard NOT READY`.
 13. **Verify** (read-only): `--stage pre-unpause --relayer <relayer> --module <new module> --old-module <V1 module>`
@@ -56,6 +60,15 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
 15. Watch one real deposit and one real withdrawal through end to end.
 16. Keep `LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V1>` set (harmless; the executor also refuses
     anything V1 already minted).
+
+## Refunds under V2
+
+Every refund is recorded on V2 (`recordRefund`, relayer holds `REFUND_MARKER_ROLE`) before it
+is sent, and only after the backend's own node confirms the deposit output is the bridge's
+P2PKH at its hd_index with the recorded value. Refunds V2 has not recorded are never
+broadcast. A refund for an output imported from V1 is refused by the contract.
+If a stolen relayer key poisons an output's record, the Safe can `resetOutpointRecord(key)`
+(only for outputs that never minted), after revoking the role.
 
 ## If something is wrong
 
