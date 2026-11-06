@@ -134,6 +134,17 @@ export class DobbscoinBackendRpc {
     return this.call<RpcUnspent[]>('listunspent', params);
   }
 
+  /**
+   * Whether the node's mempool holds this txid. Uses getrawmempool: this
+   * Dobbscoin node has no getmempoolentry (-32601). Needed because
+   * getrawtransaction reports confirmations 0 BOTH for a mempool tx and for a
+   * tx only in a stale, reorged-out block.
+   */
+  async isInMempool(txid: string): Promise<boolean> {
+    const pool = await this.call<string[]>('getrawmempool', []);
+    return pool.includes(txid);
+  }
+
   /** Returns confirmations for a txid. Returns 0 if unconfirmed, -1 if not found. */
   async getConfirmations(txid: string): Promise<number> {
     type RawTx = { confirmations?: number };

@@ -185,7 +185,10 @@ export function checkManualReview(count: number, newest: ManualReviewOrder[], ts
     timestamp: ts,
     message:
       `${count} order(s) waiting in MANUAL_REVIEW; nothing moves them but an operator. ` +
-      `Newest: ${lines.join(' | ')}${count > newest.length ? ` | +${count - newest.length} older` : ''}`,
+      `Newest: ${lines.join(' | ')}${count > newest.length ? ` | +${count - newest.length} older` : ''}. ` +
+      `Retry a payout: set its state to PAYOUT_QUEUED. That re-sends the same signed tx while its coins are held, ` +
+      `re-signs only if they were released, and refuses one already broadcast. Coins are released automatically ` +
+      `only when the node refused a tx never sent before; otherwise a human confirms it is on no node first.`,
     data: { manualReviewCount: count, newest },
   }];
 }

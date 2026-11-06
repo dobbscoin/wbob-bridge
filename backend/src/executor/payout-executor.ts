@@ -15,8 +15,8 @@
 
 import type { Sql } from 'postgres';
 import { OutboundState, assertOutboundTransition } from '@wbob/shared';
-import { RpcCallError, type DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
-import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, type UtxoInput } from '../dobbscoin/tx-builder.js';
+import { RpcCallError, RpcNetworkError, type DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
+import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, txidFromRawHex, txInputsFromRawHex, type UtxoInput } from '../dobbscoin/tx-builder.js';
 import type { BackendConfig } from '../config.js';
 import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 import { unpayableDestinationReason } from '../gnosis/destination.js';
@@ -60,6 +60,27 @@ export function isDefiniteRejection(err: unknown): boolean {
 
 
 const PAYOUT_MIN_CONFIRMATIONS = 3;
+/** Re-sends of the same signed tx on retryable failures before parking it (~1 h at the 15 s poll). */
+const MAX_SEND_ATTEMPTS = 240;
+/** A broadcast payout the node no longer knows is re-sent at most this often. */
+const RESEND_FORGOTTEN_AFTER_MS = 10 * 60_000;
+/** Consecutive refused re-sends (one per RESEND_FORGOTTEN_AFTER_MS) before parking: ~30 min. */
+const RESEND_FORGOTTEN_MAX_FAILURES = 3;
+
+/**
+ * Worth re-sending the SAME tx later (always safe: identical tx): the node was
+ * unreachable/busy/warming up, an input is not visible YET (-25: e.g. a parent
+ * payout's change the node forgot and that is re-sent first), or a mempool
+ * limit that clears with the next block.
+ */
+export function isTransient(err: unknown): boolean {
+  if (err instanceof RpcNetworkError) return true;
+  if (!(err instanceof RpcCallError)) return false;
+  if (err.code === -28 /* RPC_IN_WARMUP */) return true;
+  if (err.method === 'sendrawtransaction' && err.code === -25) return true;
+  if (err.method === 'sendrawtransaction' && err.code === -26 && /too-long-mempool-chain|mempool full/i.test(err.message)) return true;
+  return false;
+}
 
 // ─── DB row types ─────────────────────────────────────────────────────────────
 
@@ -67,6 +88,11 @@ interface QueuedPayoutRow {
   order_id:          string;
   dobbscoin_address: string;
   amount_sat:        bigint;
+  /** Set when this order was signed before (an operator re-queued it from MANUAL_REVIEW). */
+  payout_id:         string | null;
+  payout_txid:       string | null;
+  held_utxos:        number;   // bridge_utxos still reserved by that payout
+  spent_utxos:       number;   // bridge_utxos marked spent by that payout
 }
 
 interface SignedPayoutRow {
@@ -79,9 +105,10 @@ interface SignedPayoutRow {
 }
 
 interface BroadcastPayoutRow {
-  order_id:  string;
-  payout_id: string;
-  txid:      string;
+  order_id:     string;
+  payout_id:    string;
+  txid:         string;
+  broadcast_at: Date | null;
 }
 
 interface BridgeUtxoRow {
@@ -98,6 +125,8 @@ interface BridgeUtxoRow {
 
 export class PayoutExecutor {
   private readonly txBuilder: DobbscoinTxBuilder;
+  /** payoutId → last re-send of a forgotten payout, and consecutive refusals. */
+  private readonly resendState = new Map<string, { last: number; failures: number }>();
   constructor(
     private readonly sql: Sql,
     private readonly rpc: DobbscoinBackendRpc,
@@ -139,32 +168,69 @@ export class PayoutExecutor {
   private async processQueued(): Promise<void> {
     const queued = await this.sql<QueuedPayoutRow[]>`
       SELECT
-        bo.id            AS order_id,
+        bo.id                     AS order_id,
         bo.user_dobbscoin_address AS dobbscoin_address,
-        bo.amount_sat
+        bo.amount_sat,
+        p.id                      AS payout_id,
+        p.txid                    AS payout_txid,
+        (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'reserved') AS held_utxos,
+        (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'spent')    AS spent_utxos
       FROM bridge_orders bo
       LEFT JOIN payouts p ON p.withdrawal_request_id = (
         SELECT id FROM withdrawal_requests wr WHERE wr.order_id = bo.id
       )
       WHERE bo.order_type = 'outbound'
         AND bo.state = ${OutboundState.PAYOUT_QUEUED}
-        AND p.id IS NULL
     `;
 
     for (const row of queued) {
       const unpayable = unpayableDestinationReason(row.dobbscoin_address)
         ?? belowPayoutMinimumReason(row.amount_sat, this.config.payoutMinSat);
       if (unpayable !== null) {
-        console.error(`[payout-executor] orderId=${row.order_id}: ${unpayable}`);
-        try {
-          await this._transitionOutbound(
-            row.order_id, OutboundState.PAYOUT_QUEUED, OutboundState.MANUAL_REVIEW, { error: unpayable },
-          );
-        } catch (err) {
-          console.error(`[payout-executor] park error orderId=${row.order_id}:`, err);
-        }
+        await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, unpayable);
         continue;
       }
+
+      // ── Operator retry (MANUAL_REVIEW → PAYOUT_QUEUED) of an order signed before ──
+      if (row.payout_id !== null) {
+        if (row.payout_txid !== null || row.spent_utxos > 0) {
+          // Already went out (or its inputs are recorded spent): re-sending or
+          // re-signing could pay twice. Nothing safe to do automatically.
+          await this._park(row.order_id, OutboundState.PAYOUT_QUEUED,
+            `retry refused: payout ${row.payout_id} was already broadcast` +
+            (row.payout_txid ? ` as ${row.payout_txid}` : '') + `; check the chain, do not re-queue`);
+          continue;
+        }
+        if (row.held_utxos > 0) {
+          // Its signed tx still holds its inputs: re-send THAT tx. Identical tx,
+          // same txid, same inputs, so it can never pay twice.
+          await this._transitionGeneric(row.order_id, OutboundState.PAYOUT_QUEUED, OutboundState.PAYOUT_SIGNED,
+            'RETRY_SAME_TX', { payoutId: row.payout_id });
+          console.log(`[payout-executor] retry orderId=${row.order_id}: re-sending the same signed tx`);
+          continue;
+        }
+        // Inputs were released (the node refused it outright): sign a new tx
+        // under the same payout row; broadcastSigned only ever sends the newest.
+        // Belt and braces before creating a second tx: our node must hold none
+        // of the older signed txs for this payout.
+        const older = await this.sql<{ txid: string | null; hex: string | null }[]>`
+          SELECT metadata->>'txid' AS txid, metadata->>'signedHex' AS hex FROM audit_events
+          WHERE order_id = ${row.order_id} AND event_type = 'PAYOUT_SIGNED' AND metadata->>'payoutId' = ${row.payout_id}
+        `;
+        let blocked: string | null = null;
+        for (const o of older) {
+          const t = o.txid ?? (o.hex ? txidFromRawHex(o.hex) : null);
+          if (t === null) continue;
+          const has = await this._nodeHas(t);
+          if (has !== 'no') { blocked = `older tx ${t} for this payout: node says ${has ?? 'unreachable'}`; break; }
+        }
+        if (blocked !== null) {
+          if (blocked.endsWith('unreachable')) { console.warn(`[payout-executor] re-sign deferred orderId=${row.order_id}: ${blocked}`); continue; }
+          await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, `re-sign refused: ${blocked}`);
+          continue;
+        }
+      }
+
       try {
         await this._buildAndSignPayout(row);
       } catch (err) {
@@ -173,10 +239,7 @@ export class PayoutExecutor {
           continue;
         }
         console.error(`[payout-executor] processQueued error orderId=${row.order_id}:`, err);
-        await this._transitionOutbound(
-          row.order_id, OutboundState.PAYOUT_QUEUED, OutboundState.MANUAL_REVIEW,
-          { error: String(err) },
-        );
+        await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, String(err));
       }
     }
   }
@@ -232,13 +295,29 @@ export class PayoutExecutor {
       if (wrRows.length === 0) throw new Error('No withdrawal_request row');
       const wrId = wrRows[0]!.id;
 
-      // Create payout row with signed tx
-      const payoutRows = await tx<{ id: string }[]>`
-        INSERT INTO payouts (withdrawal_request_id, dobbscoin_address, amount_sat, fee_sat)
-        VALUES (${wrId}, ${row.dobbscoin_address}, ${row.amount_sat}, ${result.feeSat})
-        RETURNING id
-      `;
-      const payoutId = payoutRows[0]!.id;
+      // Create the payout row, or reuse it when re-signing after a release
+      // (withdrawal_request_id is UNIQUE: one payout row per withdrawal).
+      let payoutId: string;
+      if (row.payout_id !== null) {
+        const held = await tx<{ n: number }[]>`
+          SELECT count(*)::int AS n FROM bridge_utxos WHERE spent_payout_id = ${row.payout_id}
+        `;
+        const upd = await tx<{ id: string }[]>`
+          UPDATE payouts SET fee_sat = ${result.feeSat.toString()}, updated_at = now()
+          WHERE id = ${row.payout_id} AND txid IS NULL
+          RETURNING id
+        `;
+        // Re-check under the order lock: nothing may still point at the old tx.
+        if (held[0]!.n !== 0 || upd.length !== 1) throw new Error(`re-sign refused: payout ${row.payout_id} changed`);
+        payoutId = row.payout_id;
+      } else {
+        const payoutRows = await tx<{ id: string }[]>`
+          INSERT INTO payouts (withdrawal_request_id, dobbscoin_address, amount_sat, fee_sat)
+          VALUES (${wrId}, ${row.dobbscoin_address}, ${row.amount_sat}, ${result.feeSat})
+          RETURNING id
+        `;
+        payoutId = payoutRows[0]!.id;
+      }
 
       // Store signed_hex in metadata (reuse payout row via separate update — no raw_hex column yet)
       // We store it in audit_events metadata temporarily until broadcast
@@ -252,6 +331,7 @@ export class PayoutExecutor {
           'payout-executor',
           ${tx.json({
             payoutId,
+            txid: result.txid,
             signedHex: result.rawHex,
             feeSat: result.feeSat.toString(),
             changeSat: result.changeSat.toString(),
@@ -287,9 +367,11 @@ export class PayoutExecutor {
   // ── Job 2: PAYOUT_SIGNED → PAYOUT_BROADCAST ──────────────────────────────
 
   private async broadcastSigned(): Promise<void> {
-    // Retrieve signed hex + change-output details from the PAYOUT_SIGNED audit row
+    // The NEWEST signed hex recorded for each payout row. A payout re-signed
+    // after a release has older PAYOUT_SIGNED rows whose inputs may be reused
+    // elsewhere; sending one of those could pay the recipient twice.
     const signed = await this.sql<SignedPayoutRow[]>`
-      SELECT
+      SELECT DISTINCT ON (p.id)
         bo.id AS order_id,
         p.id  AS payout_id,
         (ae.metadata->>'signedHex')     AS signed_hex,
@@ -299,129 +381,216 @@ export class PayoutExecutor {
       FROM bridge_orders bo
       JOIN withdrawal_requests wr ON wr.order_id = bo.id
       JOIN payouts p ON p.withdrawal_request_id = wr.id
-      -- Only the signed hex recorded for THIS payout row. An order re-signed
-      -- after a release has older PAYOUT_SIGNED rows whose inputs may be free
-      -- again; broadcasting one of those would pay the recipient twice.
       JOIN audit_events ae ON ae.order_id = bo.id AND ae.event_type = 'PAYOUT_SIGNED'
                           AND ae.metadata->>'payoutId' = p.id::text
       WHERE bo.state = ${OutboundState.PAYOUT_SIGNED}
         AND p.txid IS NULL
-      ORDER BY ae.id DESC
+      ORDER BY p.id, ae.id DESC
     `;
 
     for (const row of signed) {
       if (!row.signed_hex) continue;
-      // Record the attempt BEFORE sending. If an earlier attempt exists, that
-      // send may have reached peers even though we never recorded success (crash
-      // between send and commit), so a later rejection must not free the inputs.
-      let priorAttempts: number;
+      const expectedTxid = txidFromRawHex(row.signed_hex);
+      let hist: { thisTx: number; sinceRetry: number; retried: boolean };
       try {
-        priorAttempts = await this._recordBroadcastAttempt(row.order_id, row.payout_id);
+        hist = await this._recordBroadcastAttempt(row.order_id, row.payout_id, expectedTxid);
       } catch (err) {
         console.error(`[payout-executor] could not record broadcast attempt orderId=${row.order_id}; not sending:`, err);
         continue;
       }
+
+      // 1. Send. A failure here is the NODE's answer, never a DB error.
+      let sendErr: unknown = null;
+      let nodeTxid: string | null = null;
       try {
-        const txid = await this.rpc.sendRawTransaction(row.signed_hex);
-
-        await this.sql.begin(async (tx) => {
-          const rows = await tx<{ state: string }[]>`
-            SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
-          `;
-          if (rows.length === 0 || rows[0]!.state !== OutboundState.PAYOUT_SIGNED) {
-            // The node ACCEPTED this tx, but the order moved meanwhile (another
-            // poller parked it, or a hand edit). The coins are spent either way:
-            // record that, never leave them 'available'.
-            await tx`UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now() WHERE id = ${row.payout_id}`;
-            await tx`UPDATE bridge_utxos SET status = 'spent', updated_at = now() WHERE spent_payout_id = ${row.payout_id}`;
-            await tx`
-              INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-              VALUES (${row.order_id}, 'PAYOUT_SENT_OUT_OF_STATE', ${rows[0]?.state ?? null}, ${rows[0]?.state ?? 'UNKNOWN'},
-                      'payout-executor', ${tx.json({ txid, payoutId: row.payout_id })})
-            `;
-            console.error(`[payout-executor] CRITICAL: payout txid=${txid} was accepted but order ${row.order_id} is ` +
-              `${rows[0]?.state ?? 'missing'}; recorded the txid and marked inputs spent. Reconcile by hand.`);
-            return;
-          }
-
-          await tx`
-            UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now()
-            WHERE id = ${row.payout_id}
-          `;
-          await tx`
-            UPDATE bridge_utxos SET status = 'spent', updated_at = now()
-            WHERE spent_payout_id = ${row.payout_id}
-          `;
-
-          // Ingest the change output as a new spendable UTXO. Convention: the
-          // tx-builder always places change at vout=1 (recipient is vout=0),
-          // and emits no change output when changeSat <= dust threshold.
-          if (row.change_sat && BigInt(row.change_sat) > 0n
-              && row.change_address && row.change_index !== null) {
-            await tx`
-              INSERT INTO bridge_utxos
-                (order_id, txid, vout, amount_sat, address, hd_index, derivation_path, status)
-              VALUES
-                (${row.order_id}, ${txid}, 1, ${BigInt(row.change_sat)},
-                 ${row.change_address}, ${parseInt(row.change_index, 10)},
-                 'change', 'available')
-            `;
-          }
-
-          await tx`
-            UPDATE bridge_orders SET state = ${OutboundState.PAYOUT_BROADCAST}, updated_at = now()
-            WHERE id = ${row.order_id}
-          `;
-          await tx`
-            INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-            VALUES (
-              ${row.order_id}, 'STATE_TRANSITION',
-              ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.PAYOUT_BROADCAST},
-              'payout-executor', ${tx.json({ txid })}
-            )
-          `;
-        });
-
-        console.log(`[payout-executor] broadcast txid=${txid} orderId=${row.order_id}`);
+        nodeTxid = await this.rpc.sendRawTransaction(row.signed_hex);
       } catch (err) {
-        console.error(`[payout-executor] broadcastSigned error orderId=${row.order_id}:`, err);
-        if (isDefiniteRejection(err) && priorAttempts === 0) {
-          // The node refused the tx outright (dust, fee, non-standard, ...): it is
-          // in no mempool, so its inputs are still ours. Free them, or every such
-          // payout permanently locks the largest coins (selection is largest-first).
-          await this._parkAndRelease(row.order_id, row.payout_id, String(err));
-        } else {
-          // Timeout, "already in mempool", missing inputs, ...: the tx may be out
-          // there. Keep the inputs reserved; releasing them could double-spend.
-          await this._transitionOutbound(
-            row.order_id, OutboundState.PAYOUT_SIGNED, OutboundState.MANUAL_REVIEW,
-            {
-              error: String(err),
-              inputsHeld: isDefiniteRejection(err)
-                ? `node refused it, but ${priorAttempts} earlier broadcast attempt(s) exist: verify the tx is not on the network before releasing its reserved UTXOs`
-                : 'the tx may be on the network: reserved UTXOs kept',
-            },
-          );
+        sendErr = err;
+      }
+
+      if (nodeTxid !== null) {
+        if (nodeTxid !== expectedTxid) {
+          console.error(`[payout-executor] CRITICAL: node returned txid ${nodeTxid}, computed ${expectedTxid} ` +
+            `(orderId=${row.order_id}); recording the node's`);
+        }
+        // 2. Record it. If this fails the tx is still out there: the next poll
+        // re-sends the same tx (0.14 returns the hash for a mempool tx) and retries the commit.
+        try {
+          await this._commitBroadcast(row, nodeTxid, {});
+          console.log(`[payout-executor] broadcast txid=${nodeTxid} orderId=${row.order_id}`);
+        } catch (err) {
+          console.error(`[payout-executor] broadcast txid=${nodeTxid} accepted but not recorded (orderId=${row.order_id}); retrying next poll:`, err);
+        }
+        continue;
+      }
+      console.error(`[payout-executor] send failed orderId=${row.order_id}:`, sendErr);
+
+      // 3. Lost acknowledgement? Does the node hold this exact tx anyway?
+      const has = await this._nodeHas(expectedTxid);
+      const alreadyInChain = sendErr instanceof RpcCallError && sendErr.code === -27;
+      if (alreadyInChain || has === 'mempool' || has === 'chain') {
+        try {
+          await this._commitBroadcast(row, expectedTxid, {
+            ackLost: true, nodeHas: alreadyInChain ? 'chain' : has, sendError: String(sendErr),
+          });
+          console.warn(`[payout-executor] send ack lost orderId=${row.order_id}; node has txid=${expectedTxid}, recorded as broadcast`);
+        } catch (err) {
+          console.error(`[payout-executor] could not record ack-lost broadcast orderId=${row.order_id}; retrying next poll:`, err);
+        }
+        continue;
+      }
+
+      // 4. Refused outright. A refusal proves THIS send was not accepted, so
+      // record it. If no earlier send of this tx may have reached the network
+      // and it was never operator-retried, and the node confirms it does not
+      // hold it, its inputs are still ours: free them.
+      if (isDefiniteRejection(sendErr)) {
+        await this._recordRefusal(row.order_id, row.payout_id, expectedTxid, String(sendErr));
+        if (hist.thisTx === 0 && !hist.retried) {
+          if (has === 'no') {
+            await this._parkAndRelease(row.order_id, row.payout_id, String(sendErr));
+            continue;
+          }
+          if (has === null) {
+            console.warn(`[payout-executor] refused orderId=${row.order_id}, node lookup failed; deciding next poll`);
+            continue;     // stays PAYOUT_SIGNED; the refusal row keeps it eligible
+          }
         }
       }
+
+      // 5. Retryable (node down/busy, input not visible yet, mempool limits):
+      // re-send the same tx next poll.
+      if (isTransient(sendErr) && hist.sinceRetry + 1 < MAX_SEND_ATTEMPTS) {
+        console.warn(`[payout-executor] retryable send failure orderId=${row.order_id} ` +
+          `(attempt ${hist.sinceRetry + 1}/${MAX_SEND_ATTEMPTS}); will re-send the same tx`);
+        continue;
+      }
+
+      // 6. Park, inputs held: the tx may be on peers, or its inputs spent elsewhere.
+      try {
+        await this._transitionOutbound(
+          row.order_id, OutboundState.PAYOUT_SIGNED, OutboundState.MANUAL_REVIEW,
+          {
+            error: String(sendErr),
+            txid: expectedTxid,
+            inputsHeld: isDefiniteRejection(sendErr)
+              ? 'node refused it, but it may have been sent before (earlier attempts or an operator retry): ' +
+                'its reserved UTXOs are HELD. Confirm the tx is on no node before releasing them by hand.'
+              : 'the tx may be on the network: reserved UTXOs kept',
+            retry: "set state='PAYOUT_QUEUED' to re-send this same signed tx (safe: identical tx)",
+          },
+        );
+      } catch (err) {
+        console.error(`[payout-executor] park error orderId=${row.order_id}:`, err);
+      }
     }
+  }
+
+  /** Record a payout as broadcast: txid, inputs spent, change ingested, state advanced. */
+  private async _commitBroadcast(row: SignedPayoutRow, txid: string, extra: Record<string, unknown>): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      const rows = await tx<{ state: string }[]>`
+        SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
+      `;
+      if (rows.length === 0 || rows[0]!.state !== OutboundState.PAYOUT_SIGNED) {
+        // The node HAS this tx, but the order moved meanwhile (another poller
+        // parked it, or a hand edit). The coins are spent either way: record
+        // that, never leave them 'available'.
+        await tx`UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now() WHERE id = ${row.payout_id}`;
+        await tx`UPDATE bridge_utxos SET status = 'spent', updated_at = now() WHERE spent_payout_id = ${row.payout_id}`;
+        // Inputs may have been released meanwhile (spent_payout_id cleared): mark
+        // the outpoints this tx ACTUALLY spends, read from the signed hex.
+        let inputs: { txid: string; vout: number }[] = [];
+        try { inputs = txInputsFromRawHex(row.signed_hex); }
+        catch (err) { console.error(`[payout-executor] cannot parse inputs of payout ${row.payout_id}:`, err); }
+        for (const inp of inputs) {
+          await tx`UPDATE bridge_utxos SET status = 'spent', spent_payout_id = ${row.payout_id}, updated_at = now()
+                   WHERE txid = ${inp.txid} AND vout = ${inp.vout}`;
+        }
+        if (row.change_sat && BigInt(row.change_sat) > 0n && row.change_address && row.change_index !== null) {
+          await tx`
+            INSERT INTO bridge_utxos (order_id, txid, vout, amount_sat, address, hd_index, derivation_path, status)
+            VALUES (${row.order_id}, ${txid}, 1, ${BigInt(row.change_sat).toString()}, ${row.change_address},
+                    ${parseInt(row.change_index, 10)}, 'change', 'available')
+            ON CONFLICT (txid, vout) DO NOTHING
+          `;
+        }
+        await tx`
+          INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+          VALUES (${row.order_id}, 'PAYOUT_SENT_OUT_OF_STATE', ${rows[0]?.state ?? null}, ${rows[0]?.state ?? 'UNKNOWN'},
+                  'payout-executor', ${tx.json({ txid, payoutId: row.payout_id, ...extra } as never)})
+        `;
+        console.error(`[payout-executor] CRITICAL: payout txid=${txid} is on the network but order ${row.order_id} is ` +
+          `${rows[0]?.state ?? 'missing'}; recorded the txid and marked inputs spent. Reconcile by hand.`);
+        return;
+      }
+
+      await tx`
+        UPDATE payouts SET txid = ${txid}, broadcast_at = now(), updated_at = now()
+        WHERE id = ${row.payout_id}
+      `;
+      await tx`
+        UPDATE bridge_utxos SET status = 'spent', updated_at = now()
+        WHERE spent_payout_id = ${row.payout_id}
+      `;
+
+      // Ingest the change output as a new spendable UTXO. Convention: the
+      // tx-builder always places change at vout=1 (recipient is vout=0),
+      // and emits no change output when changeSat <= dust threshold.
+      if (row.change_sat && BigInt(row.change_sat) > 0n
+          && row.change_address && row.change_index !== null) {
+        await tx`
+          INSERT INTO bridge_utxos
+            (order_id, txid, vout, amount_sat, address, hd_index, derivation_path, status)
+          VALUES
+            (${row.order_id}, ${txid}, 1, ${BigInt(row.change_sat)},
+             ${row.change_address}, ${parseInt(row.change_index, 10)},
+             'change', 'available')
+          ON CONFLICT (txid, vout) DO NOTHING
+        `;
+      }
+
+      await tx`
+        UPDATE bridge_orders SET state = ${OutboundState.PAYOUT_BROADCAST}, updated_at = now()
+        WHERE id = ${row.order_id}
+      `;
+      await tx`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (
+          ${row.order_id}, 'STATE_TRANSITION',
+          ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.PAYOUT_BROADCAST},
+          'payout-executor', ${tx.json({ txid, ...extra } as never)}
+        )
+      `;
+    });
   }
 
   // ── Job 3: PAYOUT_BROADCAST → PAYOUT_CONFIRMED → COMPLETED ───────────────
 
   private async confirmBroadcast(): Promise<void> {
     const broadcast = await this.sql<BroadcastPayoutRow[]>`
-      SELECT bo.id AS order_id, p.id AS payout_id, p.txid
+      SELECT bo.id AS order_id, p.id AS payout_id, p.txid, p.broadcast_at
       FROM bridge_orders bo
       JOIN withdrawal_requests wr ON wr.order_id = bo.id
       JOIN payouts p ON p.withdrawal_request_id = wr.id
       WHERE bo.state = ${OutboundState.PAYOUT_BROADCAST}
         AND p.txid IS NOT NULL
+      ORDER BY p.broadcast_at ASC NULLS FIRST   -- parents before children (change chains)
     `;
 
     for (const row of broadcast) {
-      const confs = await this.rpc.getConfirmations(row.txid).catch(() => -1);
+      let confs: number;
+      try { confs = await this.rpc.getConfirmations(row.txid); } catch { continue; /* node unreachable */ }
+      if (confs === -1) { await this._resendForgotten(row); continue; }
+      if (confs === 0) {
+        // 0 is also what a tx only in a stale (reorged-out) block reports.
+        let inPool: boolean | null = null;
+        try { inPool = await this.rpc.isInMempool(row.txid); } catch { /* unreachable */ }
+        if (inPool === false) await this._resendForgotten(row);
+        continue;
+      }
       if (confs < PAYOUT_MIN_CONFIRMATIONS) continue;
+      this.resendState.delete(row.payout_id);
 
       await this._transitionOutbound(
         row.order_id, OutboundState.PAYOUT_BROADCAST, OutboundState.PAYOUT_CONFIRMED,
@@ -442,24 +611,159 @@ export class PayoutExecutor {
     }
   }
 
+  /**
+   * The node no longer knows a payout we broadcast (evicted from the mempool,
+   * node restarted, never relayed). Re-send the SAME signed tx (safe: same
+   * txid, same inputs). If its inputs are gone (-25), they were spent by a
+   * different tx (a conflict or a malleated copy): park for a human.
+   */
+  private async _resendForgotten(row: BroadcastPayoutRow): Promise<void> {
+    const since = row.broadcast_at ? Date.now() - row.broadcast_at.getTime() : Infinity;
+    if (since < RESEND_FORGOTTEN_AFTER_MS) return;
+    const st = this.resendState.get(row.payout_id) ?? { last: 0, failures: 0 };
+    if (Date.now() - st.last < RESEND_FORGOTTEN_AFTER_MS) return;
+    st.last = Date.now();
+    this.resendState.set(row.payout_id, st);
+
+    const hexRows = await this.sql<{ signed_hex: string | null }[]>`
+      SELECT ae.metadata->>'signedHex' AS signed_hex FROM audit_events ae
+      WHERE ae.order_id = ${row.order_id} AND ae.event_type = 'PAYOUT_SIGNED'
+        AND ae.metadata->>'payoutId' = ${row.payout_id}
+      ORDER BY ae.id DESC
+    `;
+    const hexes = hexRows.map((r) => r.signed_hex).filter((h): h is string => h !== null);
+    // Only the hex whose txid IS the recorded one. Sending any other tx would
+    // never make the recorded txid confirm (and could be a different payment).
+    const hex = hexes.find((h) => txidFromRawHex(h) === row.txid);
+    if (!hex) {
+      this.resendState.delete(row.payout_id);
+      await this._park(row.order_id, OutboundState.PAYOUT_BROADCAST,
+        `broadcast payout ${row.txid} is unknown to the node and no stored signed tx has that txid: reconcile by hand`);
+      return;
+    }
+    try {
+      await this.rpc.sendRawTransaction(hex);
+      st.failures = 0;
+      console.warn(`[payout-executor] node had forgotten payout txid=${row.txid}; re-sent it (orderId=${row.order_id})`);
+    } catch (err) {
+      if (err instanceof RpcCallError && err.code === -27) { st.failures = 0; return; }   // in the chain after all
+      // Node unreachable/warming up says nothing about the tx: don't count it.
+      if (err instanceof RpcNetworkError || (err instanceof RpcCallError && err.code === -28)) return;
+      // -25 can mean "inputs spent by a different tx" OR "parent payout's change
+      // is forgotten too" (it gets re-sent first, ordering is oldest-first). Only
+      // a refusal that persists means a human has to look.
+      st.failures += 1;
+      console.error(`[payout-executor] re-send of forgotten payout txid=${row.txid} refused ` +
+        `(${st.failures}/${RESEND_FORGOTTEN_MAX_FAILURES}):`, err);
+      if (st.failures < RESEND_FORGOTTEN_MAX_FAILURES) return;
+      this.resendState.delete(row.payout_id);
+      try {
+        await this._transitionOutbound(row.order_id, OutboundState.PAYOUT_BROADCAST, OutboundState.MANUAL_REVIEW, {
+          error: String(err), txid: row.txid,
+          note: 'broadcast payout is unknown to the node and keeps being refused on re-send (conflict, a malleated ' +
+                'copy, or fee policy): check whether the recipient was paid before doing anything',
+        });
+      } catch (e2) {
+        console.error(`[payout-executor] park error orderId=${row.order_id}:`, e2);
+      }
+    }
+  }
+
+  /**
+   * Does our node hold this exact tx? 'mempool' | 'chain' | 'no' | null (node
+   * unreachable). confirmations 0 alone is NOT enough: a tx only in a stale,
+   * reorged-out block also reports 0, so check the mempool itself.
+   */
+  private async _nodeHas(txid: string): Promise<'mempool' | 'chain' | 'no' | null> {
+    try {
+      const confs = await this.rpc.getConfirmations(txid);
+      if (confs >= 1) return 'chain';
+      if (confs === -1) return 'no';
+      return (await this.rpc.isInMempool(txid)) ? 'mempool' : 'no';
+    } catch {
+      return null;
+    }
+  }
+
+  /** Record that the node definitively refused this exact tx (it was not accepted, so not relayed by this send). */
+  private async _recordRefusal(orderId: string, payoutId: string, txid: string, error: string): Promise<void> {
+    try {
+      await this.sql`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (${orderId}, 'PAYOUT_BROADCAST_REFUSED', ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.PAYOUT_SIGNED},
+                'payout-executor', ${this.sql.json({ payoutId, txid, error })})
+      `;
+    } catch (err) {
+      console.error(`[payout-executor] could not record refusal orderId=${orderId}:`, err);
+    }
+  }
+
+  /** Park in MANUAL_REVIEW with a reason, logging instead of throwing. */
+  private async _park(orderId: string, from: OutboundState, reason: string): Promise<void> {
+    console.error(`[payout-executor] orderId=${orderId}: ${reason}`);
+    try {
+      await this._transitionOutbound(orderId, from, OutboundState.MANUAL_REVIEW, { error: reason });
+    } catch (err) {
+      console.error(`[payout-executor] park error orderId=${orderId}:`, err);
+    }
+  }
+
+  /** Like _transitionOutbound, with a custom audit event type. */
+  private async _transitionGeneric(
+    orderId: string, from: OutboundState, to: OutboundState, eventType: string, metadata: Record<string, unknown>,
+  ): Promise<void> {
+    assertOutboundTransition(from, to);
+    await this.sql.begin(async (tx) => {
+      const rows = await tx<{ state: string }[]>`SELECT state FROM bridge_orders WHERE id = ${orderId} FOR UPDATE`;
+      if (rows.length === 0 || rows[0]!.state !== from) return;
+      await tx`UPDATE bridge_orders SET state = ${to}, updated_at = now() WHERE id = ${orderId}`;
+      await tx`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (${orderId}, ${eventType}, ${from}, ${to}, 'payout-executor', ${tx.json(metadata as never)})
+      `;
+    });
+  }
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
-  /** Append a PAYOUT_BROADCAST_ATTEMPT audit row; returns how many existed before it. */
-  private async _recordBroadcastAttempt(orderId: string, payoutId: string): Promise<number> {
+  /**
+   * Append a PAYOUT_BROADCAST_ATTEMPT audit row for this exact tx and report the
+   * history before it (under the order lock, so concurrent pollers serialize):
+   *   thisTx      attempts of this txid that MAY have reached the network: all
+   *               attempts (plus legacy txid-less rows written before 2026-11-06)
+   *               minus the ones the node definitively refused
+   *   sinceRetry  attempts of this txid since the last operator RETRY_SAME_TX
+   *   retried     whether this payout was ever re-queued by an operator
+   */
+  private async _recordBroadcastAttempt(orderId: string, payoutId: string, txid: string):
+    Promise<{ thisTx: number; sinceRetry: number; retried: boolean }> {
     return this.sql.begin(async (tx) => {
-      // Serialize concurrent pollers on this order, so two cannot both count 0.
       await tx`SELECT id FROM bridge_orders WHERE id = ${orderId} FOR UPDATE`;
-      const [c] = await tx<{ n: number }[]>`
-        SELECT count(*)::int AS n FROM audit_events
-        WHERE order_id = ${orderId} AND event_type = 'PAYOUT_BROADCAST_ATTEMPT'
-          AND metadata->>'payoutId' = ${payoutId}
+      const [h] = await tx<{ this_tx: number; since_retry: number; retried: boolean }[]>`
+        WITH refused AS (
+          SELECT count(*)::int AS n FROM audit_events
+          WHERE order_id = ${orderId} AND event_type = 'PAYOUT_BROADCAST_REFUSED'
+            AND metadata->>'payoutId' = ${payoutId} AND metadata->>'txid' = ${txid}
+        ), last_retry AS (
+          SELECT COALESCE(MAX(id), 0) AS id FROM audit_events
+          WHERE order_id = ${orderId} AND event_type = 'RETRY_SAME_TX' AND metadata->>'payoutId' = ${payoutId}
+        )
+        SELECT
+          -- attempts that MAY have reached the network: all attempts of this tx
+          -- (and legacy txid-less ones) minus those the node definitively refused
+          (count(*) FILTER (WHERE metadata->>'txid' = ${txid} OR metadata->>'txid' IS NULL)
+             - (SELECT n FROM refused))::int AS this_tx,
+          count(*) FILTER (WHERE metadata->>'txid' = ${txid} AND id > (SELECT id FROM last_retry))::int AS since_retry,
+          (SELECT id FROM last_retry) > 0 AS retried
+        FROM audit_events
+        WHERE order_id = ${orderId} AND event_type = 'PAYOUT_BROADCAST_ATTEMPT' AND metadata->>'payoutId' = ${payoutId}
       `;
       await tx`
         INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
         VALUES (${orderId}, 'PAYOUT_BROADCAST_ATTEMPT', ${OutboundState.PAYOUT_SIGNED}, ${OutboundState.PAYOUT_SIGNED},
-                'payout-executor', ${tx.json({ payoutId, attempt: c!.n + 1 })})
+                'payout-executor', ${tx.json({ payoutId, txid, attempt: h!.this_tx + 1 })})
       `;
-      return c!.n;
+      return { thisTx: h!.this_tx, sinceRetry: h!.since_retry, retried: h!.retried };
     });
   }
 

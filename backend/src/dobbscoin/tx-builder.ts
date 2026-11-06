@@ -60,6 +60,38 @@ const BYTES_PER_INPUT  = 148;
 const BYTES_PER_OUTPUT = 34;
 const TX_OVERHEAD      = 10;
 
+/**
+ * Outpoints spent by a serialized legacy (non-segwit) tx, txids in RPC display
+ * order. Dobbscoin has no segwit; throws on anything it can't parse.
+ */
+export function txInputsFromRawHex(rawHex: string): { txid: string; vout: number }[] {
+  const b = Buffer.from(rawHex, 'hex');
+  let o = 4;                                              // version
+  const varint = (): number => {
+    const f = b[o++]!;
+    if (f < 0xfd) return f;
+    if (f === 0xfd) { const v = b.readUInt16LE(o); o += 2; return v; }
+    if (f === 0xfe) { const v = b.readUInt32LE(o); o += 4; return v; }
+    throw new Error('varint too large');
+  };
+  const n = varint();
+  if (n === 0) throw new Error('no inputs (segwit marker?): not a legacy tx');
+  const ins: { txid: string; vout: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    if (o + 36 > b.length) throw new Error('truncated tx');
+    const txid = Buffer.from(b.subarray(o, o + 32)).reverse().toString('hex'); o += 32;
+    const vout = b.readUInt32LE(o); o += 4;
+    o += varint() + 4;                                     // scriptSig + sequence
+    ins.push({ txid, vout });
+  }
+  return ins;
+}
+
+/** txid of a serialized (non-segwit) tx: double-SHA256, byte-reversed, as RPC displays it. */
+export function txidFromRawHex(rawHex: string): string {
+  return Buffer.from(sha256(sha256(Buffer.from(rawHex, 'hex')))).reverse().toString('hex');
+}
+
 /** Outputs at or below this many satoshis are dust: never created, folded into the fee. */
 export const DUST_THRESHOLD_SAT = 546n;
 
@@ -336,11 +368,7 @@ export class DobbscoinTxBuilder {
     const rawBytes = tx.extract();
     const rawHex = Buffer.from(rawBytes).toString('hex');
 
-    // Compute txid: dsha256 of raw bytes, reversed (big-endian display format)
-    const hash1 = sha256(rawBytes);
-    const hash2 = sha256(hash1);
-    const txidBytes = Buffer.from(hash2).reverse();
-    const txid = txidBytes.toString('hex');
+    const txid = txidFromRawHex(rawHex);
 
     return { rawHex, txid };
   }

@@ -78,7 +78,11 @@ export async function nextChangeIndex(sql: Sql): Promise<number> {
   const rows = await sql<{ next: number }[]>`
     SELECT GREATEST(
       COALESCE((SELECT MAX(hd_index) FROM bridge_utxos WHERE derivation_path = 'change'), -1),
-      COALESCE((SELECT MAX(change_index) FROM deposit_refunds), -1)
+      COALESCE((SELECT MAX(change_index) FROM deposit_refunds), -1),
+      -- Payout change indexes live only in PAYOUT_SIGNED audit metadata until
+      -- broadcast; include every one ever signed so none is handed out twice.
+      COALESCE((SELECT MAX((metadata->>'changeIndex')::int) FROM audit_events
+                WHERE event_type = 'PAYOUT_SIGNED' AND metadata->>'changeIndex' IS NOT NULL), -1)
     ) + 1 AS next
   `;
   return Number(rows[0]?.next ?? 0);
