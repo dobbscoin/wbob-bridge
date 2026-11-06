@@ -38,6 +38,8 @@ export interface MintCapResponse {
    * only the token's UTC day: capacity used by V2 returns 24-25 h after each mint.
    */
   controllerRemainingSat?: string;
+  /** V2 only: the controller's rolling 24 h limit (mintLimitPerWindow). */
+  controllerLimitSat?: string;
 }
 
 const CACHE_MS = 15_000;
@@ -64,6 +66,7 @@ export async function mintCapRoute(
       resetsAt:       iso(window.resetsAtSec),
       gnosisBlock:    state.blockNumber.toString(),
       ...(state.controllerRemainingSat === undefined ? {} : { controllerRemainingSat: state.controllerRemainingSat.toString() }),
+      ...(state.controllerLimitSat === undefined ? {} : { controllerLimitSat: state.controllerLimitSat.toString() }),
       checkedAt:      new Date().toISOString(),
     };
   }

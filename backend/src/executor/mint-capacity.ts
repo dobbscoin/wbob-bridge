@@ -50,6 +50,8 @@ export interface MintCapChainState {
    * 24 h cap). Undefined against V1, which has no cap of its own.
    */
   controllerRemainingSat?: bigint;
+  /** BridgeControllerV2.mintLimitPerWindow() at the same block (display). */
+  controllerLimitSat?: bigint;
 }
 
 export interface MintCapWindow {
@@ -217,6 +219,7 @@ export const WBOB_CAP_ABI = parseAbi([
 const CONTROLLER_WBOB_ABI = parseAbi([
   'function wBOB() view returns (address)',
   'function remainingMintCapacity() view returns (uint256)',
+  'function mintLimitPerWindow() view returns (uint256)',
 ]);
 
 /**
@@ -255,23 +258,25 @@ export class ViemMintCapReader implements MintCapReader {
     if (blockNumber === null) throw new Error('latest block has no number');
     const read = (functionName: 'dailyMintLimit' | 'currentDayMinted' | 'currentDayStart' | 'MAX_SUPPLY' | 'totalSupply') =>
       this.client.readContract({ address, abi: WBOB_CAP_ABI, functionName, blockNumber }) as Promise<bigint>;
-    const [dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply, controllerRemaining] = await Promise.all([
+    const v2read = (functionName: 'remainingMintCapacity' | 'mintLimitPerWindow') => this.controllerVersion === 2
+      ? this.client.readContract({
+          address: this.bridgeControllerAddress as Hex, abi: CONTROLLER_WBOB_ABI, functionName, blockNumber,
+        }) as Promise<bigint>
+      : Promise.resolve(undefined);
+    const [dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply, controllerRemaining, controllerLimit] = await Promise.all([
       read('dailyMintLimit'),
       read('currentDayMinted'),
       read('currentDayStart'),
       read('MAX_SUPPLY'),
       read('totalSupply'),
-      this.controllerVersion === 2
-        ? this.client.readContract({
-            address: this.bridgeControllerAddress as Hex, abi: CONTROLLER_WBOB_ABI,
-            functionName: 'remainingMintCapacity', blockNumber,
-          }) as Promise<bigint>
-        : Promise.resolve(undefined),
+      v2read('remainingMintCapacity'),
+      v2read('mintLimitPerWindow'),
     ]);
     return {
       dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply,
       blockNumber, blockTimestamp: block.timestamp,
       ...(controllerRemaining === undefined ? {} : { controllerRemainingSat: controllerRemaining }),
+      ...(controllerLimit === undefined ? {} : { controllerLimitSat: controllerLimit }),
     };
   }
 
