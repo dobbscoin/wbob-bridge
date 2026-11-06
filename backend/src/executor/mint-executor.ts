@@ -776,18 +776,17 @@ export class MintExecutor {
           seen.add(who);
           out.push(e);
         } else if (who !== e.signer.toLowerCase()) {
-          // Signed under the OTHER controller version? That's a misconfigured
-          // watcher (BRIDGE_CONTROLLER_VERSION), and every mint would stall.
-          const other = await recoverTypedDataAddress({
-            domain: { ...domain, ...bridgeControllerDomain(this.config.bridgeControllerVersion === 2 ? 1 : 2) },
-            types: MINT_AUTHORIZATION_TYPES, primaryType: 'MintAuthorization', message: auth, signature: e.sig as ViemHex,
-          }).catch(() => null);
-          if (other && other.toLowerCase() === e.signer.toLowerCase() && !this.alertedWrongDomain.has(who + e.signer)) {
-            this.alertedWrongDomain.add(who + e.signer);
+          // Valid under some OTHER controller domain? Then a watcher is
+          // misconfigured (BRIDGE_CONTROLLER_VERSION or BRIDGE_CONTROLLER_ADDRESS
+          // left on the old controller) and every mint would stall: say which.
+          const why = await this._wrongDomainOf(auth, e);
+          if (why !== null && !this.alertedWrongDomain.has(e.signer.toLowerCase() + why)) {
+            this.alertedWrongDomain.add(e.signer.toLowerCase() + why);
             await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
-              message: `Watcher ${e.signer} signs with the wrong EIP-712 domain version (expected ` +
-                `${this.config.bridgeControllerVersion}). Set BRIDGE_CONTROLLER_VERSION on that watcher; its signatures are ignored.`,
-              data: { signer: e.signer } });
+              message: `Watcher ${e.signer} signs for ${why}, not for ${this.config.bridgeControllerAddress} ` +
+                `version ${this.config.bridgeControllerVersion}. Fix BRIDGE_CONTROLLER_ADDRESS / BRIDGE_CONTROLLER_VERSION ` +
+                `on that watcher; its signatures are ignored until then.`,
+              data: { signer: e.signer, signsFor: why } });
           }
         }
       } catch {
@@ -795,6 +794,26 @@ export class MintExecutor {
       }
     }
     return out;
+  }
+
+  /** If `e` is a valid signature by its signer under another known controller domain, describe it. */
+  private async _wrongDomainOf(
+    auth: Parameters<MintExecutor['_validSignatures']>[0],
+    e: { signer: string; sig: string },
+  ): Promise<string | null> {
+    const addresses = [this.config.bridgeControllerAddress, ...(this.config.legacyBridgeControllerAddresses ?? [])];
+    for (const address of addresses) {
+      for (const version of [1, 2] as const) {
+        if (address.toLowerCase() === this.config.bridgeControllerAddress.toLowerCase()
+            && version === this.config.bridgeControllerVersion) continue;
+        const got = await recoverTypedDataAddress({
+          domain: { ...bridgeControllerDomain(version), verifyingContract: address as ViemHex },
+          types: MINT_AUTHORIZATION_TYPES, primaryType: 'MintAuthorization', message: auth, signature: e.sig as ViemHex,
+        }).catch(() => null);
+        if (got && got.toLowerCase() === e.signer.toLowerCase()) return `${address} version ${version}`;
+      }
+    }
+    return null;
   }
 
   /** Replace the signature list with `keep`, only if nobody changed it since we read it. */

@@ -22,6 +22,7 @@ import { RefundExecutor } from './executor/refund-executor.js';
 import { DobbscoinBackendRpc } from './dobbscoin/rpc.js';
 import { BridgeGuard } from './gnosis/bridge-guard.js';
 import { assertControllerVersion } from './gnosis/controller-version.js';
+import { AlertDispatcher } from './monitor/webhook.js';
 import { SolvencyMonitor } from './monitor/solvency-monitor.js';
 
 async function main(): Promise<void> {
@@ -50,7 +51,15 @@ async function main(): Promise<void> {
       : '[backend] BridgeGuard configured — emergency pause/unpause available to ops (NOT automatic)');
     const guardOperator = await guard.getOperator().catch(() => 'unknown');
     console.log(`[backend] BridgeGuard operator: ${guardOperator}`);
-    for (const p of await guard.readiness()) console.error(`[backend] BridgeGuard NOT READY: ${p}`);
+    const notReady = await guard.readiness();
+    for (const p of notReady) console.error(`[backend] BridgeGuard NOT READY: ${p}`);
+    if (notReady.length > 0) {
+      await new AlertDispatcher({ webhookUrl: config.alertWebhookUrl, emailTo: config.alertEmailTo }).dispatch({
+        level: 'critical', type: 'MINT_SUBMIT_BLOCKED', timestamp: new Date().toISOString(),
+        message: `Emergency pause is NOT ready: ${notReady.join(' | ')}`,
+        data: { problems: notReady },
+      }).catch((err) => console.error('[backend] could not send the BridgeGuard alert:', err));
+    }
   } else {
     console.warn('[backend] BridgeGuard DISABLED — set BRIDGE_EXECUTOR_MODULE_ADDRESS to enable emergency pause');
   }

@@ -41,7 +41,12 @@ const MODULE_ABI = parseAbi([
   'function unpause() external',
   'function pauseAll() external',
   'function operator() view returns (address)',
+  'function safe() view returns (address)',
+  'function controller() view returns (address)',
+  'function token() view returns (address)',
 ]);
+
+const SAFE_ABI = parseAbi(['function isModuleEnabled(address module) view returns (bool)']);
 
 export class BridgeGuard {
   private readonly publicClient;
@@ -51,6 +56,7 @@ export class BridgeGuard {
   private readonly v2: boolean;
 
   constructor(private readonly config: BackendConfig) {
+    // (config is kept: readiness() compares the module's targets with it.)
     if (!config.bridgeExecutorModuleAddress) {
       throw new Error('BridgeGuard: BRIDGE_EXECUTOR_MODULE_ADDRESS is not configured');
     }
@@ -158,7 +164,23 @@ export class BridgeGuard {
    */
   async readiness(): Promise<string[]> {
     const problems: string[] = [];
+    const read = (functionName: 'safe' | 'controller' | 'token') =>
+      this.publicClient.readContract({ address: this.moduleAddress, abi: MODULE_ABI, functionName }) as Promise<string>;
     try {
+      if (this.v2) {
+        // The V1 module has none of these; a V2 config left pointing at it fails here, not mid-incident.
+        const [safe, controller, token] = await Promise.all([read('safe'), read('controller'), read('token')]);
+        if (controller.toLowerCase() !== this.config.bridgeControllerAddress.toLowerCase()) {
+          problems.push(`module controller() is ${controller}, not BRIDGE_CONTROLLER_ADDRESS ${this.config.bridgeControllerAddress}`);
+        }
+        if (this.config.wBobAddress && token.toLowerCase() !== this.config.wBobAddress.toLowerCase()) {
+          problems.push(`module token() is ${token}, not WBOB_ADDRESS ${this.config.wBobAddress}`);
+        }
+        const enabled = await this.publicClient.readContract({
+          address: safe as ViemHex, abi: SAFE_ABI, functionName: 'isModuleEnabled', args: [this.moduleAddress],
+        }) as boolean;
+        if (!enabled) problems.push(`module ${this.moduleAddress} is NOT enabled on Safe ${safe}: pauseAll would revert`);
+      }
       const op = (await this.getOperator()).toLowerCase();
       if (op !== this.account.address.toLowerCase()) {
         problems.push(`module operator is ${op} but this backend holds ${this.account.address}: a pause would revert OnlyOperator`);
@@ -166,7 +188,9 @@ export class BridgeGuard {
       const bal = await this.publicClient.getBalance({ address: this.account.address });
       if (bal === 0n) problems.push(`operator ${this.account.address} has 0 xDAI: a pause cannot pay gas`);
     } catch (err) {
-      problems.push(`could not read module/operator: ${String(err).slice(0, 160)}`);
+      problems.push(this.v2
+        ? `could not read the module as an EmergencyPauseModule (is BRIDGE_EXECUTOR_MODULE_ADDRESS still the V1 module?): ${String(err).slice(0, 160)}`
+        : `could not read module/operator: ${String(err).slice(0, 160)}`);
     }
     return problems;
   }

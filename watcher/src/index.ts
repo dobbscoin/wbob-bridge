@@ -18,6 +18,7 @@ import { DobbscoinRpcClient, RpcCallError, btcToSatoshis } from './rpc/client.js
 import { outputAddress } from './deposits/address-watcher.js';
 import type { TxChainStatus } from './deposits/block-handler.js';
 import { checkMintAgainstNode } from './signing/node-check.js';
+import { BridgeAddresses } from './deposits/bridge-address.js';
 import { BlockPoller, CatchUpTooFarError } from './chain/block-poller.js';
 import { loadCursor, saveCursor } from './chain/cursor-store.js';
 import { createBlockHandlers } from './deposits/block-handler.js';
@@ -53,6 +54,7 @@ interface PendingMintRow {
   vout:             number;
   source_chain_name: string;
   deposit_address:  string;
+  hd_index:         number | null;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -71,6 +73,13 @@ async function main(): Promise<void> {
     bridgeControllerVersion: config.bridgeControllerVersion,
   });
   const submitter = new SignatureSubmitter(sql);
+  // The bridge's deposit addresses, derived from the xpub in OUR env: a DB
+  // writer cannot point a mint at an address they control.
+  const bridgeAddresses = new BridgeAddresses(config.hdWalletXpub, config.hdDerivationPath, config.dobbscoinAddressVersion);
+  const expectedDepositAddress = (hdIndex: number | null): string | null => {
+    if (hdIndex === null) return null;
+    try { return bridgeAddresses.depositAddress(hdIndex); } catch { return null; }
+  };
 
   console.log(`[watcher] started. signer=${authorizer.address}`);
 
@@ -132,7 +141,8 @@ async function main(): Promise<void> {
         sd.txid,
         sd.vout,
         sd.source_chain_name,
-        sd.deposit_address
+        sd.deposit_address,
+        sd.hd_index
       FROM mint_requests mr
       JOIN bridge_orders bo  ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
@@ -153,7 +163,7 @@ async function main(): Promise<void> {
         // Independent check, per signer, at the moment of signing, against a FRESH
         // node answer (never the cache). See signing/node-check.ts.
         const why = checkMintAgainstNode(
-          { ...row, deposit_id_hex: depositIdHex },
+          { ...row, deposit_id_hex: depositIdHex, expected_deposit_address: expectedDepositAddress(row.hd_index) },
           await txStatusFresh(row.txid),
           config.finalConfirmations,
         );

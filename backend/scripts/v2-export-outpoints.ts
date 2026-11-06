@@ -24,7 +24,9 @@
  * final additionally requires: --to <= the 'finalized' block, V1 paused and
  * role-less at --to AND at latest, and no V1 MintExecuted in (--to, latest].
  * Output: { ..., count, keys, batches } with batches of BATCH keys for
- * importProcessedOutpoints (each ~20k gas/key; 500 keys ≈ 10M gas).
+ * importProcessedOutpoints (each ~20k gas/key; 300 keys ≈ 6M gas). After the
+ * import, run scripts/v2-verify-import.ts against the same file BEFORE sealImport
+ * and again before the final unpause.
  */
 import { writeFileSync } from 'node:fs';
 import postgres from 'postgres';
@@ -34,7 +36,8 @@ import { loadConfig } from '../src/config.js';
 import { DobbscoinBackendRpc, RpcCallError } from '../src/dobbscoin/rpc.js';
 import { outpointKey } from '../src/executor/mint-executor.js';
 
-const BATCH = 500;
+// ~20k gas per new key: 300 keys ≈ 6M gas, well under Gnosis's ~17M block limit.
+const BATCH = 300;
 const MINT_EXECUTED = parseAbiItem(
   'event MintExecuted(bytes32 indexed depositId, address indexed recipient, uint256 amount, uint256 sourceChainId, bytes32 sourceTxHash, uint32 sourceVout)',
 );

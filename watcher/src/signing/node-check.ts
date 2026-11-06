@@ -7,8 +7,10 @@
  *
  * Checks:
  *   - the node knows the tx and shows it at >= finalConfirmations in the active chain
- *   - output `vout` exists, pays the recorded deposit address, and is worth at least
- *     the amount about to be authorized (a daily-cap split mints less than the deposit)
+ *   - the recorded deposit address IS the bridge's own address at hd_index, derived
+ *     from HD_WALLET_XPUB in this watcher's environment (never trusted from the DB)
+ *   - output `vout` exists, pays that address, and is worth at least the amount
+ *     about to be authorized (a daily-cap split mints less than the deposit)
  *   - the depositId in the row is exactly what computeDepositId gives for the
  *     node's view of that output plus the row's recipient
  *
@@ -30,6 +32,8 @@ export interface MintCheckRow {
   recipient_address: string;
   amount_sat: bigint | string | number;
   deposit_id_hex: string;
+  /** The bridge's address at this row's hd_index, derived from the watcher's xpub (null = could not derive). */
+  expected_deposit_address: string | null;
 }
 
 export function checkMintAgainstNode(
@@ -40,6 +44,10 @@ export function checkMintAgainstNode(
   if (st === null) return 'node does not know the tx';
   if (st.confirmations < finalConfirmations) {
     return `node shows ${st.confirmations} confirmations (< ${finalConfirmations})`;
+  }
+  if (row.expected_deposit_address === null) return 'cannot derive the bridge address for this row (no hd_index?)';
+  if (row.deposit_address !== row.expected_deposit_address) {
+    return `recorded deposit address ${row.deposit_address} is not the bridge's address ${row.expected_deposit_address} at this hd_index`;
   }
   const out = st.outputs?.find((o) => o.n === row.vout);
   if (out === undefined) return `tx has no output ${row.vout}`;

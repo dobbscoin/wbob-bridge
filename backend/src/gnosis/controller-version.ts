@@ -1,17 +1,35 @@
 /**
- * Refuse to start when BRIDGE_CONTROLLER_VERSION does not match the contract at
- * BRIDGE_CONTROLLER_ADDRESS. A mismatch is silent otherwise: the wrong EIP-712
- * domain makes every signature fail (mints stall), and V1 settings against V2
- * skip the rolling-cap read and the outpoint replay check.
+ * Startup checks for the controller configuration. Refuses to start on a
+ * definite misconfiguration; an RPC failure only warns.
  *
- * Probe: remainingMintCapacity() exists only on BridgeControllerV2.
+ *  - BRIDGE_CONTROLLER_VERSION must match the contract at BRIDGE_CONTROLLER_ADDRESS
+ *    (probe: remainingMintCapacity() exists only on BridgeControllerV2). A mismatch
+ *    is silent otherwise: the wrong EIP-712 domain makes every signature fail, and
+ *    V1 settings against V2 skip the rolling-cap read and the outpoint check.
+ *  - V2 mode needs LEGACY_BRIDGE_CONTROLLER_ADDRESSES (the old controller): one
+ *    watermark covers all scanned controllers, so a V1 burn still below it at the
+ *    switch would otherwise never be ingested (burned, never paid).
+ *  - V2's on-chain minWithdrawal should be >= PAYOUT_MIN_SAT, or burns between the
+ *    two are accepted on-chain and then parked by the payout executor.
  */
-import { createPublicClient, http, fallback, parseAbi, type Hex } from 'viem';
+import {
+  createPublicClient, http, fallback, parseAbi,
+  BaseError, ContractFunctionRevertedError, ContractFunctionZeroDataError, type Hex,
+} from 'viem';
 import { gnosis } from 'viem/chains';
 import type { BackendConfig } from '../config.js';
 
-const PROBE_ABI = parseAbi(['function remainingMintCapacity() view returns (uint256)']);
+const PROBE_ABI = parseAbi([
+  'function remainingMintCapacity() view returns (uint256)',
+  'function minWithdrawal() view returns (uint256)',
+]);
 
+/**
+ * 2 if the contract answers a V2-only view, 1 if it REVERTS or returns no data.
+ * Anything else (HTTP error, timeout) is rethrown: viem wraps every failure in
+ * ContractFunctionExecutionError, so the class name alone proves nothing; the
+ * cause chain says whether the CONTRACT refused.
+ */
 export async function detectControllerVersion(
   client: { readContract: (a: never) => Promise<unknown> },
   address: string,
@@ -20,20 +38,26 @@ export async function detectControllerVersion(
     await client.readContract({ address: address as Hex, abi: PROBE_ABI, functionName: 'remainingMintCapacity' } as never);
     return 2;
   } catch (err) {
-    const msg = String(err);
-    // A revert / missing selector means "not V2". Anything else (RPC down) is rethrown.
-    if (/revert|execution reverted|returned no data|ContractFunctionExecutionError|function selector/i.test(msg)) return 1;
+    if (err instanceof BaseError) {
+      const cause = err.walk((e) => e instanceof ContractFunctionRevertedError || e instanceof ContractFunctionZeroDataError);
+      if (cause) return 1;
+    }
     throw err;
   }
 }
 
 export async function assertControllerVersion(config: BackendConfig): Promise<void> {
+  if (config.bridgeControllerVersion === 2 && (config.legacyBridgeControllerAddresses ?? []).length === 0) {
+    throw new Error(
+      'BRIDGE_CONTROLLER_VERSION=2 needs LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V1 controller>: without it, V1 burns ' +
+      'below the scan watermark at the switch are never ingested. (It is harmless to keep set afterwards.)',
+    );
+  }
   const client = createPublicClient({ chain: gnosis, transport: fallback(config.gnosisRpcUrls.map((u) => http(u))) });
   let onChain: 1 | 2;
   try {
     onChain = await detectControllerVersion(client as never, config.bridgeControllerAddress);
   } catch (err) {
-    // RPC unreachable: don't take the backend down over the check itself.
     console.warn(`[backend] could not verify the controller version (RPC): ${String(err).slice(0, 160)}`);
     return;
   }
@@ -44,4 +68,17 @@ export async function assertControllerVersion(config: BackendConfig): Promise<vo
     );
   }
   console.log(`[backend] controller ${config.bridgeControllerAddress} verified as V${onChain}`);
+  if (onChain === 2) {
+    try {
+      const minW = await client.readContract({
+        address: config.bridgeControllerAddress as Hex, abi: PROBE_ABI, functionName: 'minWithdrawal',
+      }) as bigint;
+      if (minW < config.payoutMinSat) {
+        console.error(`[backend] V2 minWithdrawal ${minW} < PAYOUT_MIN_SAT ${config.payoutMinSat}: burns between the two ` +
+          `are accepted on-chain and then parked in MANUAL_REVIEW. Raise it with setMinWithdrawal via the Safe.`);
+      }
+    } catch (err) {
+      console.warn(`[backend] could not read V2 minWithdrawal: ${String(err).slice(0, 120)}`);
+    }
+  }
 }
