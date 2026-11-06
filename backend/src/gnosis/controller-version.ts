@@ -22,6 +22,7 @@ import type { BackendConfig } from '../config.js';
 const PROBE_ABI = parseAbi([
   'function remainingMintCapacity() view returns (uint256)',
   'function minWithdrawal() view returns (uint256)',
+  'function processedDeposits(bytes32) view returns (bool)',
 ]);
 
 /**
@@ -68,6 +69,22 @@ export async function assertControllerVersion(config: BackendConfig): Promise<vo
     );
   }
   console.log(`[backend] controller ${config.bridgeControllerAddress} verified as V${onChain}`);
+
+  // Every legacy address must BE a controller: the executor asks each one
+  // "already minted?" before authorizing; a wrong address would stall every
+  // authorization with console output only.
+  for (const legacy of config.legacyBridgeControllerAddresses ?? []) {
+    try {
+      await client.readContract({
+        address: legacy as Hex, abi: PROBE_ABI, functionName: 'processedDeposits', args: [`0x${'00'.repeat(32)}`],
+      });
+    } catch (err) {
+      if (err instanceof BaseError && err.walk((e) => e instanceof ContractFunctionRevertedError || e instanceof ContractFunctionZeroDataError)) {
+        throw new Error(`LEGACY_BRIDGE_CONTROLLER_ADDRESSES entry ${legacy} is not a bridge controller (no processedDeposits).`);
+      }
+      console.warn(`[backend] could not probe legacy controller ${legacy} (RPC): ${String(err).slice(0, 120)}`);
+    }
+  }
   if (onChain === 2) {
     try {
       const minW = await client.readContract({

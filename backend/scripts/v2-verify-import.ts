@@ -3,10 +3,16 @@
  * must read processedOutpoints(key) == true on V2. READ-ONLY; sends nothing.
  *
  *   cd backend && set -a && . ../.env && set +a && \
- *   node --import=tsx scripts/v2-verify-import.ts --file v1-outpoints.json --v2 <V2 address> [--rpc <url>]
+ *   node --import=tsx scripts/v2-verify-import.ts --stage pre-seal    --file v1-outpoints.json --v2 <V2> [--rpc <url>]
+ *   node --import=tsx scripts/v2-verify-import.ts --stage pre-unpause --file v1-outpoints.json --v2 <V2> \
+ *        --relayer <backend relayer address> --module <EmergencyPauseModule> --old-module <V1 module> [--rpc <url>]
  *
- * Run it after the import batches land, BEFORE sealImport, and again before the
- * final unpause (Safe tx 3). Exit 1 on any missing key or unexpected state.
+ * Both stages: every key imported; V1 paused and role-less; V2 HOLDS
+ * BRIDGE_EXECUTOR_ROLE (else every mint/withdrawal reverts); V2 still PAUSED
+ * (unpausing before the backend scans V2 loses V2 burns for good).
+ * pre-unpause also: importSealed; the relayer holds REFUND_MARKER_ROLE (else
+ * refunds are never recorded, so never sent); the new module is enabled on the
+ * Safe and the old one is not. Exit 1 on any problem.
  * (V2 accepts imports after the seal too, so a gap found here can still be
  * closed; but never unpause with one open.)
  */
@@ -19,7 +25,10 @@ const V2_ABI = parseAbi([
   'function importSealed() view returns (bool)',
   'function paused() view returns (bool)',
   'function wBOB() view returns (address)',
+  'function hasRole(bytes32, address) view returns (bool)',
 ]);
+const MODULE_ABI = parseAbi(['function safe() view returns (address)']);
+const SAFE_ABI = parseAbi(['function isModuleEnabled(address) view returns (bool)']);
 const V1_ABI = parseAbi(['function paused() view returns (bool)']);
 const WBOB_ABI = parseAbi(['function hasRole(bytes32, address) view returns (bool)']);
 
@@ -33,6 +42,8 @@ function arg(name: string, fallback?: string): string {
 async function main(): Promise<void> {
   const file = JSON.parse(readFileSync(arg('file'), 'utf8')) as { final: boolean; keys: Hex[]; v1: Hex; count: number };
   const v2 = arg('v2') as Hex;
+  const stage = arg('stage');
+  if (stage !== 'pre-seal' && stage !== 'pre-unpause') throw new Error('--stage must be pre-seal or pre-unpause');
   const rpc = arg('rpc', (process.env['GNOSIS_RPC_URLS'] ?? process.env['GNOSIS_RPC_URL'] ?? '').split(',')[0]);
   const client = createPublicClient({ chain: gnosis, transport: http(rpc) });
   const problems: string[] = [];
@@ -50,6 +61,26 @@ async function main(): Promise<void> {
     client.readContract({ address: wbob, abi: WBOB_ABI, functionName: 'hasRole', args: [role, v2] }),
   ]) as [boolean, boolean, boolean, boolean, boolean];
   if (!v1Paused || v1Role) problems.push(`V1 ${file.v1}: paused=${v1Paused}, BRIDGE_EXECUTOR_ROLE=${v1Role} (must be paused, role-less)`);
+  if (!v2Role) problems.push(`V2 does NOT hold BRIDGE_EXECUTOR_ROLE on wBOB: every mint and withdrawal would revert`);
+  if (!paused) problems.push(`V2 is already UNPAUSED: unpause only as the very last step, after the backend scans V2 (else V2 burns are lost)`);
+
+  if (stage === 'pre-unpause') {
+    if (!sealed) problems.push('importSealed=false: sealImport has not run');
+    const relayer = arg('relayer') as Hex;
+    const marker = await client.readContract({
+      address: v2, abi: V2_ABI, functionName: 'hasRole', args: [keccak256(toBytes('REFUND_MARKER_ROLE')), relayer],
+    }) as boolean;
+    if (!marker) problems.push(`relayer ${relayer} lacks REFUND_MARKER_ROLE: refunds could never be recorded, so never sent`);
+    const mod = arg('module') as Hex;
+    const oldMod = arg('old-module') as Hex;
+    const safe = await client.readContract({ address: mod, abi: MODULE_ABI, functionName: 'safe' }) as Hex;
+    const [newOn, oldOn] = await Promise.all([
+      client.readContract({ address: safe, abi: SAFE_ABI, functionName: 'isModuleEnabled', args: [mod] }),
+      client.readContract({ address: safe, abi: SAFE_ABI, functionName: 'isModuleEnabled', args: [oldMod] }),
+    ]) as [boolean, boolean];
+    if (!newOn) problems.push(`EmergencyPauseModule ${mod} is NOT enabled on Safe ${safe}`);
+    if (oldOn) problems.push(`old module ${oldMod} is STILL enabled on Safe ${safe} (it can unpause V1's controller)`);
+  }
 
   let missing = 0;
   for (const k of file.keys) {
@@ -61,8 +92,9 @@ async function main(): Promise<void> {
   console.log(`V2 ${v2}: ${file.keys.length - missing}/${file.keys.length} keys imported, importSealed=${sealed}, ` +
     `paused=${paused}, V2 has BRIDGE_EXECUTOR_ROLE=${v2Role}`);
   if (missing === 0 && problems.length === 0) {
-    console.log(sealed ? 'OK: complete and sealed. Safe to proceed to the final unpause once the services point at V2.'
-                       : 'OK: complete. Safe to call sealImport.');
+    console.log(stage === 'pre-unpause'
+      ? 'OK (pre-unpause): imported, sealed, roles and modules right, still paused. Unpause once the services point at V2.'
+      : 'OK (pre-seal): every key imported, roles right, still paused. Safe to call sealImport.');
   }
   for (const p of problems) console.log(`  PROBLEM ${p}`);
   if (problems.length > 0) process.exitCode = 1;

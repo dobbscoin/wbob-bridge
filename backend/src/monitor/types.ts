@@ -21,7 +21,8 @@ export type AlertType =
   | 'REFUND_NEEDS_ATTENTION' // refund parked: sender undeterminable or tx refused
   | 'MINT_SUBMIT_BLOCKED'  // executeMint simulation reverted; mint held, reason recorded
   | 'MINT_AUTH_REGENERATED' // an expired / stale-nonce authorization was reissued
-  | 'MANUAL_REVIEW_ORDERS'; // orders parked in MANUAL_REVIEW: excluded from every other check, need an operator
+  | 'MANUAL_REVIEW_ORDERS' // orders parked in MANUAL_REVIEW: excluded from every other check, need an operator
+  | 'WATCHER_REFUSED';     // a watcher refused to sign a mint (its own check failed): that mint stalls
 
 export interface Alert {
   level: AlertLevel;

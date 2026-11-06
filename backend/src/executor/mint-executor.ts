@@ -50,7 +50,7 @@ import {
   InboundState,
   assertInboundTransition,
   bridgeControllerDomain,
-  MINT_AUTHORIZATION_TYPES,
+  mintAuthorizationTypes,
 } from '@wbob/shared';
 import { bufferToHex } from '../db/hex.js';
 import type { BackendConfig } from '../config.js';
@@ -96,6 +96,49 @@ export const BRIDGE_ABI = parseAbi([
   'error ExceedsMaxSupply(uint256 requested, uint256 available)',
   // OpenZeppelin v5 Pausable
   'error EnforcedPause()',
+  // OpenZeppelin v5 AccessControl (e.g. the controller lacks BRIDGE_EXECUTOR_ROLE on WBob)
+  'error AccessControlUnauthorizedAccount(address account, bytes32 neededRole)',
+]);
+
+/**
+ * BridgeControllerV2: its executeMint struct adds sourceValue (so it is a
+ * different function selector), plus V2-only errors. Picked by version, never
+ * by overload resolution.
+ */
+export const BRIDGE_ABI_V2 = parseAbi([
+  'function mintNonce() view returns (uint256)',
+  'function processedDeposits(bytes32) view returns (bool)',
+  'function processedOutpoints(bytes32) view returns (bool)',
+  'function isSigner(address) view returns (bool)',
+  'function executeMint((bytes32 depositId, address recipient, uint256 amount, uint256 sourceChainId, bytes32 sourceTxHash, uint32 sourceVout, uint256 sourceValue, uint256 deadline, uint256 nonce) auth, bytes[] signatures) external',
+  'error AlreadyProcessed(bytes32 depositId)',
+  'error DeadlineExpired(uint256 deadline, uint256 blockTimestamp)',
+  'error WrongMintNonce(uint256 provided, uint256 expected)',
+  'error InsufficientValidSignatures(uint256 valid, uint8 threshold)',
+  'error OutpointAlreadyMinted(bytes32 outpointKey)',
+  'error ExceedsWindowLimit(uint256 requested, uint256 remaining)',
+  'error ImportNotSealed()',
+  'error ZeroAmount()',
+  'error ZeroAddress()',
+  'error WrongSourceChain(uint256 provided, uint256 expected)',
+  'error SourceValueMismatch(bytes32 outpointKey, uint256 provided, uint256 recorded)',
+  'error ExceedsSourceValue(bytes32 outpointKey, uint256 minted, uint256 refunded, uint256 value)',
+  'error ExceedsDailyMintLimit(uint256 requested, uint256 remaining)',
+  'error ExceedsMaxSupply(uint256 requested, uint256 available)',
+  'error EnforcedPause()',
+  'error AccessControlUnauthorizedAccount(address account, bytes32 neededRole)',
+]);
+
+/** The V1 struct has no sourceValue; drop it before hashing under V1 types. */
+function stripSourceValue<T extends { sourceValue?: bigint }>(auth: T): Omit<T, 'sourceValue'> {
+  const { sourceValue: _drop, ...rest } = auth;
+  return rest;
+}
+
+/** Reverts that need a human now: the mint will never go through on its own. */
+const CRITICAL_REVERTS = new Set([
+  'AlreadyProcessed', 'OutpointAlreadyMinted', 'ImportNotSealed', 'WrongSourceChain',
+  'SourceValueMismatch', 'ExceedsSourceValue', 'AccessControlUnauthorizedAccount',
 ]);
 
 const SIGNATURE_THRESHOLD = 3;
@@ -133,6 +176,7 @@ interface ReadyToMintRow {
   signatures:         Array<{ signer: string; sig: string }>;
   txid:               string;
   vout:               number;
+  deposit_value_sat:  bigint | null;
 }
 
 interface RegenCandidateRow {
@@ -200,8 +244,6 @@ export function outpointKey(sourceChainId: bigint, sourceTxHash: ViemHex, source
   ));
 }
 
-/** Reverts that mean "this Dobbscoin output is already minted": a human must reconcile. */
-const ALREADY_MINTED = new Set(['AlreadyProcessed', 'OutpointAlreadyMinted']);
 
 /** Stable, human-readable name for a simulated revert (stable = no clock values, so it dedups). */
 export function describeRevert(err: unknown): { name: string | null; text: string } {
@@ -637,7 +679,8 @@ export class MintExecutor {
         mr.deadline,
         mr.signatures,
         sd.txid,
-        sd.vout
+        sd.vout,
+        sd.amount_sat AS deposit_value_sat
       FROM mint_requests mr
       JOIN bridge_orders bo ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
@@ -673,9 +716,16 @@ export class MintExecutor {
       sourceChainId: this.config.dobbscoinChainId,
       sourceTxHash,
       sourceVout:    row.vout,
+      // V2 signs the deposit's full value; watchers checked the DB value against their nodes.
+      ...(this.config.bridgeControllerVersion === 2 ? { sourceValue: row.deposit_value_sat ?? 0n } : {}),
       deadline:      row.deadline,
       nonce:         row.mint_nonce,
     };
+    if (this.config.bridgeControllerVersion === 2 && !row.deposit_value_sat) {
+      await this._recordSubmitError(row.order_id,
+        'no recorded deposit value (source_deposits.amount_sat) — V2 needs it as sourceValue; reconcile by hand', 'critical');
+      return;
+    }
 
     // 1. Keep only signatures that recover to their claimed signer over THIS
     //    auth. A watcher can append a signature it computed over the previous
@@ -694,9 +744,9 @@ export class MintExecutor {
       ({ request } = await this.publicClient.simulateContract({
         account: this.account,
         address: this.config.bridgeControllerAddress as ViemHex,
-        abi: BRIDGE_ABI,
+        abi: this.config.bridgeControllerVersion === 2 ? BRIDGE_ABI_V2 : BRIDGE_ABI,
         functionName: 'executeMint',
-        args: [auth, valid.map((e) => e.sig as ViemHex)],
+        args: [auth as never, valid.map((e) => e.sig as ViemHex)],
       }));
     } catch (err) {
       const { name, text } = describeRevert(err);
@@ -705,7 +755,7 @@ export class MintExecutor {
         await this._dropNonSigners(row.order_id, row.signatures, valid);
       }
       // DeadlineExpired / WrongMintNonce: the regenerator reissues it next poll.
-      const level = ALREADY_MINTED.has(name) || name === 'ImportNotSealed' ? 'critical' : 'warning';
+      const level = CRITICAL_REVERTS.has(name) ? 'critical' : 'warning';
       await this._recordSubmitError(row.order_id, text, level);
       return;
     }
@@ -752,7 +802,7 @@ export class MintExecutor {
   private async _validSignatures(
     auth: {
       depositId: ViemHex; recipient: ViemHex; amount: bigint; sourceChainId: bigint;
-      sourceTxHash: ViemHex; sourceVout: number; deadline: bigint; nonce: bigint;
+      sourceTxHash: ViemHex; sourceVout: number; sourceValue?: bigint; deadline: bigint; nonce: bigint;
     },
     sigs: Array<{ signer: string; sig: string }>,
   ): Promise<Array<{ signer: string; sig: string }>> {
@@ -766,9 +816,9 @@ export class MintExecutor {
       try {
         const recovered = await recoverTypedDataAddress({
           domain,
-          types: MINT_AUTHORIZATION_TYPES,
+          types: mintAuthorizationTypes(this.config.bridgeControllerVersion),
           primaryType: 'MintAuthorization',
-          message: auth,
+          message: auth as never,
           signature: e.sig as ViemHex,
         });
         const who = recovered.toLowerCase();
@@ -808,7 +858,8 @@ export class MintExecutor {
             && version === this.config.bridgeControllerVersion) continue;
         const got = await recoverTypedDataAddress({
           domain: { ...bridgeControllerDomain(version), verifyingContract: address as ViemHex },
-          types: MINT_AUTHORIZATION_TYPES, primaryType: 'MintAuthorization', message: auth, signature: e.sig as ViemHex,
+          types: mintAuthorizationTypes(version), primaryType: 'MintAuthorization',
+          message: (version === 2 ? auth : stripSourceValue(auth)) as never, signature: e.sig as ViemHex,
         }).catch(() => null);
         if (got && got.toLowerCase() === e.signer.toLowerCase()) return `${address} version ${version}`;
       }

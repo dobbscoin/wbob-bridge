@@ -22,6 +22,7 @@ import { RefundExecutor } from './executor/refund-executor.js';
 import { DobbscoinBackendRpc } from './dobbscoin/rpc.js';
 import { BridgeGuard } from './gnosis/bridge-guard.js';
 import { assertControllerVersion } from './gnosis/controller-version.js';
+import { RefundRecorder } from './gnosis/refund-recorder.js';
 import { AlertDispatcher } from './monitor/webhook.js';
 import { SolvencyMonitor } from './monitor/solvency-monitor.js';
 
@@ -82,7 +83,10 @@ async function main(): Promise<void> {
   const mintExecutor   = new MintExecutor(sql, config, dripSender);
   const gnosisWatcher  = new GnosisEventWatcher(sql, config);
   // Refunds of over-cap deposit excess ride the payout loop (no concurrent UTXO selection).
-  const refundExecutor = new RefundExecutor(sql, rpc, config);
+  // V2: refunds are recorded on-chain before they are sent (minted + refunded <= value).
+  const refundExecutor = new RefundExecutor(sql, rpc, config, {
+    recorder: config.bridgeControllerVersion === 2 ? new RefundRecorder(config) : null,
+  });
   const payoutExecutor = new PayoutExecutor(sql, rpc, config, refundExecutor);
   console.log(`[backend] RefundExecutor: auto-send ${config.refundsAutoSend ? 'ON' : 'OFF (REFUNDS_AUTO_SEND=false)'}`);
 

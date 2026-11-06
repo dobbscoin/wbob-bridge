@@ -89,4 +89,14 @@ describe('checkMintAgainstNode', () => {
   it('refuses when the bridge address cannot be derived (no hd_index)', () => {
     expect(checkMintAgainstNode(row({ expected_deposit_address: null }), node(), FINAL)).toMatch(/cannot derive/);
   });
+
+  it('refuses when the recorded deposit value differs from the node (it is signed as sourceValue in V2)', () => {
+    expect(checkMintAgainstNode(row({ deposit_value_sat: 100_000_001n }), node(), FINAL)).toMatch(/recorded deposit value/);
+    expect(checkMintAgainstNode(row({ deposit_value_sat: 100_000_000n }), node(), FINAL)).toBeNull();
+  });
+
+  it('V2 requires a recorded deposit value; V1 tolerates a legacy row without one', () => {
+    expect(checkMintAgainstNode(row({ deposit_value_sat: null, require_deposit_value: true }), node(), FINAL)).toMatch(/no recorded deposit value/);
+    expect(checkMintAgainstNode(row({ deposit_value_sat: null }), node(), FINAL)).toBeNull();
+  });
 });

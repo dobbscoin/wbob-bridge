@@ -55,6 +55,7 @@ interface PendingMintRow {
   source_chain_name: string;
   deposit_address:  string;
   hd_index:         number | null;
+  deposit_value_sat: bigint | null;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -128,6 +129,23 @@ async function main(): Promise<void> {
   // Polls for MINT_AUTH_CREATED orders that the backend executor created.
   // Signs any that this watcher hasn't signed yet.
 
+  // A refusal stalls that mint: record it once per order per watcher so the
+  // backend monitor can alert (WATCHER_REFUSED), instead of console-only.
+  const refusedOnce = new Set<string>();
+  async function recordRefusal(orderId: string, reason: string): Promise<void> {
+    if (refusedOnce.has(orderId)) return;
+    refusedOnce.add(orderId);
+    try {
+      await sql`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (${orderId}, 'WATCHER_REFUSED', ${InboundState.MINT_AUTH_CREATED}, ${InboundState.MINT_AUTH_CREATED},
+                ${'watcher:' + authorizer.address.toLowerCase()}, ${sql.json({ reason: reason.slice(0, 300) })})
+      `;
+    } catch (err) {
+      console.error(`[watcher] could not record refusal orderId=${orderId}:`, err);
+    }
+  }
+
   async function pollForSigningOpportunities(): Promise<void> {
     const pending = await sql<PendingMintRow[]>`
       SELECT
@@ -142,7 +160,8 @@ async function main(): Promise<void> {
         sd.vout,
         sd.source_chain_name,
         sd.deposit_address,
-        sd.hd_index
+        sd.hd_index,
+        sd.amount_sat AS deposit_value_sat
       FROM mint_requests mr
       JOIN bridge_orders bo  ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
@@ -162,15 +181,20 @@ async function main(): Promise<void> {
 
         // Independent check, per signer, at the moment of signing, against a FRESH
         // node answer (never the cache). See signing/node-check.ts.
+        const st = await txStatusFresh(row.txid);
         const why = checkMintAgainstNode(
-          { ...row, deposit_id_hex: depositIdHex, expected_deposit_address: expectedDepositAddress(row.hd_index) },
-          await txStatusFresh(row.txid),
+          { ...row, deposit_id_hex: depositIdHex, expected_deposit_address: expectedDepositAddress(row.hd_index),
+            require_deposit_value: config.bridgeControllerVersion === 2 },
+          st,
           config.finalConfirmations,
         );
         if (why !== null) {
           console.error(`[watcher] REFUSING TO SIGN orderId=${row.order_id} txid=${row.txid}: ${why}`);
+          await recordRefusal(row.order_id, why);
           continue;
         }
+        // The value we sign as sourceValue is OUR node's, already checked equal to the DB's.
+        const sourceValue = st!.outputs!.find((o) => o.n === row.vout)!.valueSat;
 
         // Dobbscoin txids are stored in the DB as raw 64-char hex (no 0x prefix —
         // native Bitcoin display form). EIP-712 bytes32 encoding needs a 0x-prefix
@@ -183,6 +207,7 @@ async function main(): Promise<void> {
           sourceChainId: config.dobbscoinChainId,
           sourceTxHash,
           sourceVout:    row.vout,
+          sourceValue,
           deadline:      row.deadline,
           nonce:         row.mint_nonce,
         };

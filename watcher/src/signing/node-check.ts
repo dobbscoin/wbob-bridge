@@ -34,6 +34,10 @@ export interface MintCheckRow {
   deposit_id_hex: string;
   /** The bridge's address at this row's hd_index, derived from the watcher's xpub (null = could not derive). */
   expected_deposit_address: string | null;
+  /** source_deposits.amount_sat: the deposit value the bridge recorded (null on legacy rows). */
+  deposit_value_sat?: bigint | string | number | null;
+  /** V2: the recorded deposit value is required and must equal the node's (it is signed as sourceValue). */
+  require_deposit_value?: boolean;
 }
 
 export function checkMintAgainstNode(
@@ -53,6 +57,11 @@ export function checkMintAgainstNode(
   if (out === undefined) return `tx has no output ${row.vout}`;
   if (out.address !== row.deposit_address) {
     return `output ${row.vout} pays ${out.address}, not ${row.deposit_address}`;
+  }
+  if (row.deposit_value_sat === null || row.deposit_value_sat === undefined) {
+    if (row.require_deposit_value) return 'no recorded deposit value for this row (needed to sign sourceValue)';
+  } else if (BigInt(row.deposit_value_sat) !== out.valueSat) {
+    return `recorded deposit value ${row.deposit_value_sat} != the node's output value ${out.valueSat}`;
   }
   const amount = BigInt(row.amount_sat);
   if (amount <= 0n) return `non-positive amount ${amount}`;

@@ -34,6 +34,7 @@ import {
 import { detectDepositSender } from '../dobbscoin/sender.js';
 import type { BackendConfig } from '../config.js';
 import { AlertDispatcher } from '../monitor/webhook.js';
+import type { RefundRecorder } from '../gnosis/refund-recorder.js';
 import type { Alert } from '../monitor/types.js';
 import { fmtBob } from './mint-capacity.js';
 
@@ -91,6 +92,12 @@ export async function nextChangeIndex(sql: Sql): Promise<number> {
 export interface RefundExecutorOptions {
   dispatcher?: Pick<AlertDispatcher, 'dispatch'>;
   txBuilder?: Pick<DobbscoinTxBuilder, 'buildRefundTx' | 'deriveChangeAddress'>;
+  /**
+   * BridgeControllerV2 only: records each refund on-chain (recordRefund) so the
+   * contract enforces minted + refunded <= value per output. When set, a refund
+   * is NEVER broadcast until V2 shows it recorded. Null/absent = V1 behavior.
+   */
+  recorder?: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded'> | null;
 }
 
 export class RefundExecutor {
@@ -111,10 +118,51 @@ export class RefundExecutor {
       webhookUrl: config.alertWebhookUrl,
       emailTo:    config.alertEmailTo,
     });
+    this.recorder = opts.recorder ?? null;
+  }
+
+  private readonly recorder: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded'> | null;
+  /** Refund ids whose on-chain record we already confirmed (or alerted on) this process. */
+  private readonly recordedIds = new Set<string>();
+  private readonly recordAlerted = new Set<string>();
+
+  // ── 0. Record refunds on V2 (BridgeControllerV2 only) ─────────────────────
+  //
+  // As soon as the bridge has decided part of a deposit will NOT be minted (a
+  // deposit_refunds row exists, in any state), V2 must know: otherwise a DB
+  // writer could later mint against those coins. Recording can only block.
+  async recordRefundsOnChain(): Promise<void> {
+    if (!this.recorder) return;
+    const rows = await this.sql<{ id: string; order_id: string; deposit_txid: string; deposit_vout: number;
+                                  deposit_amount_sat: bigint; excess_sat: bigint }[]>`
+      SELECT id, order_id, deposit_txid, deposit_vout, deposit_amount_sat, excess_sat
+      FROM deposit_refunds
+    `;
+    for (const r of rows) {
+      if (this.recordedIds.has(r.id)) continue;
+      const rec = { depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
+                    depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat };
+      try {
+        if (await this.recorder.ensureRecorded(rec)) {
+          this.recordedIds.add(r.id);
+          continue;
+        }
+      } catch (err) {
+        console.error(`[refund-executor] recordRefund failed refundId=${r.id}:`, err);
+        if (!this.recordAlerted.has(r.id)) {
+          this.recordAlerted.add(r.id);
+          await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+            message: `Could not record refund ${r.id} (order ${r.order_id}) on BridgeControllerV2: ${String(err).slice(0, 200)}. ` +
+              `The refund will NOT be sent until it is recorded (check REFUND_MARKER_ROLE and relayer gas).`,
+            data: { refundId: r.id, orderId: r.order_id } });
+        }
+      }
+    }
   }
 
   async poll(): Promise<void> {
     const jobs: Array<[string, () => Promise<void>]> = [
+      ['recordOnChain',    () => this.recordRefundsOnChain()],
       ['resolveSenders',   () => this.resolveSenders()],
       ['announceSplits',   () => this.announceSplits()],
       ['signQueued',       () => this.signQueued()],
@@ -355,6 +403,18 @@ export class RefundExecutor {
       ORDER BY r.signed_at
     `;
     for (const r of rows) {
+      // V2: never send coins back before the contract knows (else the same
+      // coins could still be minted by a DB writer).
+      if (this.recorder) {
+        const recorded = await this.recorder.isRecorded({
+          depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
+          depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat,
+        }).catch(() => false);
+        if (!recorded) {
+          console.warn(`[refund-executor] refund ${r.id} not recorded on V2 yet; holding the broadcast`);
+          continue;
+        }
+      }
       let txid: string;
       try {
         txid = await this.rpc.sendRawTransaction(r.signed_hex!);

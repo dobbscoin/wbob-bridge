@@ -259,7 +259,9 @@ export function loadConfig(): BackendConfig {
     hdWalletXpub:               requireEnv('HD_WALLET_XPUB'),
     hdWalletXpriv:              requireEnv('HD_WALLET_XPRIV'),
     dobbscoinAddressVersion:    optionalEnvInt('DOBBSCOIN_ADDRESS_VERSION', 0x00),
-    hdDerivationPath:           process.env['HD_DERIVATION_PATH'] ?? 'm/0',
+    // `||`, like the watcher: an EMPTY value must mean the default, never "" (the
+    // two would otherwise derive different addresses).
+    hdDerivationPath:           process.env['HD_DERIVATION_PATH'] || 'm/0',
     hdChangePath:               process.env['HD_CHANGE_PATH'] ?? 'm/1',
     dobbscoinRpc: {
       url:      requireEnv('DOBBSCOIN_RPC_URL'),

@@ -29,6 +29,8 @@ export interface MintAuthorization {
   sourceChainId: bigint;     // Dobbscoin numeric chain ID
   sourceTxHash:  Hex;        // Dobbscoin txid as bytes32 (zero-padded)
   sourceVout:    number;     // UTXO output index
+  /** V2 only: the deposit output's FULL value (sat), as the signer's own node reports it. */
+  sourceValue?:  bigint;
   deadline:      bigint;     // unix timestamp — authorization expiry
   nonce:         bigint;     // must equal BridgeController.mintNonce()
 }
