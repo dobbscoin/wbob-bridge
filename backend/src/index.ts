@@ -40,7 +40,9 @@ async function main(): Promise<void> {
 
   if (BridgeGuard.isEnabled(config)) {
     const guard = new BridgeGuard(config);
-    console.log('[backend] BridgeGuard enabled — emergency pause/unpause available');
+    console.log(config.bridgeControllerVersion === 2
+      ? '[backend] BridgeGuard enabled — emergency pauseAll (controller + token) available; unpause is a Safe tx'
+      : '[backend] BridgeGuard enabled — emergency pause/unpause available');
     const guardOperator = await guard.getOperator().catch(() => 'unknown');
     console.log(`[backend] BridgeGuard operator: ${guardOperator}`);
   } else {

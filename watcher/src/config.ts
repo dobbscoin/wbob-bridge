@@ -4,8 +4,8 @@
  * All required vars must be set; missing vars throw at startup (fail-fast).
  */
 
-import type { Hex, Address } from '@wbob/shared';
-import { DOBBSCOIN_CHAIN_IDS } from '@wbob/shared';
+import type { Hex, Address, BridgeControllerVersion } from '@wbob/shared';
+import { DOBBSCOIN_CHAIN_IDS, parseBridgeControllerVersion } from '@wbob/shared';
 
 export interface WatcherConfig {
   /** Bitcoin Core RPC connection. */
@@ -21,6 +21,8 @@ export interface WatcherConfig {
   watcherPrivateKey: Hex;
   /** Deployed BridgeController address on Gnosis. */
   bridgeControllerAddress: Address;
+  /** 1 = BridgeController (EIP-712 version '1'), 2 = BridgeControllerV2 (version '2'). */
+  bridgeControllerVersion: BridgeControllerVersion;
   /** How often to poll for new blocks (ms). */
   pollIntervalMs: number;
   /** Min confirmations before DEPOSIT_CONFIRMED. */
@@ -69,6 +71,7 @@ export function loadConfig(): WatcherConfig {
     databaseUrl:             requireEnv('DATABASE_URL'),
     watcherPrivateKey:       requireEnv('WATCHER_PRIVATE_KEY') as Hex,
     bridgeControllerAddress: requireEnv('BRIDGE_CONTROLLER_ADDRESS') as Address,
+    bridgeControllerVersion: parseBridgeControllerVersion(process.env['BRIDGE_CONTROLLER_VERSION']),
     pollIntervalMs:          optionalEnvInt('POLL_INTERVAL_MS', 15_000),
     minConfirmations:        optionalEnvInt('MIN_CONFIRMATIONS', 3),
     finalConfirmations:      optionalEnvInt('FINAL_CONFIRMATIONS', 6),

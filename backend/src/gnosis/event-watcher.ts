@@ -68,6 +68,13 @@ export class GnosisEventWatcher {
     });
   }
 
+  /** BRIDGE_CONTROLLER_ADDRESS plus LEGACY_BRIDGE_CONTROLLER_ADDRESSES, deduplicated. */
+  controllerAddresses(): ViemHex[] {
+    const all = [this.config.bridgeControllerAddress, ...(this.config.legacyBridgeControllerAddresses ?? [])];
+    const seen = new Set<string>();
+    return all.filter((a) => { const k = a.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }) as ViemHex[];
+  }
+
   // ── Main poll ────────────────────────────────────────────────────────────
 
   async poll(): Promise<void> {
@@ -103,7 +110,10 @@ export class GnosisEventWatcher {
       const windowEnd = candidateEnd < safeTip ? candidateEnd : safeTip;
 
       const logs = await this.publicClient.getLogs({
-        address: this.config.bridgeControllerAddress as ViemHex,
+        // The current controller plus any legacy ones still inside the
+        // confirmation buffer across a cutover (one watermark: same chain).
+        // V2 withdrawalIds include the controller address, so ids never collide.
+        address: this.controllerAddresses(),
         event: WITHDRAWAL_EVENT,
         fromBlock: windowStart,
         toBlock: windowEnd,
@@ -137,6 +147,7 @@ export class GnosisEventWatcher {
             nonce,
             burnTxHash:      log.transactionHash ?? '',
             burnBlockNumber: log.blockNumber ?? 0n,
+            controller:      (log.address ?? this.config.bridgeControllerAddress) as string,
           });
         } catch (err) {
           // Safety wins over speed (spec v2 §"poison-pill semantics").
@@ -184,6 +195,8 @@ export class GnosisEventWatcher {
     nonce:           bigint;
     burnTxHash:      string;
     burnBlockNumber: bigint;
+    /** Which controller emitted it (V1 or V2 across a cutover). */
+    controller?:     string;
   }): Promise<void> {
     const {
       withdrawalId, sender, amount, nonce,
@@ -245,6 +258,7 @@ export class GnosisEventWatcher {
             withdrawalId: withdrawalId.toString(),
             burnTxHash,
             burnBlockNumber: burnBlockNumber.toString(),
+            controller: args.controller ?? null,
             ...(dest.invalid ? { invalidDestination: true, invalidReason: dest.reason } : {}),
           })}
         )

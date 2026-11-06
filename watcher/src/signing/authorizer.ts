@@ -15,7 +15,8 @@ import { signTypedData } from 'viem/actions';
 import { createWalletClient, http } from 'viem';
 import { gnosis } from 'viem/chains';
 import {
-  BRIDGE_CONTROLLER_DOMAIN,
+  bridgeControllerDomain,
+  type BridgeControllerVersion,
   MINT_AUTHORIZATION_TYPES,
   type MintAuthorization,
   type Address,
@@ -29,6 +30,8 @@ export interface AuthorizerConfig {
   privateKey: Hex;
   /** Address of the deployed BridgeController contract (required for EIP-712 verifyingContract). */
   bridgeControllerAddress: Address;
+  /** Which controller that address is; picks the EIP-712 domain version. Default 1. */
+  bridgeControllerVersion?: BridgeControllerVersion;
 }
 
 // ─── Authorizer ───────────────────────────────────────────────────────────────
@@ -36,10 +39,12 @@ export interface AuthorizerConfig {
 export class MintAuthorizer {
   private readonly account: ReturnType<typeof privateKeyToAccount>;
   private readonly bridgeControllerAddress: Address;
+  private readonly bridgeControllerVersion: BridgeControllerVersion;
 
   constructor(config: AuthorizerConfig) {
     this.account = privateKeyToAccount(config.privateKey);
     this.bridgeControllerAddress = config.bridgeControllerAddress;
+    this.bridgeControllerVersion = config.bridgeControllerVersion ?? 1;
   }
 
   /** The EOA address corresponding to this watcher's private key. */
@@ -54,7 +59,7 @@ export class MintAuthorizer {
    */
   async sign(auth: MintAuthorization): Promise<Hex> {
     const domain = {
-      ...BRIDGE_CONTROLLER_DOMAIN,
+      ...bridgeControllerDomain(this.bridgeControllerVersion),
       verifyingContract: this.bridgeControllerAddress,
     } as const;
 

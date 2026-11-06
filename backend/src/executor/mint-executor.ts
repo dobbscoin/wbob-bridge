@@ -35,6 +35,9 @@ import {
   fallback,
   parseAbi,
   recoverTypedDataAddress,
+  keccak256,
+  encodeAbiParameters,
+  parseAbiParameters,
   BaseError,
   ContractFunctionRevertedError,
   type PublicClient,
@@ -46,7 +49,7 @@ import type { Sql, TransactionSql } from 'postgres';
 import {
   InboundState,
   assertInboundTransition,
-  BRIDGE_CONTROLLER_DOMAIN,
+  bridgeControllerDomain,
   MINT_AUTHORIZATION_TYPES,
 } from '@wbob/shared';
 import { bufferToHex } from '../db/hex.js';
@@ -81,6 +84,13 @@ export const BRIDGE_ABI = parseAbi([
   'error DeadlineExpired(uint256 deadline, uint256 blockTimestamp)',
   'error WrongMintNonce(uint256 provided, uint256 expected)',
   'error InsufficientValidSignatures(uint256 valid, uint8 threshold)',
+  // BridgeControllerV2
+  'function processedOutpoints(bytes32) view returns (bool)',
+  'error OutpointAlreadyMinted(bytes32 outpointKey)',
+  'error ExceedsWindowLimit(uint256 requested, uint256 remaining)',
+  'error ImportNotSealed()',
+  'error ZeroAmount()',
+  'error ZeroAddress()',
   // WBob.mint, bubbled up through executeMint
   'error ExceedsDailyMintLimit(uint256 requested, uint256 remaining)',
   'error ExceedsMaxSupply(uint256 requested, uint256 available)',
@@ -180,6 +190,19 @@ export function capDecisionJson(d: CapDecision): Record<string, string | boolean
   };
 }
 
+/**
+ * BridgeControllerV2's replay key for a Dobbscoin output:
+ * keccak256(abi.encode(uint256 sourceChainId, bytes32 sourceTxHash, uint32 sourceVout)).
+ */
+export function outpointKey(sourceChainId: bigint, sourceTxHash: ViemHex, sourceVout: number): ViemHex {
+  return keccak256(encodeAbiParameters(
+    parseAbiParameters('uint256, bytes32, uint32'), [sourceChainId, sourceTxHash, sourceVout],
+  ));
+}
+
+/** Reverts that mean "this Dobbscoin output is already minted": a human must reconcile. */
+const ALREADY_MINTED = new Set(['AlreadyProcessed', 'OutpointAlreadyMinted']);
+
 /** Stable, human-readable name for a simulated revert (stable = no clock values, so it dedups). */
 export function describeRevert(err: unknown): { name: string | null; text: string } {
   if (err instanceof BaseError) {
@@ -228,6 +251,7 @@ export class MintExecutor {
       this.publicClient as unknown as PublicClient,
       config.wBobAddress,
       config.bridgeControllerAddress,
+      config.bridgeControllerVersion,
     );
     this.alerts = opts.dispatcher ?? new AlertDispatcher({
       webhookUrl: config.alertWebhookUrl,
@@ -452,6 +476,28 @@ export class MintExecutor {
       );
       return;
     }
+    // V2 also keys replay on the Dobbscoin output itself. A row whose output is
+    // already minted under ANOTHER depositId (a duplicate or forged row) must
+    // not be re-authorized forever; it is exactly what V2 exists to stop.
+    if (this.config.bridgeControllerVersion === 2) {
+      const txh = (row.txid.startsWith('0x') ? row.txid : `0x${row.txid}`) as ViemHex;
+      const key = outpointKey(this.config.dobbscoinChainId, txh, row.vout);
+      const minted = await this.publicClient.readContract({
+        address: this.config.bridgeControllerAddress as ViemHex,
+        abi: BRIDGE_ABI,
+        functionName: 'processedOutpoints',
+        args: [key],
+      }) as boolean;
+      if (minted) {
+        await this._recordSubmitError(
+          row.order_id,
+          `OutpointAlreadyMinted(${key}) — Dobbscoin output ${row.txid}:${row.vout} is already minted on-chain ` +
+          `under a different depositId; this row is a duplicate or forged. Do NOT re-authorize; investigate`,
+          'critical',
+        );
+        return;
+      }
+    }
 
     const legacy = row.deposit_amount_sat === null;
     const result = await this.sql.begin(async (tx) => {
@@ -580,7 +626,8 @@ export class MintExecutor {
         AND mr.signature_count >= ${SIGNATURE_THRESHOLD}
         AND mr.gnosis_tx_hash IS NULL
         AND mr.deadline > ${(nowSec + DEADLINE_MARGIN_SECONDS).toString()}
-        AND (mr.last_submit_error IS NULL OR mr.last_submit_error NOT LIKE 'AlreadyProcessed%')
+        AND (mr.last_submit_error IS NULL OR (mr.last_submit_error NOT LIKE 'AlreadyProcessed%'
+                                              AND mr.last_submit_error NOT LIKE 'OutpointAlreadyMinted%'))
     `;
 
     for (const row of ready) {
@@ -639,7 +686,7 @@ export class MintExecutor {
         await this._dropNonSigners(row.order_id, row.signatures, valid);
       }
       // DeadlineExpired / WrongMintNonce: the regenerator reissues it next poll.
-      const level = name === 'AlreadyProcessed' ? 'critical' : 'warning';
+      const level = ALREADY_MINTED.has(name) || name === 'ImportNotSealed' ? 'critical' : 'warning';
       await this._recordSubmitError(row.order_id, text, level);
       return;
     }
@@ -691,7 +738,7 @@ export class MintExecutor {
     sigs: Array<{ signer: string; sig: string }>,
   ): Promise<Array<{ signer: string; sig: string }>> {
     const domain = {
-      ...BRIDGE_CONTROLLER_DOMAIN,
+      ...bridgeControllerDomain(this.config.bridgeControllerVersion),
       verifyingContract: this.config.bridgeControllerAddress as ViemHex,
     } as const;
     const seen = new Set<string>();

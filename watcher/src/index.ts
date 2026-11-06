@@ -68,6 +68,7 @@ async function main(): Promise<void> {
   const authorizer = new MintAuthorizer({
     privateKey: config.watcherPrivateKey,
     bridgeControllerAddress: config.bridgeControllerAddress,
+    bridgeControllerVersion: config.bridgeControllerVersion,
   });
   const submitter = new SignatureSubmitter(sql);
 
