@@ -21,6 +21,7 @@ import { PayoutExecutor } from './executor/payout-executor.js';
 import { RefundExecutor } from './executor/refund-executor.js';
 import { DobbscoinBackendRpc } from './dobbscoin/rpc.js';
 import { BridgeGuard } from './gnosis/bridge-guard.js';
+import { assertControllerVersion } from './gnosis/controller-version.js';
 import { SolvencyMonitor } from './monitor/solvency-monitor.js';
 
 async function main(): Promise<void> {
@@ -38,13 +39,18 @@ async function main(): Promise<void> {
 
   const rpc = new DobbscoinBackendRpc(config.dobbscoinRpc);
 
+  await assertControllerVersion(config);
+
   if (BridgeGuard.isEnabled(config)) {
     const guard = new BridgeGuard(config);
+    // Nothing in the backend calls emergencyPause() automatically: it is for
+    // ops scripts / a human. Say so, rather than imply automatic protection.
     console.log(config.bridgeControllerVersion === 2
-      ? '[backend] BridgeGuard enabled — emergency pauseAll (controller + token) available; unpause is a Safe tx'
-      : '[backend] BridgeGuard enabled — emergency pause/unpause available');
+      ? '[backend] BridgeGuard configured — pauseAll (controller + token) available to ops (NOT automatic); unpause is a Safe tx'
+      : '[backend] BridgeGuard configured — emergency pause/unpause available to ops (NOT automatic)');
     const guardOperator = await guard.getOperator().catch(() => 'unknown');
     console.log(`[backend] BridgeGuard operator: ${guardOperator}`);
+    for (const p of await guard.readiness()) console.error(`[backend] BridgeGuard NOT READY: ${p}`);
   } else {
     console.warn('[backend] BridgeGuard DISABLED — set BRIDGE_EXECUTOR_MODULE_ADDRESS to enable emergency pause');
   }

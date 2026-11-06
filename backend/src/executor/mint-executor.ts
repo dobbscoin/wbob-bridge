@@ -228,6 +228,9 @@ export class MintExecutor {
   private readonly capReader: MintCapReader;
   private readonly alerts: Pick<AlertDispatcher, 'dispatch'>;
   private readonly now: () => bigint;
+  /** Orders already alerted as minted-on-chain at authorization time (alert once). */
+  private readonly alertedAlreadyMinted = new Set<string>();
+  private readonly alertedWrongDomain = new Set<string>();
 
   constructor(
     private readonly sql: Sql,
@@ -315,6 +318,23 @@ export class MintExecutor {
     const mintNonce = await this._readMintNonce();
 
     for (const order of orders) {
+      // Before reserving capacity or authorizing anything: is it minted already?
+      try {
+        const reason = await this._alreadyMintedReason(bufferToHex(order.deposit_id) as ViemHex, order.txid, order.vout);
+        if (reason !== null) {
+          if (!this.alertedAlreadyMinted.has(order.order_id)) {
+            this.alertedAlreadyMinted.add(order.order_id);
+            console.error(`[executor] NOT authorizing orderId=${order.order_id}: ${reason}`);
+            await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
+              message: `Deposit ${order.txid}:${order.vout} (order ${order.order_id}) was not authorized: ${reason}`,
+              data: { orderId: order.order_id, reason } });
+          }
+          continue;
+        }
+      } catch (err) {
+        console.error(`[executor] already-minted check failed orderId=${order.order_id}; not authorizing this poll:`, err);
+        continue;
+      }
       try {
         const outcome = await this.sql.begin(async (tx) => {
           // Serialise capacity decisions bridge-wide (all backend instances).
@@ -456,47 +476,46 @@ export class MintExecutor {
     }
   }
 
+  /**
+   * Is this deposit already minted ON-CHAIN, by any controller? Returns the
+   * reason (for last_submit_error / the alert) or null. Checks the current
+   * controller's processedDeposits, V2's processedOutpoints, and every LEGACY
+   * controller's processedDeposits: a V1 mint whose tx the DB never recorded
+   * (and which an incomplete import missed) must never be re-authorized on V2.
+   */
+  private async _alreadyMintedReason(depositIdHex: ViemHex, txid: string, vout: number): Promise<string | null> {
+    const read = (address: string, functionName: 'processedDeposits' | 'processedOutpoints', arg: ViemHex) =>
+      this.publicClient.readContract({ address: address as ViemHex, abi: BRIDGE_ABI, functionName, args: [arg] }) as Promise<boolean>;
+    if (await read(this.config.bridgeControllerAddress, 'processedDeposits', depositIdHex)) {
+      return `AlreadyProcessed(${depositIdHex}) — deposit is already minted on-chain but this order never recorded the tx; reconcile by hand`;
+    }
+    if (this.config.bridgeControllerVersion === 2) {
+      const txh = (txid.startsWith('0x') ? txid : `0x${txid}`) as ViemHex;
+      const key = outpointKey(this.config.dobbscoinChainId, txh, vout);
+      if (await read(this.config.bridgeControllerAddress, 'processedOutpoints', key)) {
+        return `OutpointAlreadyMinted(${key}) — Dobbscoin output ${txid}:${vout} is already minted on-chain ` +
+          `under a different depositId; this row is a duplicate or forged. Do NOT re-authorize; investigate`;
+      }
+    }
+    for (const legacy of this.config.legacyBridgeControllerAddresses ?? []) {
+      if (await read(legacy, 'processedDeposits', depositIdHex)) {
+        return `AlreadyProcessed(${depositIdHex}) on legacy controller ${legacy} — minted there already; ` +
+          `the V2 import is missing it. Do NOT re-authorize; reconcile and import the outpoint`;
+      }
+    }
+    return null;
+  }
+
   private async _regenerate(row: RegenCandidateRow, mintNonce: bigint): Promise<void> {
     const depositIdHex = bufferToHex(row.deposit_id) as ViemHex;
 
     // Never reissue an authorization for a deposit the chain already minted
-    // (an executeMint that went out but was not recorded). A fresh auth would
-    // only revert AlreadyProcessed; a human needs to reconcile the DB.
-    const processed = await this.publicClient.readContract({
-      address: this.config.bridgeControllerAddress as ViemHex,
-      abi: BRIDGE_ABI,
-      functionName: 'processedDeposits',
-      args: [depositIdHex],
-    }) as boolean;
-    if (processed) {
-      await this._recordSubmitError(
-        row.order_id,
-        `AlreadyProcessed(${depositIdHex}) — deposit is already minted on-chain but this order never recorded the tx; reconcile by hand`,
-        'critical',
-      );
+    // (an executeMint that went out but was not recorded, a duplicate/forged
+    // row, or a legacy-controller mint). A human needs to reconcile the DB.
+    const mintedReason = await this._alreadyMintedReason(depositIdHex, row.txid, row.vout);
+    if (mintedReason !== null) {
+      await this._recordSubmitError(row.order_id, mintedReason, 'critical');
       return;
-    }
-    // V2 also keys replay on the Dobbscoin output itself. A row whose output is
-    // already minted under ANOTHER depositId (a duplicate or forged row) must
-    // not be re-authorized forever; it is exactly what V2 exists to stop.
-    if (this.config.bridgeControllerVersion === 2) {
-      const txh = (row.txid.startsWith('0x') ? row.txid : `0x${row.txid}`) as ViemHex;
-      const key = outpointKey(this.config.dobbscoinChainId, txh, row.vout);
-      const minted = await this.publicClient.readContract({
-        address: this.config.bridgeControllerAddress as ViemHex,
-        abi: BRIDGE_ABI,
-        functionName: 'processedOutpoints',
-        args: [key],
-      }) as boolean;
-      if (minted) {
-        await this._recordSubmitError(
-          row.order_id,
-          `OutpointAlreadyMinted(${key}) — Dobbscoin output ${row.txid}:${row.vout} is already minted on-chain ` +
-          `under a different depositId; this row is a duplicate or forged. Do NOT re-authorize; investigate`,
-          'critical',
-        );
-        return;
-      }
     }
 
     const legacy = row.deposit_amount_sat === null;
@@ -756,6 +775,20 @@ export class MintExecutor {
         if (who === e.signer.toLowerCase() && !seen.has(who)) {
           seen.add(who);
           out.push(e);
+        } else if (who !== e.signer.toLowerCase()) {
+          // Signed under the OTHER controller version? That's a misconfigured
+          // watcher (BRIDGE_CONTROLLER_VERSION), and every mint would stall.
+          const other = await recoverTypedDataAddress({
+            domain: { ...domain, ...bridgeControllerDomain(this.config.bridgeControllerVersion === 2 ? 1 : 2) },
+            types: MINT_AUTHORIZATION_TYPES, primaryType: 'MintAuthorization', message: auth, signature: e.sig as ViemHex,
+          }).catch(() => null);
+          if (other && other.toLowerCase() === e.signer.toLowerCase() && !this.alertedWrongDomain.has(who + e.signer)) {
+            this.alertedWrongDomain.add(who + e.signer);
+            await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
+              message: `Watcher ${e.signer} signs with the wrong EIP-712 domain version (expected ` +
+                `${this.config.bridgeControllerVersion}). Set BRIDGE_CONTROLLER_VERSION on that watcher; its signatures are ignored.`,
+              data: { signer: e.signer } });
+          }
         }
       } catch {
         // malformed signature — dropped

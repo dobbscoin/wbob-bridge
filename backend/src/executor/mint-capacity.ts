@@ -180,6 +180,10 @@ export async function outstandingReservedSat(
     FROM mint_requests mr
     JOIN bridge_orders bo ON bo.id = mr.order_id
     WHERE bo.state IN ('MINT_AUTH_CREATED', 'MINT_SUBMITTED')
+      -- Rows flagged as already minted on-chain (duplicate/forged, or a V1 leftover)
+      -- will never mint again; they must not keep shrinking everyone's capacity.
+      AND (mr.last_submit_error IS NULL OR (mr.last_submit_error NOT LIKE 'AlreadyProcessed%'
+                                            AND mr.last_submit_error NOT LIKE 'OutpointAlreadyMinted%'))
   `;
   const reservations = rows
     .filter((r) => r.order_id !== excludeOrderId)

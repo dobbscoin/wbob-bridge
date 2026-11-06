@@ -11,18 +11,24 @@
  * V1 mint can exist that is missing from the list. The script refuses to call
  * the list complete unless V1 is paused AND role-less at --to.
  *
- * Checks, any failure → exit 1 and nothing to import:
+ * Checks, any failure → exit 1, final=false, nothing to import:
+ *   - --from is at/before V1's deployment (no code at --from - 1)
+ *   - logs come from ONE pinned RPC (no fallback mixing) whose head covers latest
  *   - every log's sourceChainId == the configured Dobbscoin chain id
  *   - no outpoint appears twice (that would mean V1 itself minted it twice)
  *   - each outpoint has a source_deposits row whose mint tx hash is this log's tx
  *   - our Dobbscoin node shows the tx with that output, worth >= the minted amount
- *   - every DB mint (mint_requests.gnosis_tx_hash set) appears among the logs
+ *   - EVERY mint_requests row (recorded tx or not) that V1.processedDeposits says
+ *     is minted appears among the logs: catches a V1 mint the DB never recorded
+ *   - every DB-recorded mint tx appears among the logs
+ * final additionally requires: --to <= the 'finalized' block, V1 paused and
+ * role-less at --to AND at latest, and no V1 MintExecuted in (--to, latest].
  * Output: { ..., count, keys, batches } with batches of BATCH keys for
  * importProcessedOutpoints (each ~20k gas/key; 500 keys ≈ 10M gas).
  */
 import { writeFileSync } from 'node:fs';
 import postgres from 'postgres';
-import { createPublicClient, http, fallback, parseAbi, parseAbiItem, keccak256, toBytes, type Hex } from 'viem';
+import { createPublicClient, http, parseAbi, parseAbiItem, keccak256, toBytes, type Hex } from 'viem';
 import { gnosis } from 'viem/chains';
 import { loadConfig } from '../src/config.js';
 import { DobbscoinBackendRpc, RpcCallError } from '../src/dobbscoin/rpc.js';
@@ -48,11 +54,16 @@ async function main(): Promise<void> {
   const from = BigInt(arg('from'));
   const to = BigInt(arg('to'));
   const out = arg('out');
-  const v1 = (process.argv.includes('--v1') ? arg('v1') : process.env['V1_BRIDGE_CONTROLLER_ADDRESS']
-    ?? process.env['BRIDGE_CONTROLLER_ADDRESS']) as Hex;
-  if (!v1) throw new Error('V1 address: pass --v1 or set V1_BRIDGE_CONTROLLER_ADDRESS');
+  // Required, never inferred: after the .env flip BRIDGE_CONTROLLER_ADDRESS is V2.
+  const v1 = arg('v1') as Hex;
   const config = loadConfig();
-  const client = createPublicClient({ chain: gnosis, transport: fallback(config.gnosisRpcUrls.map((u) => http(u))) });
+  if (v1.toLowerCase() === config.bridgeControllerAddress.toLowerCase() && config.bridgeControllerVersion === 2) {
+    throw new Error('--v1 is the configured V2 controller');
+  }
+  // ONE transport for everything chain-side: a fallback could answer getLogs
+  // from a lagging node with [] and silently drop mints.
+  const rpcUrl = process.argv.includes('--rpc') ? arg('rpc') : config.gnosisRpcUrls[0]!;
+  const client = createPublicClient({ chain: gnosis, transport: http(rpcUrl) });
   const rpc = new DobbscoinBackendRpc(config.dobbscoinRpc);
   const problems: string[] = [];
 
@@ -63,10 +74,21 @@ async function main(): Promise<void> {
     address: wbob, abi: WBOB_ABI, functionName: 'hasRole',
     args: [keccak256(toBytes('BRIDGE_EXECUTOR_ROLE')), v1], blockNumber: to,
   }) as boolean;
-  const final = pausedAtTo && !roleAtTo;
-  if (!final) {
+  if (!pausedAtTo || roleAtTo) {
     problems.push(`V1 at block ${to}: paused=${pausedAtTo}, BRIDGE_EXECUTOR_ROLE=${roleAtTo}. ` +
       `Run Safe tx 1 first and pass its block as --to; otherwise V1 can still mint after this list.`);
+  }
+  const latest = await client.getBlockNumber();
+  const finalized = (await client.getBlock({ blockTag: 'finalized' })).number!;
+  if (to > finalized) problems.push(`--to ${to} is not finalized yet (finalized: ${finalized}); wait and rerun`);
+  const pausedNow = await client.readContract({ address: v1, abi: V1_ABI, functionName: 'paused' }) as boolean;
+  const roleNow = await client.readContract({
+    address: wbob, abi: WBOB_ABI, functionName: 'hasRole', args: [keccak256(toBytes('BRIDGE_EXECUTOR_ROLE')), v1],
+  }) as boolean;
+  if (!pausedNow || roleNow) problems.push(`V1 NOW (block ${latest}): paused=${pausedNow}, role=${roleNow} — it could mint again`);
+  if (from > 0n) {
+    const codeBefore = await client.getCode({ address: v1, blockNumber: from - 1n });
+    if (codeBefore && codeBefore !== '0x') problems.push(`--from ${from} is after V1's deployment: earlier mints would be missed`);
   }
 
   // ── All V1 MintExecuted logs in [from, to] ──
@@ -82,14 +104,21 @@ async function main(): Promise<void> {
     if (((s - from) / chunk) % 500n === 0n) process.stderr.write(`  scanned to block ${e}, ${logs.length} mints\n`);
   }
 
+  // ── No V1 mint may exist after --to ──
+  for (let s2 = to + 1n; s2 <= latest; s2 += chunk) {
+    const e2 = s2 + chunk - 1n < latest ? s2 + chunk - 1n : latest;
+    const late = await client.getLogs({ address: v1, event: MINT_EXECUTED, fromBlock: s2, toBlock: e2 });
+    for (const l of late) problems.push(`V1 MintExecuted AFTER --to at block ${l.blockNumber} (tx ${l.transactionHash})`);
+  }
+
   // ── DB view (read only) ──
   const sql = postgres(config.databaseUrl, { max: 1, onnotice: () => {} });
-  const dbRows = await sql.begin('read only', (tx) => tx<{ txid: string; vout: number; gnosis_tx_hash: string | null }[]>`
-    SELECT sd.txid, sd.vout, mr.gnosis_tx_hash
+  const allRows = await sql.begin('read only', (tx) => tx<{ txid: string; vout: number; gnosis_tx_hash: string | null; deposit_id: string }[]>`
+    SELECT sd.txid, sd.vout, mr.gnosis_tx_hash, encode(mr.deposit_id, 'hex') AS deposit_id
     FROM mint_requests mr JOIN source_deposits sd ON sd.order_id = mr.order_id
-    WHERE mr.gnosis_tx_hash IS NOT NULL
   `);
   await sql.end();
+  const dbRows = allRows.filter((r) => r.gnosis_tx_hash !== null);
   const dbByOutpoint = new Map(dbRows.map((r) => [`${r.txid.replace(/^0x/, '').toLowerCase()}:${r.vout}`, r]));
 
   // ── Per-log checks ──
@@ -126,12 +155,28 @@ async function main(): Promise<void> {
       problems.push(`DB mint ${r.txid}:${r.vout} (tx ${r.gnosis_tx_hash}) has no V1 MintExecuted in [${from}, ${to}]`);
     }
   }
+  // Every row V1 itself says is minted — INCLUDING rows whose mint tx the DB
+  // never recorded — must be in the list, or V2 could mint that output again.
+  const PROCESSED_ABI = parseAbi(['function processedDeposits(bytes32) view returns (bool)']);
+  for (const r of allRows) {
+    const minted = await client.readContract({
+      address: v1, abi: PROCESSED_ABI, functionName: 'processedDeposits', args: [`0x${r.deposit_id}` as Hex], blockNumber: to,
+    }) as boolean;
+    const op = `${r.txid.replace(/^0x/, '').toLowerCase()}:${r.vout}`;
+    const key = outpointKey(config.dobbscoinChainId, (`0x${r.txid.replace(/^0x/, '')}`) as Hex, r.vout);
+    if (minted && !seen.has(key)) problems.push(`${op}: V1.processedDeposits=true but NOT in the logs (unrecorded mint?)`);
+    if (!minted && r.gnosis_tx_hash) problems.push(`${op}: DB has mint tx ${r.gnosis_tx_hash} but V1.processedDeposits=false`);
+  }
 
   const batches: Hex[][] = [];
   for (let i = 0; i < keys.length; i += BATCH) batches.push(keys.slice(i, i + BATCH));
+  const final = problems.length === 0;
   writeFileSync(out, JSON.stringify({
-    v1, wbob, fromBlock: from.toString(), toBlock: to.toString(), final,
-    count: keys.length, dbMintCount: dbRows.length, problems, keys, batches,
+    v1, wbob, rpcUrl, fromBlock: from.toString(), toBlock: to.toString(), finalizedBlock: finalized.toString(),
+    latestBlock: latest.toString(), final,
+    count: keys.length, dbMintCount: dbRows.length, dbRowsChecked: allRows.length, problems,
+    // Never hand out import batches from a list that is not final.
+    keys: final ? keys : [], batches: final ? batches : [],
   }, null, 2));
   console.log(`V1 mints: ${logs.length}, unique outpoints: ${keys.length}, DB mints: ${dbRows.length}, ` +
     `batches: ${batches.length}, final: ${final}, problems: ${problems.length} → ${out}`);

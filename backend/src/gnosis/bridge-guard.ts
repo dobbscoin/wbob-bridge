@@ -24,11 +24,17 @@ import {
   http,
   fallback,
   parseAbi,
+  parseEventLogs,
   type Hex as ViemHex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { gnosis } from 'viem/chains';
 import type { BackendConfig } from '../config.js';
+
+const MODULE_EVENTS_ABI = parseAbi([
+  'event EmergencyPaused(address indexed triggeredBy, bool controllerPaused, bool tokenPaused)',
+  'event PauseFailed(address indexed target)',
+]);
 
 const MODULE_ABI = parseAbi([
   'function pause() external',
@@ -54,8 +60,11 @@ export class BridgeGuard {
     if (this.v2 && !config.emergencyOperatorPrivateKey) {
       console.warn('[bridge-guard] EMERGENCY_OPERATOR_PRIVATE_KEY unset: using the executor key for a module that can freeze the token');
     }
+    // The separate key belongs to V2's module only. On V1 the module operator
+    // is the executor key, so staging EMERGENCY_OPERATOR_PRIVATE_KEY early must
+    // not change V1's pause.
     this.account = privateKeyToAccount(
-      (config.emergencyOperatorPrivateKey ?? config.executorPrivateKey) as ViemHex,
+      ((this.v2 ? config.emergencyOperatorPrivateKey : null) ?? config.executorPrivateKey) as ViemHex,
     );
 
     this.publicClient = createPublicClient({
@@ -85,10 +94,25 @@ export class BridgeGuard {
         functionName: this.v2 ? 'pauseAll' : 'pause',
       });
       console.error(`[bridge-guard] pause tx submitted: ${txHash}`);
-      await this.publicClient.waitForTransactionReceipt({ hash: txHash });
-      console.error(this.v2
-        ? '[bridge-guard] BridgeControllerV2 + wBOB token PAUSED via module (check EmergencyPaused event per target)'
-        : '[bridge-guard] BridgeController PAUSED via module');
+      const rc = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+      if (rc.status !== 'success') {
+        console.error(`[bridge-guard] PAUSE TX REVERTED (${txHash}): nothing was paused. Pause via the Safe NOW.`);
+        return;
+      }
+      if (!this.v2) {
+        console.error('[bridge-guard] BridgeController PAUSED via module');
+        return;
+      }
+      const events = parseEventLogs({ abi: MODULE_EVENTS_ABI, logs: rc.logs });
+      const done = events.find((e) => e.eventName === 'EmergencyPaused')?.args as
+        { controllerPaused: boolean; tokenPaused: boolean } | undefined;
+      const failed = events.filter((e) => e.eventName === 'PauseFailed').map((e) => (e.args as { target: string }).target);
+      if (done?.controllerPaused && done?.tokenPaused) {
+        console.error('[bridge-guard] BridgeControllerV2 + wBOB token PAUSED via module');
+      } else {
+        console.error(`[bridge-guard] PARTIAL PAUSE: controller=${done?.controllerPaused ?? '?'} token=${done?.tokenPaused ?? '?'}` +
+          ` failed=[${failed.join(', ')}]. Pause the rest via the Safe NOW.`);
+      }
     } catch (err) {
       console.error('[bridge-guard] FAILED to pause via module:', err);
     }
@@ -126,6 +150,25 @@ export class BridgeGuard {
       abi: MODULE_ABI,
       functionName: 'operator',
     }) as Promise<string>;
+  }
+
+  /**
+   * Startup check: the module's operator must be the key we hold, and it needs
+   * xDAI for gas. Returns problems (empty = ready); never throws.
+   */
+  async readiness(): Promise<string[]> {
+    const problems: string[] = [];
+    try {
+      const op = (await this.getOperator()).toLowerCase();
+      if (op !== this.account.address.toLowerCase()) {
+        problems.push(`module operator is ${op} but this backend holds ${this.account.address}: a pause would revert OnlyOperator`);
+      }
+      const bal = await this.publicClient.getBalance({ address: this.account.address });
+      if (bal === 0n) problems.push(`operator ${this.account.address} has 0 xDAI: a pause cannot pay gas`);
+    } catch (err) {
+      problems.push(`could not read module/operator: ${String(err).slice(0, 160)}`);
+    }
+    return problems;
   }
 
   /** True if the module is configured (non-null address in config). */
