@@ -19,6 +19,7 @@
  *   7. Log ordering                — `it('test 7 — defensive sort ...')`
  *   8. First-event-in-first-window — `it('test 8 — first-event-in-first ...')`
  *   9. Halt-state recording        — `it('test 9 — halt-state across polls ...')`
+ *  10. Poison destination          — `it('test 10 — poison destination ...')`
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
@@ -444,5 +445,54 @@ describe('GnosisEventWatcher.processNewWithdrawals', () => {
     expect(await getState('gnosis_scan_halt_count')).toBeNull();
     expect(await getState('gnosis_scan_halt_withdrawal_id')).toBeNull();
     expect(await getState('gnosis_scan_halt_last_error')).toBeNull();
+  });
+
+  // ── 10 — Poison destination (2026-11-05) ──────────────────────────────────
+  // requestWithdrawal(1, "\x00") used to fail _createWithdrawalOrder on every
+  // poll (Postgres rejects NUL in TEXT), halting ingestion for everyone.
+  it('test 10 — poison destination: NUL and oversize addresses are recorded as INVALID, flagged in audit, and do not halt the scan', async () => {
+    const config = makeConfig();
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(300_012n);
+    await setLastBlock(299_997n);                       // window [299_998, 300_000]
+    mock.setLogsForRange(299_998n, 300_000n, [
+      makeLog(299_998n, 10n, { dobbscoinAddress: '\u0000' }),
+      makeLog(299_999n, 11n, { dobbscoinAddress: 'A'.repeat(100_000) }),
+      makeLog(300_000n, 12n),                           // a normal withdrawal after the poison
+    ]);
+
+    const watcher = makeWatcher(config, mock);
+    const run = () => (watcher as unknown as { processNewWithdrawals: () => Promise<void> }).processNewWithdrawals();
+    await run();
+
+    expect(await getState('gnosis_last_block')).toBe('300000');      // not halted
+    expect(await getState('gnosis_scan_halt_count')).toBeNull();
+    expect(await countWithdrawals()).toBe(3);
+
+    const rows = await sql<{ withdrawal_id: string; dobbscoin_address: string; bo_addr: string }[]>`
+      SELECT wr.withdrawal_id, wr.dobbscoin_address, bo.user_dobbscoin_address AS bo_addr
+      FROM withdrawal_requests wr JOIN bridge_orders bo ON bo.id = wr.order_id
+      ORDER BY wr.withdrawal_id
+    `;
+    expect(rows.map((r) => r.dobbscoin_address)).toEqual([
+      'INVALID:00',
+      'INVALID:' + '41'.repeat(64) + '..(+99936B)',
+      '1L9YGqctBWaCmn7y8d8CBkTXzXXZ4EAECN',                         // untouched
+    ]);
+    expect(rows.every((r) => r.bo_addr === r.dobbscoin_address)).toBe(true);
+
+    const flagged = await sql<{ wid: string; reason: string }[]>`
+      SELECT metadata->>'withdrawalId' AS wid, metadata->>'invalidReason' AS reason
+      FROM audit_events WHERE (metadata->>'invalidDestination')::boolean IS TRUE ORDER BY 1
+    `;
+    expect(flagged).toEqual([
+      { wid: '10', reason: 'contains a NUL byte' },
+      { wid: '11', reason: 'too long (100000 bytes)' },
+    ]);
+
+    // Re-scanning the same range is idempotent.
+    await setLastBlock(299_997n);
+    await run();
+    expect(await countWithdrawals()).toBe(3);
   });
 });

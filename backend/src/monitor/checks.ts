@@ -163,6 +163,33 @@ export function buildAlerts(
   return alerts;
 }
 
+// ─── checkManualReview ───────────────────────────────────────────────────────
+
+export interface ManualReviewOrder { id: string; orderType: string; since: string; reason: string | null }
+
+/**
+ * MANUAL_REVIEW is excluded from STUCK_ORDERS and solvency obligations, so
+ * without this an order parked there (unpayable withdrawal destination, failed
+ * payout broadcast, ...) is silent forever. Independent of the supply read, so
+ * it also fires while SUPPLY_READ_STALE suppresses buildAlerts. The caller
+ * repeats it per cooldown, and skips the cooldown when the count goes up.
+ * Sample = newest first, kept short so the Discord post (2000 chars) is whole.
+ */
+export function checkManualReview(count: number, newest: ManualReviewOrder[], ts: string): Alert[] {
+  if (count <= 0) return [];
+  const lines = newest.map((o) =>
+    `${o.orderType} ${o.id} since ${o.since}${o.reason ? `: ${o.reason.slice(0, 120)}` : ''}`);
+  return [{
+    level: 'warning',
+    type: 'MANUAL_REVIEW_ORDERS',
+    timestamp: ts,
+    message:
+      `${count} order(s) waiting in MANUAL_REVIEW; nothing moves them but an operator. ` +
+      `Newest: ${lines.join(' | ')}${count > newest.length ? ` | +${count - newest.length} older` : ''}`,
+    data: { manualReviewCount: count, newest },
+  }];
+}
+
 // ─── checkDripWalletBalance ──────────────────────────────────────────────────
 
 /**

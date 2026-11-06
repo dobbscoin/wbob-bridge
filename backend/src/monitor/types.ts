@@ -20,7 +20,8 @@ export type AlertType =
   | 'REFUND_CONFIRMED'     // refund reached the confirmation threshold
   | 'REFUND_NEEDS_ATTENTION' // refund parked: sender undeterminable or tx refused
   | 'MINT_SUBMIT_BLOCKED'  // executeMint simulation reverted; mint held, reason recorded
-  | 'MINT_AUTH_REGENERATED'; // an expired / stale-nonce authorization was reissued
+  | 'MINT_AUTH_REGENERATED' // an expired / stale-nonce authorization was reissued
+  | 'MANUAL_REVIEW_ORDERS'; // orders parked in MANUAL_REVIEW: excluded from every other check, need an operator
 
 export interface Alert {
   level: AlertLevel;
@@ -50,6 +51,8 @@ export interface SolvencySnapshot {
   isSolvent: boolean;
   /** Number of orders stuck in non-terminal state past the configured threshold. */
   stuckOrderCount: number;
+  /** Orders in MANUAL_REVIEW (terminal for every other check; nothing moves them but an operator). */
+  manualReviewCount?: number;
   /** Where wBobSupplySat came from on this cycle. */
   supplySource: 'chain' | 'db-estimate';
   /**

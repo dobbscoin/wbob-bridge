@@ -34,6 +34,7 @@ import { gnosis } from 'viem/chains';
 import type { Sql } from 'postgres';
 import { OutboundState, assertOutboundTransition } from '@wbob/shared';
 import type { BackendConfig } from '../config.js';
+import { sanitizeDobbscoinDestination } from './destination.js';
 
 // ─── ABI ─────────────────────────────────────────────────────────────────────
 
@@ -185,16 +186,20 @@ export class GnosisEventWatcher {
     burnBlockNumber: bigint;
   }): Promise<void> {
     const {
-      withdrawalId, sender, amount, dobbscoinAddress, nonce,
+      withdrawalId, sender, amount, nonce,
       burnTxHash, burnBlockNumber,
     } = args;
+    // The destination string is attacker-chosen; a value Postgres can't store
+    // would fail this method forever and halt the scanner for everyone.
+    const dest = sanitizeDobbscoinDestination(args.dobbscoinAddress);
+    const dobbscoinAddress = dest.value;
 
-    await this.sql.begin(async (tx) => {
+    const inserted = await this.sql.begin(async (tx) => {
       // Idempotency: skip if already recorded
       const existing = await tx<{ id: string }[]>`
         SELECT id FROM withdrawal_requests WHERE withdrawal_id = ${withdrawalId.toString()}
       `;
-      if (existing.length > 0) return;
+      if (existing.length > 0) return null;
 
       // Create bridge_order
       const orderRows = await tx<{ id: string }[]>`
@@ -240,12 +245,25 @@ export class GnosisEventWatcher {
             withdrawalId: withdrawalId.toString(),
             burnTxHash,
             burnBlockNumber: burnBlockNumber.toString(),
+            ...(dest.invalid ? { invalidDestination: true, invalidReason: dest.reason } : {}),
           })}
         )
       `;
+      return orderId;
     });
 
+    if (inserted === null) return;
     console.log(`[gnosis-watcher] recorded withdrawal withdrawalId=${withdrawalId}`);
+
+    if (dest.invalid) {
+      // No alert from here on purpose: anything awaited in the scan loop can
+      // stall ingestion. The payout step parks this order in MANUAL_REVIEW and
+      // the solvency monitor alerts (MANUAL_REVIEW_ORDERS) until it is resolved.
+      console.error(
+        `[gnosis-watcher] INVALID withdrawal destination withdrawalId=${withdrawalId} order=${inserted} ` +
+        `sender=${sender} amountSat=${amount} burnTx=${burnTxHash} (${dest.reason}); stored as ${dest.value}`,
+      );
+    }
   }
 
   // ── Confirm burns that have reached depth ────────────────────────────────

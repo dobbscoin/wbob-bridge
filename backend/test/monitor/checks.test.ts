@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { checkSolvency, checkStuckOrders, buildAlerts } from '../../src/monitor/checks.js';
+import { checkSolvency, checkStuckOrders, buildAlerts, checkManualReview } from '../../src/monitor/checks.js';
 import type { SolvencySnapshot } from '../../src/monitor/types.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -277,5 +277,43 @@ describe('buildAlerts', () => {
     expect(alerts.find((a) => a.type === 'SOLVENCY_BREACH')).toBeDefined();
     // RECOVERED should NOT fire while still insolvent
     expect(alerts.find((a) => a.type === 'SOLVENCY_RECOVERED')).toBeUndefined();
+  });
+});
+
+// ─── MANUAL_REVIEW_ORDERS (2026-11-05) ───────────────────────────────────────
+
+describe('checkManualReview', () => {
+  const TS = '2026-11-06T00:00:00.000Z';
+
+  it('no alert when nothing is in MANUAL_REVIEW', () => {
+    expect(checkManualReview(0, [], TS)).toEqual([]);
+  });
+
+  it('is not part of buildAlerts, so a stale supply read cannot suppress it', () => {
+    expect(buildAlerts(makeSnapshot({ manualReviewCount: 3 }), true, LOW_THRESHOLD)
+      .find((a) => a.type === 'MANUAL_REVIEW_ORDERS')).toBeUndefined();
+  });
+
+  it('names the newest orders with their recorded error, and counts the rest', () => {
+    const [a] = checkManualReview(12, [
+      { id: 'o-new', orderType: 'outbound', since: '2026-11-05T02:00:00.000Z', reason: 'invalid withdrawal destination (sanitized at ingest; ...): INVALID:00' },
+      { id: 'o-old', orderType: 'outbound', since: '2026-11-05T01:00:00.000Z', reason: null },
+    ], TS);
+    expect(a!.type).toBe('MANUAL_REVIEW_ORDERS');
+    expect(a!.level).toBe('warning');
+    expect(a!.message).toContain('12 order(s) waiting in MANUAL_REVIEW');
+    expect(a!.message.indexOf('o-new')).toBeLessThan(a!.message.indexOf('o-old'));
+    expect(a!.message).toContain('INVALID:00');
+    expect(a!.message).toContain('+10 older');
+  });
+
+  it('fits a Discord post: 5 orders with long errors stay under 2000 chars', () => {
+    const long = 'x'.repeat(5000);
+    const newest = Array.from({ length: 5 }, (_, i) => ({
+      id: `00000000-0000-0000-0000-00000000000${i}`, orderType: 'outbound', since: TS, reason: long,
+    }));
+    const [a] = checkManualReview(999, newest, TS);
+    expect(a!.message.length).toBeLessThan(2000);
+    expect(a!.message).toContain('+994 older');
   });
 });

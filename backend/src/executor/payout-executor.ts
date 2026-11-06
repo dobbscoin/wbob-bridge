@@ -19,6 +19,7 @@ import type { DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
 import { DobbscoinTxBuilder, type UtxoInput } from '../dobbscoin/tx-builder.js';
 import type { BackendConfig } from '../config.js';
 import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
+import { unpayableDestinationReason } from '../gnosis/destination.js';
 
 const PAYOUT_MIN_CONFIRMATIONS = 3;
 
@@ -113,6 +114,18 @@ export class PayoutExecutor {
     `;
 
     for (const row of queued) {
+      const unpayable = unpayableDestinationReason(row.dobbscoin_address);
+      if (unpayable !== null) {
+        console.error(`[payout-executor] orderId=${row.order_id}: ${unpayable}`);
+        try {
+          await this._transitionOutbound(
+            row.order_id, OutboundState.PAYOUT_QUEUED, OutboundState.MANUAL_REVIEW, { error: unpayable },
+          );
+        } catch (err) {
+          console.error(`[payout-executor] park error orderId=${row.order_id}:`, err);
+        }
+        continue;
+      }
       try {
         await this._buildAndSignPayout(row);
       } catch (err) {

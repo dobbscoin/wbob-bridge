@@ -22,7 +22,7 @@ import { gnosis } from 'viem/chains';
 import type { Sql } from 'postgres';
 import type { BackendConfig } from '../config.js';
 import type { Alert,SolvencySnapshot, AlertType } from './types.js';
-import { checkSolvency, checkStuckOrders, buildAlerts, checkDripWalletBalance, checkScanHalt } from './checks.js';
+import { checkSolvency, checkStuckOrders, buildAlerts, checkDripWalletBalance, checkScanHalt, checkManualReview, type ManualReviewOrder } from './checks.js';
 import { AlertDispatcher } from './webhook.js';
 import type { DripSender } from '../executor/drip-sender.js';
 import type { DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
@@ -41,6 +41,8 @@ export class SolvencyMonitor {
   private lastKnownSolvent: boolean | null = null;
   /** Epoch-ms of the last dispatch per alert type (for cooldown). */
   private readonly alertCooldowns = new Map<AlertType, number>();
+  /** MANUAL_REVIEW count at the last successful read (null = not read yet). */
+  private lastManualReviewCount: number | null = null;
 
   constructor(
     private readonly sql: Sql,
@@ -137,6 +139,35 @@ export class SolvencyMonitor {
       stuckThresholdMs,
     );
 
+    // 4b. MANUAL_REVIEW is terminal for every check above; read it separately.
+    // Guarded: a failure here must not cost the cycle's other alerts.
+    let manualReviewCount: number | null = null;
+    let manualReviewNewest: ManualReviewOrder[] = [];
+    try {
+      const cnt = await this.sql<{ c: number }[]>`
+        SELECT count(*)::int AS c FROM bridge_orders WHERE state = 'MANUAL_REVIEW'
+      `;
+      manualReviewCount = cnt[0]!.c;
+      if (manualReviewCount > 0) {
+        const rows = await this.sql<{ id: string; order_type: string; updated_at: Date; reason: string | null }[]>`
+          SELECT bo.id, bo.order_type, bo.updated_at, r.reason
+          FROM (SELECT id, order_type, updated_at FROM bridge_orders
+                WHERE state = 'MANUAL_REVIEW' ORDER BY updated_at DESC LIMIT 5) bo
+          LEFT JOIN LATERAL (
+            SELECT ae.metadata->>'error' AS reason FROM audit_events ae
+            WHERE ae.order_id = bo.id AND ae.to_state = 'MANUAL_REVIEW'
+            ORDER BY ae.id DESC LIMIT 1
+          ) r ON true
+          ORDER BY bo.updated_at DESC
+        `;
+        manualReviewNewest = rows.map((r) => ({
+          id: r.id, orderType: r.order_type, since: r.updated_at.toISOString(), reason: r.reason,
+        }));
+      }
+    } catch (err) {
+      console.error('[solvency-monitor] MANUAL_REVIEW read failed:', err);
+    }
+
     // 5. Build snapshot
     const { isSolvent, coverageRatio } = checkSolvency(
       wBobSupplySat,
@@ -152,6 +183,7 @@ export class SolvencyMonitor {
       coverageRatio,
       isSolvent,
       stuckOrderCount: stuckIds.length,
+      ...(manualReviewCount === null ? {} : { manualReviewCount }),
       supplySource,
       supplyIsStale,
       chainTipAgeSec,
@@ -238,6 +270,14 @@ export class SolvencyMonitor {
       }
     }
 
+    // ── MANUAL_REVIEW (independent of the supply read) ───────────────────────
+    let manualReviewRose = false;
+    if (manualReviewCount !== null) {
+      alerts.push(...checkManualReview(manualReviewCount, manualReviewNewest, checkedAt));
+      manualReviewRose = this.lastManualReviewCount !== null && manualReviewCount > this.lastManualReviewCount;
+      this.lastManualReviewCount = manualReviewCount;
+    }
+
     // ── Gnosis log-scan halt (independent observer of the watcher's state) ──
     // The watcher records halt facts to bridge_state when _createWithdrawalOrder
     // fails; this check reads those facts on the monitor's cadence and decides
@@ -299,7 +339,9 @@ export class SolvencyMonitor {
     const now = Date.now();
     for (const alert of alerts) {
       const lastFired = this.alertCooldowns.get(alert.type) ?? 0;
-      if (now - lastFired >= this.config.alertCooldownMs) {
+      // A NEW order entering MANUAL_REVIEW is news; don't sit on it for a cooldown.
+      const bypass = alert.type === 'MANUAL_REVIEW_ORDERS' && manualReviewRose;
+      if (bypass || now - lastFired >= this.config.alertCooldownMs) {
         this.alertCooldowns.set(alert.type, now);
         await this.dispatcher.dispatch(alert);
       }
