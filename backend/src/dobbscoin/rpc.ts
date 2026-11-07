@@ -145,6 +145,15 @@ export class DobbscoinBackendRpc {
     return pool.includes(txid);
   }
 
+  /**
+   * Whether the output is still unspent, counting spends in the mempool
+   * (gettxout with include_mempool=true returns null for a spent output).
+   */
+  async isUnspent(txid: string, vout: number): Promise<boolean> {
+    const r = await this.call<unknown>('gettxout', [txid, vout, true]);
+    return r !== null && r !== undefined;
+  }
+
   /** Returns confirmations for a txid. Returns 0 if unconfirmed, -1 if not found. */
   async getConfirmations(txid: string): Promise<number> {
     type RawTx = { confirmations?: number };

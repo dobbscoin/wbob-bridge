@@ -26,7 +26,6 @@
 import {
   createPublicClient,
   http,
-  fallback,
   parseAbiItem,
   type Hex as ViemHex,
 } from 'viem';
@@ -35,6 +34,7 @@ import type { Sql } from 'postgres';
 import { OutboundState, assertOutboundTransition } from '@wbob/shared';
 import type { BackendConfig } from '../config.js';
 import { sanitizeDobbscoinDestination } from './destination.js';
+import { AlertDispatcher } from '../monitor/webhook.js';
 
 // ─── ABI ─────────────────────────────────────────────────────────────────────
 
@@ -62,25 +62,113 @@ export class GnosisEventWatcher {
   ) {
     this.publicClient = createPublicClient({
       chain: gnosis,
-      // READ path: fallback() across the ordered RPC list so reads survive the
-      // node going down. Writers stay pinned to gnosisRpcUrl — see config.ts.
-      transport: fallback(config.gnosisRpcUrls.map((u) => http(u))),
+      // Pinned to OUR node (review round 7 #3). Through fallback(), the tip
+      // could come from one endpoint and the logs from a lagging public one
+      // that clamps the range and answers [] : the watermark then moved past
+      // real burns and those withdrawals were never paid, with no alert. If
+      // the node is down, ingestion waits (payouts need it for the burn check
+      // anyway) and the stall alert below fires.
+      transport: http(config.gnosisRpcUrl),
     });
+    this.alerts = new AlertDispatcher({ webhookUrl: config.alertWebhookUrl, emailTo: config.alertEmailTo });
+  }
+
+  private readonly alerts: AlertDispatcher;
+  /** Last time processNewWithdrawals completed (null = not yet). */
+  private lastScanOk: number | null = null;
+  private readonly startedAt = Date.now();
+  private stallAlerted = false;
+  /** The recount's own cursor: in memory, so a DB writer cannot move it. */
+  private recountCursor: bigint | null = null;
+
+  /**
+   * Independent recount (review round 7 #3): re-reads every WithdrawalRequested
+   * of the controller from GNOSIS_START_BLOCK with its own in-memory cursor and
+   * checks each one up to the DB watermark has a withdrawal_requests row. A
+   * missing one (skipped by a bad RPC answer, a watermark moved by a DB writer,
+   * or a deleted row) is ingested now and alerted. Re-ingesting a burn that was
+   * already paid is safe: the payout step refuses it (already-paid check).
+   */
+  async recount(): Promise<void> {
+    const watermark = BigInt(await this._getState('gnosis_last_block'));
+    const tip = (await this.publicClient.getBlockNumber()) - BigInt(this.config.gnosisConfirmationDepth);
+    const end = watermark < tip ? watermark : tip;
+    let from = this.recountCursor ?? this.config.gnosisStartBlock;
+    const chunk = BigInt(this.config.gnosisLogScanChunk);
+    const missing: string[] = [];
+    while (from <= end) {
+      const to = from + chunk - 1n < end ? from + chunk - 1n : end;
+      const logs = await this.publicClient.getLogs({
+        address: this.config.bridgeControllerAddress as ViemHex, event: WITHDRAWAL_EVENT, fromBlock: from, toBlock: to,
+      });
+      if (logs.length > 0) {
+        const ids = logs.map((l) => (l.args as { withdrawalId: bigint }).withdrawalId.toString());
+        const have = new Set((await this.sql<{ withdrawal_id: string }[]>`
+          SELECT withdrawal_id::text FROM withdrawal_requests WHERE withdrawal_id IN ${this.sql(ids)}
+        `).map((r) => r.withdrawal_id));
+        for (const log of logs) {
+          const a = log.args as { withdrawalId: bigint; sender: string; amount: bigint; dobbscoinAddress: string; nonce: bigint };
+          if (have.has(a.withdrawalId.toString())) continue;
+          missing.push(`${a.withdrawalId} (block ${log.blockNumber}, tx ${log.transactionHash})`);
+          await this._createWithdrawalOrder({
+            withdrawalId: a.withdrawalId, sender: a.sender, amount: a.amount, dobbscoinAddress: a.dobbscoinAddress,
+            nonce: a.nonce, burnTxHash: log.transactionHash ?? '', burnBlockNumber: log.blockNumber ?? 0n,
+          });
+        }
+      }
+      this.recountCursor = to + 1n;
+      from = to + 1n;
+    }
+    if (missing.length > 0) {
+      await this._alert(`${missing.length} burned withdrawal(s) were missing from the database below the scan ` +
+        `watermark and have been ingested now: ${missing.slice(0, 5).join(', ')}. Either an RPC answered wrong or ` +
+        `the DB was edited; check how they went missing.`, { missing: missing.slice(0, 20) });
+    }
+  }
+
+  private async _alert(message: string, data: Record<string, unknown>): Promise<void> {
+    try {
+      await this.alerts.dispatch({ level: 'critical', type: 'GNOSIS_SCAN_HALTED', timestamp: new Date().toISOString(), message, data });
+    } catch (err) {
+      console.error('[gnosis-watcher] alert failed:', err);
+    }
+  }
+
+  /** One critical alert when no scan has completed for 30 min; re-armed by the next success. */
+  private async _checkStall(): Promise<void> {
+    const since = this.lastScanOk ?? this.startedAt;
+    if (Date.now() - since < 30 * 60_000 || this.stallAlerted) return;
+    this.stallAlerted = true;
+    await this._alert(`Withdrawal ingestion has not completed a scan for ${Math.round((Date.now() - since) / 60_000)} min ` +
+      `(our Gnosis node ${this.config.gnosisRpcUrl.replace(/\/\/[^@/]*@/, '//')} down or erroring?). Burns are not being picked up.`, {});
   }
 
   // ── Main poll ────────────────────────────────────────────────────────────
 
   async poll(): Promise<void> {
     await this.processNewWithdrawals();
+    this.lastScanOk = Date.now();
+    this.stallAlerted = false;
     await this.confirmPendingBurns();
   }
 
   async start(): Promise<void> {
     console.log('[gnosis-watcher] started');
+    void this._recountLoop();
     while (true) {
       try { await this.poll(); }
       catch (err) { console.error('[gnosis-watcher] poll error:', err); }
+      await this._checkStall();
       await new Promise<void>((r) => setTimeout(r, this.config.executorPollIntervalMs));
+    }
+  }
+
+  /** Recount every 10 min, on its own loop so a slow full pass never delays ingestion. */
+  private async _recountLoop(): Promise<void> {
+    while (true) {
+      try { await this.recount(); }
+      catch (err) { console.error('[gnosis-watcher] recount failed (retrying next round):', err); }
+      await new Promise<void>((r) => setTimeout(r, 10 * 60_000));
     }
   }
 

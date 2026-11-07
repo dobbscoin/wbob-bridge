@@ -102,6 +102,11 @@ export interface BackendConfig {
    */
   gnosisLogScanChunk: number;
   /**
+   * First Gnosis block the withdrawal recount reads from (env GNOSIS_START_BLOCK;
+   * default: BridgeController V1's deployment block).
+   */
+  gnosisStartBlock: bigint;
+  /**
    * Consecutive halted polls before the solvency monitor raises a
    * GNOSIS_SCAN_HALTED alert. The watcher writes halt-state into bridge_state
    * on every failed scan; the monitor observes that state on its own cadence.
@@ -257,6 +262,7 @@ export function loadConfig(): BackendConfig {
     executorPollIntervalMs:     optionalEnvInt('EXECUTOR_POLL_INTERVAL_MS', 15_000),
     gnosisConfirmationDepth:    optionalEnvInt('GNOSIS_CONFIRMATION_DEPTH', 12),
     gnosisLogScanChunk:         optionalEnvInt('GNOSIS_LOG_SCAN_CHUNK', 1000),
+    gnosisStartBlock:           BigInt(optionalEnvInt('GNOSIS_START_BLOCK', 45_811_925)),
     gnosisScanHaltAlertThreshold: optionalEnvInt('GNOSIS_SCAN_HALT_ALERT_THRESHOLD', 10),
     dobbscoinNetwork:           network,
     dobbscoinChainId:           DOBBSCOIN_CHAIN_IDS[network],

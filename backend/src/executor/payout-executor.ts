@@ -307,6 +307,8 @@ export class PayoutExecutor {
           WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${row.withdrawal_id}
           UNION SELECT ${row.order_id}::uuid)
     `;
+    const hexOf = new Map<string, string>();
+    for (const e of signed) if (e.hex) hexOf.set(e.txid ?? txidFromRawHex(e.hex), e.hex);
     const seen = new Set<string>();
     for (const e of signed) {
       const t = e.txid ?? (e.hex ? txidFromRawHex(e.hex) : null);
@@ -316,6 +318,22 @@ export class PayoutExecutor {
       if (has === null) return { defer: true, reason: `node unreachable while checking earlier payout ${t}` };
       if (has !== 'no') {
         return { defer: false, reason: `withdrawalId ${row.withdrawal_id} was already paid: payout ${t} (order ${e.order_id}) is ${has === 'chain' ? 'confirmed' : 'in the mempool'}` };
+      }
+      // Unknown by its txid is not enough (review round 7 #2): Dobbscoin is
+      // pre-segwit, so a malleated copy can confirm under ANOTHER txid. If any
+      // input of that earlier payout is spent, something spent it: a human checks.
+      const hex = hexOf.get(t);
+      if (!hex) continue;
+      let ins: { txid: string; vout: number }[];
+      try { ins = txInputsFromRawHex(hex); } catch { continue; }
+      for (const i of ins) {
+        let unspent: boolean;
+        try { unspent = await this.rpc.isUnspent(i.txid, i.vout); }
+        catch { return { defer: true, reason: `node unreachable while checking inputs of earlier payout ${t}` }; }
+        if (!unspent) {
+          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent although ` +
+            `${t} itself is unknown: possibly a malleated copy that paid this withdrawal; check by hand` };
+        }
       }
     }
     return null;
