@@ -308,8 +308,14 @@ export class PayoutExecutor {
     // Fetch available UTXOs
     const utxoRows = await this.sql<BridgeUtxoRow[]>`
       SELECT id, txid, vout, amount_sat, address, hd_index, derivation_path
-      FROM bridge_utxos
+      FROM bridge_utxos u
       WHERE status = 'available'
+        -- A deposit output that still owes a refund is spent BY that refund
+        -- (refund-executor), never by a payout.
+        AND NOT EXISTS (
+          SELECT 1 FROM deposit_refunds r
+          WHERE r.deposit_txid = u.txid AND r.deposit_vout = u.vout
+            AND r.status IN ('queued', 'signed', 'needs_attention'))
       ORDER BY amount_sat DESC
     `;
 

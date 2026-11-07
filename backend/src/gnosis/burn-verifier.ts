@@ -61,7 +61,9 @@ export class BurnVerifier implements BurnVerifierLike {
 
   constructor(private readonly config: BackendConfig, client?: BurnChainReader) {
     this.client = client ?? (createPublicClient({ chain: gnosis, transport: http(config.gnosisRpcUrl) }) as unknown as BurnChainReader);
-    this.controllers = new Set([config.bridgeControllerAddress.toLowerCase()]);
+    // V2 cutover: burns on the previous controller(s) are still real burns.
+    this.controllers = new Set([config.bridgeControllerAddress, ...(config.legacyBridgeControllerAddresses ?? [])]
+      .map((a) => a.toLowerCase()));
   }
 
   async verify(c: BurnClaim): Promise<BurnVerdict> {

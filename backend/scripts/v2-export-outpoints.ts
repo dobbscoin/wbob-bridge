@@ -141,9 +141,18 @@ async function main(): Promise<void> {
       SELECT sd.txid, sd.vout, mr.gnosis_tx_hash, encode(mr.deposit_id, 'hex') AS deposit_id
       FROM mint_requests mr JOIN source_deposits sd ON sd.order_id = mr.order_id
     `,
-    await tx<{ txid: string; vout: number; state: string; order_id: string; created_at: Date; has_refund: boolean }[]>`
-      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id, bo.created_at,
-             EXISTS (SELECT 1 FROM deposit_refunds r WHERE r.order_id = bo.id) AS has_refund
+    await tx<{ txid: string; vout: number; state: string; order_id: string; first_seen: Date;
+                has_refund: boolean; refund_activity: boolean; unsent_refunds: string[] }[]>`
+      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id,
+             -- Earliest trace of the order: audit_events is append-only (trigger +
+             -- RLS), so moving bridge_orders.created_at can't hide an old order.
+             LEAST(bo.created_at, COALESCE((SELECT min(a.created_at) FROM audit_events a WHERE a.order_id = bo.id), bo.created_at)) AS first_seen,
+             EXISTS (SELECT 1 FROM deposit_refunds r WHERE r.order_id = bo.id) AS has_refund,
+             -- A refund leaves audit rows even if its deposit_refunds row is deleted.
+             EXISTS (SELECT 1 FROM audit_events a WHERE a.order_id = bo.id
+                      AND (a.event_type LIKE 'REFUND%' OR a.to_state = 'REFUNDED')) AS refund_activity,
+             COALESCE((SELECT array_agg(r.status) FROM deposit_refunds r WHERE r.order_id = bo.id
+                        AND r.status NOT IN ('broadcast', 'confirmed', 'too_small')), '{}') AS unsent_refunds
       FROM source_deposits sd JOIN bridge_orders bo ON bo.id = sd.order_id
       WHERE bo.order_type = 'inbound' AND sd.txid IS NOT NULL AND sd.vout IS NOT NULL
     `,
@@ -241,9 +250,13 @@ async function main(): Promise<void> {
   let settledAdded = 0;
   const inFlight: string[] = [];
   const leftToV2: string[] = [];
+  const unsentRefunds: string[] = [];
   for (const d of deposits) {
-    const createdAfterTo = BigInt(Math.floor(d.created_at.getTime() / 1000)) > toTime;
-    const settled = d.state === 'COMPLETED' || d.state === 'REFUNDED' || d.has_refund;
+    const createdAfterTo = BigInt(Math.floor(d.first_seen.getTime() / 1000)) > toTime;
+    // An imported output can never be refunded on V2, so every refund of a
+    // pre-cutover deposit must be SENT before the import (runbook: drain refunds).
+    if (!createdAfterTo && d.unsent_refunds.length > 0) unsentRefunds.push(`${d.order_id} (${d.unsent_refunds.join(',')})`);
+    const settled = d.state === 'COMPLETED' || d.state === 'REFUNDED' || d.has_refund || d.refund_activity;
     if (!settled) {
       if (createdAfterTo || d.state === 'FAILED') leftToV2.push(`${d.order_id} (${d.state})`);
       else inFlight.push(`${d.order_id} (${d.state})`);
@@ -255,13 +268,18 @@ async function main(): Promise<void> {
   if (inFlight.length > 0) {
     problems.push(`${inFlight.length} inbound order(s) created before --to are still in flight — drain them first: ${inFlight.slice(0, 5).join(', ')}`);
   }
+  if (unsentRefunds.length > 0) {
+    problems.push(`${unsentRefunds.length} refund(s) of pre-cutover deposits are not sent yet — send or settle them first ` +
+      `(V2 refuses refunds on imported outputs): ${unsentRefunds.slice(0, 5).join(', ')}`);
+  }
   if (leftToV2.length > 0) notes.push(`${leftToV2.length} unsettled order(s) left to V2 (not imported): ${leftToV2.slice(0, 5).join(', ')}`);
 
   const batches: Hex[][] = [];
   for (let i = 0; i < keys.length; i += BATCH) batches.push(keys.slice(i, i + BATCH));
   const final = problems.length === 0;
   writeFileSync(out, JSON.stringify({
-    v1, wbob, rpcUrl, fromBlock: from.toString(), toBlock: to.toString(), finalizedBlock: finalized.toString(),
+    v1, wbob, rpcUrl, sourceChainId: config.dobbscoinChainId.toString(), gnosisChainId: await client.getChainId(),
+    fromBlock: from.toString(), toBlock: to.toString(), finalizedBlock: finalized.toString(),
     latestBlock: latest.toString(), final,
     count: keys.length, v1MintCount: logs.length, settledDepositsAdded: settledAdded,
     dbMintCount: dbRows.length, dbRowsChecked: allRows.length,

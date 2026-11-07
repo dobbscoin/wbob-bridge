@@ -115,6 +115,11 @@ export interface BackendConfig {
   /** Gnosis blocks required before a burn is considered confirmed. */
   gnosisConfirmationDepth: number;
   /**
+   * Dobbscoin confirmations a deposit needs before the backend refunds any of
+   * it (env FINAL_CONFIRMATIONS, the same value the watchers use; default 60).
+   */
+  depositFinalConfirmations: number;
+  /**
    * Max blocks per `eth_getLogs` window when scanning Gnosis history.
    * Bounds the watcher's catch-up batch size to whatever the upstream RPC
    * accepts. Default 1000 matches our self-hosted Erigon node's server limit.
@@ -288,6 +293,7 @@ export function loadConfig(): BackendConfig {
     mintDeadlineSeconds:        optionalEnvInt('MINT_DEADLINE_SECONDS', 3600),
     executorPollIntervalMs:     optionalEnvInt('EXECUTOR_POLL_INTERVAL_MS', 15_000),
     gnosisConfirmationDepth:    optionalEnvInt('GNOSIS_CONFIRMATION_DEPTH', 12),
+    depositFinalConfirmations:  optionalEnvInt('FINAL_CONFIRMATIONS', 60),
     gnosisLogScanChunk:         optionalEnvInt('GNOSIS_LOG_SCAN_CHUNK', 1000),
     gnosisScanHaltAlertThreshold: optionalEnvInt('GNOSIS_SCAN_HALT_ALERT_THRESHOLD', 10),
     dobbscoinNetwork:           network,

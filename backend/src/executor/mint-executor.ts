@@ -178,6 +178,7 @@ interface ReadyToMintRow {
   txid:               string;
   vout:               number;
   deposit_value_sat:  bigint | null;
+  sigs_updated_at:    Date;
 }
 
 interface RegenCandidateRow {
@@ -274,6 +275,8 @@ export class MintExecutor {
   /** Orders already alerted as minted-on-chain at authorization time (alert once). */
   private readonly alertedAlreadyMinted = new Set<string>();
   private readonly alertedWrongDomain = new Set<string>();
+  /** Process start: signatures written before it may predate a controller switch. */
+  private readonly startedAt = new Date();
 
   constructor(
     private readonly sql: Sql,
@@ -445,7 +448,7 @@ export class MintExecutor {
                 ${tooSmall ? 'too_small' : 'queued'},
                 ${tooSmall ? 'excess is not more than the network fee plus dust' : null}
               )
-              ON CONFLICT (order_id) DO NOTHING
+              ON CONFLICT DO NOTHING   -- order_id, or (review round 5) the same deposit output
             `;
           }
 
@@ -603,7 +606,7 @@ export class MintExecutor {
               ${tooSmall ? 'too_small' : 'queued'},
               ${tooSmall ? 'excess is not more than the network fee plus dust' : null}
             )
-            ON CONFLICT (order_id) DO NOTHING
+            ON CONFLICT DO NOTHING   -- order_id, or (review round 5) the same deposit output
           `;
         }
       }
@@ -681,7 +684,8 @@ export class MintExecutor {
         mr.signatures,
         sd.txid,
         sd.vout,
-        sd.amount_sat AS deposit_value_sat
+        sd.amount_sat AS deposit_value_sat,
+        mr.updated_at AS sigs_updated_at
       FROM mint_requests mr
       JOIN bridge_orders bo ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
@@ -732,7 +736,9 @@ export class MintExecutor {
     //    auth. A watcher can append a signature it computed over the previous
     //    deadline in the instant a regeneration clears the row; such a sig is
     //    useless on-chain and would hold signature_count at the threshold.
-    const valid = await this._validSignatures(auth, row.signatures);
+    // Signatures last written before this process started may predate a
+    // controller switch: wrong-domain ones are then stale, not misconfiguration.
+    const valid = await this._validSignatures(auth, row.signatures, row.sigs_updated_at < this.startedAt);
     if (valid.length < SIGNATURE_THRESHOLD) {
       await this._pruneSignatures(row.order_id, row.signatures, valid, 'signature does not match the current authorization');
       return;
@@ -806,6 +812,7 @@ export class MintExecutor {
       sourceTxHash: ViemHex; sourceVout: number; sourceValue?: bigint; deadline: bigint; nonce: bigint;
     },
     sigs: Array<{ signer: string; sig: string }>,
+    maybeStale = false,
   ): Promise<Array<{ signer: string; sig: string }>> {
     const domain = {
       ...bridgeControllerDomain(this.config.bridgeControllerVersion),
@@ -831,7 +838,9 @@ export class MintExecutor {
           // misconfigured (BRIDGE_CONTROLLER_VERSION or BRIDGE_CONTROLLER_ADDRESS
           // left on the old controller) and every mint would stall: say which.
           const why = await this._wrongDomainOf(auth, e);
-          if (why !== null && !this.alertedWrongDomain.has(e.signer.toLowerCase() + why)) {
+          if (why !== null && maybeStale) {
+            console.warn(`[executor] dropping a pre-switch signature by ${e.signer} (signed for ${why}); it re-signs for the current controller`);
+          } else if (why !== null && !this.alertedWrongDomain.has(e.signer.toLowerCase() + why)) {
             this.alertedWrongDomain.add(e.signer.toLowerCase() + why);
             await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
               message: `Watcher ${e.signer} signs for ${why}, not for ${this.config.bridgeControllerAddress} ` +

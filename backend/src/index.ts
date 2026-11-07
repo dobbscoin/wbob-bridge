@@ -84,9 +84,19 @@ async function main(): Promise<void> {
   const gnosisWatcher  = new GnosisEventWatcher(sql, config);
   // Refunds of over-cap deposit excess ride the payout loop (no concurrent UTXO selection).
   // V2: refunds are recorded on-chain before they are sent (minted + refunded <= value).
-  const refundExecutor = new RefundExecutor(sql, rpc, config, {
-    recorder: config.bridgeControllerVersion === 2 ? new RefundRecorder(config) : null,
-  });
+  const refundRecorder = config.bridgeControllerVersion === 2 ? new RefundRecorder(config) : null;
+  if (refundRecorder) {
+    const stuckAlerts = new AlertDispatcher({ webhookUrl: config.alertWebhookUrl, emailTo: config.alertEmailTo });
+    refundRecorder.onStuck = (key, hash, ageMs) => {
+      void stuckAlerts.dispatch({
+        level: 'critical', type: 'REFUND_NEEDS_ATTENTION', timestamp: new Date().toISOString(),
+        message: `recordRefund tx ${hash} (output ${key}) has been pending ${Math.round(ageMs / 60_000)} min; ` +
+          `refunds for that output wait, and later relayer txs (mints) may queue behind it. Check relayer gas / speed it up.`,
+        data: { key, hash },
+      }).catch(() => undefined);
+    };
+  }
+  const refundExecutor = new RefundExecutor(sql, rpc, config, { recorder: refundRecorder });
   const payoutExecutor = new PayoutExecutor(sql, rpc, config, refundExecutor);
   console.log(`[backend] RefundExecutor: auto-send ${config.refundsAutoSend ? 'ON' : 'OFF (REFUNDS_AUTO_SEND=false)'}`);
 

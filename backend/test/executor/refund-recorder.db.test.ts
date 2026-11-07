@@ -19,6 +19,12 @@ import type { BackendConfig } from '../../src/config.js';
 
 const URL = process.env['REFUND_TEST_DATABASE_URL'];
 const rnd = (n: number) => randomBytes(n).toString('hex');
+/** A minimal legacy tx hex whose only input is txid:vout (enough for the input check). */
+const spending = (txid: string, vout: number) => {
+  const v = Buffer.alloc(4); v.writeUInt32LE(vout, 0);
+  return Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(txid, 'hex').reverse(), v,
+    Buffer.from([0]), Buffer.alloc(4, 0xff), Buffer.from([0]), Buffer.alloc(4)]).toString('hex');
+};
 const ROOT = HDKey.fromMasterSeed(randomBytes(32));
 const scriptAt = (i: number) =>
   `76a914${Buffer.from(ripemd160(sha256(ROOT.derive(`m/0/${i}`).publicKey!))).toString('hex')}88ac`;
@@ -31,6 +37,7 @@ describe.skipIf(!URL)('RefundExecutor V2 recording gate (real Postgres)', () => 
     hdWalletXpub: ROOT.publicExtendedKey,
     hdDerivationPath: 'm/0',
     dobbscoinAddressVersion: 0,
+    depositFinalConfirmations: 60,
   } as unknown as BackendConfig;
 
   beforeAll(() => { sql = postgres(URL!, { types: { bigint: postgres.BigInt }, onnotice: () => {} }); });
@@ -53,13 +60,14 @@ describe.skipIf(!URL)('RefundExecutor V2 recording gate (real Postgres)', () => 
                                    refund_address, status, amount_sat, fee_sat, signed_hex, txid, signed_at)
       VALUES (${o!.id}, ${txid}, 0, ${opts.recordedValue ?? value}, 600000000, ${opts.excess ?? 400000000n},
               '1L9YGqctBWaCmn7y8d8CBkTXzXXZ4EAECN', ${status}, 399990000, 10000,
-              ${status === 'signed' ? 'deadbeef' : null}, ${rnd(32)}, now())`;
-    return { orderId: o!.id, txid, index, value };
+              ${status === 'signed' ? spending(txid, 0) : null}, ${rnd(32)}, now())`;
+    return { orderId: o!.id, txid, index, value, hex: spending(txid, 0) };
   }
 
   const rpcFor = (nodeOut: Map<string, { value: number; hex: string }>, sent: string[]) => ({
     sendRawTransaction: async (h: string) => { sent.push(h); return rnd(32); },
-    getConfirmations: async () => -1,
+    getConfirmations: async (txid: string) => (nodeOut.has(txid) ? 60 : -1),
+    isUnspent: async () => true,
     getRawTransactionVerbose: async (txid: string) => {
       const o = nodeOut.get(txid);
       if (!o) throw new Error('unknown tx');
@@ -97,7 +105,7 @@ describe.skipIf(!URL)('RefundExecutor V2 recording gate (real Postgres)', () => 
     await ex.recordRefundsOnChain();
     expect(rec.recorded.get(d.txid)).toBe(400000000n);   // recorded with excess_sat
     await ex.broadcastSigned();
-    expect(sent).toContain('deadbeef');
+    expect(sent).toContain(d.hex);
     expect(await status(d.orderId)).toBe('broadcast');
   });
 
@@ -132,18 +140,49 @@ describe.skipIf(!URL)('RefundExecutor V2 recording gate (real Postgres)', () => 
     expect(await status(d.orderId)).toBe('needs_attention');
   });
 
-  it('refunds already broadcast/confirmed are not re-recorded', async () => {
+  it('a refund already SENT is still recorded on V2 (so its coins can never be minted there)', async () => {
     const d = await refundRow({ status: 'confirmed' });
+    const node = new Map([[d.txid, { value: 10, hex: scriptAt(d.index) }]]);
     const rec = recorderFake();
+    await executor(rpcFor(node, []), rec).recordRefundsOnChain();
+    expect(rec.recorded.get(d.txid)).toBe(400000000n);
+  });
+
+  it('a sent refund on an output imported from V1 is skipped quietly (V2 can never mint it)', async () => {
+    const d = await refundRow({ status: 'confirmed' });
+    const rec = recorderFake({ imported: new Set([d.txid]) });
     await executor(rpcFor(new Map(), []), rec).recordRefundsOnChain();
     expect(rec.recorded.has(d.txid)).toBe(false);
+    expect(await status(d.orderId)).toBe('confirmed');
+  });
+
+  it('V2: a record made by someone else is not enough — the node check must pass in this process', async () => {
+    const d = await refundRow({ value: 1_000_000_000n, recordedValue: 5_000_000_000n, excess: 4_400_000_000n });
+    const node = new Map([[d.txid, { value: 10, hex: scriptAt(d.index) }]]);
+    const sent: string[] = [];
+    const rec = recorderFake();
+    rec.recorded.set(d.txid, 4_400_000_000n);          // V2 already shows it (e.g. a duplicate row)
+    const ex = executor(rpcFor(node, sent), rec);
+    await ex.recordRefundsOnChain();                   // node says 10 BOB, row says 50: refused
+    await ex.broadcastSigned();
+    expect(sent).toEqual([]);
+    expect(await status(d.orderId)).toBe('needs_attention');
+  });
+
+  it('a signed refund that does not spend its deposit output is never sent', async () => {
+    const d = await refundRow();
+    await sql`UPDATE deposit_refunds SET signed_hex = ${spending(rnd(32), 0)} WHERE order_id = ${d.orderId}`;
+    const sent: string[] = [];
+    await executor(rpcFor(new Map(), sent), null).broadcastSigned();
+    expect(sent).toEqual([]);
+    expect(await status(d.orderId)).toBe('needs_attention');
   });
 
   it('V1 (no recorder): broadcasts as before', async () => {
     const d = await refundRow();
     const sent: string[] = [];
     await executor(rpcFor(new Map(), sent), null).broadcastSigned();
-    expect(sent).toContain('deadbeef');
+    expect(sent).toContain(d.hex);
     expect(await status(d.orderId)).toBe('broadcast');
   });
 });

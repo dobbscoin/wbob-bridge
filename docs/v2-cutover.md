@@ -27,8 +27,15 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
 ## Cutover
 
 5. **Drain.** Stop accepting new deposits on the portal; wait until no inbound order is
-   in flight and no V1 `executeMint` is pending. The export (step 8) refuses while an order
-   created before B1 is unsettled; deposits that arrive after B1 are left to V2.
+   in flight, no V1 `executeMint` is pending, and **every refund is sent** (`deposit_refunds`
+   only `broadcast`/`confirmed`/`too_small`). The export (step 8) refuses while an order created
+   before B1 is unsettled or has an unsent refund (V2 can never record a refund on an imported
+   output); deposits that arrive after B1 are left to V2.
+   Then set **`REFUNDS_AUTO_SEND=false`** on the backend and restart it, until step 12: a
+   refund sent in between would not be in the import, and V2 could later mint those coins too.
+   Refunds decided in the window wait in `queued` and are recorded on V2, then sent, after the
+   flip. A refund paid **by hand** at any time must get a `deposit_refunds` row (status
+   `confirmed`) so the backend records it on V2.
 6. **Safe tx 1** — stop V1 for good:
    `V1.pause()` · `V1.incrementMintNonce()` · `wBOB.revokeRole(BRIDGE_EXECUTOR_ROLE, V1)`.
    Note the block number **B1**.
@@ -48,11 +55,15 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
     `BRIDGE_CONTROLLER_ADDRESS=<V2>` · `BRIDGE_CONTROLLER_VERSION=2` ·
     `LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V1>` · `BRIDGE_EXECUTOR_MODULE_ADDRESS=<new module>` ·
     `EMERGENCY_OPERATOR_PRIVATE_KEY=<new key>` (never the relayer key; verify checks) ·
+    `REFUNDS_AUTO_SEND` back to `true` ·
     portal `NEXT_PUBLIC_BRIDGE_CONTROLLER_ADDRESS=<V2>`,
     `NEXT_PUBLIC_BRIDGE_CONTROLLER_VERSION=2` (rebuild). Restart; the backend must log
     `controller … verified as V2` and no `BridgeGuard NOT READY`.
-13. **Verify** (read-only): `--stage pre-unpause --relayer <relayer> --module <new module> --old-module <V1 module>`
-    → `OK (pre-unpause)`.
+13. **Verify** (read-only): `--stage pre-unpause --relayer <relayer> --module <new module> --old-module <V1 module>
+    --signers <the 5 watcher addresses> --mint-limit <mintLimitPerWindow as deployed, sat>` → `OK (pre-unpause)`.
+    Both verify stages also check the RPC is Gnosis (chain 100) and V2's `SOURCE_CHAIN_ID` matches the export.
+    Watch the first poll after the restart: signatures made before the flip are dropped as stale
+    (a warning in the log, not an alert) and the watchers re-sign for V2.
 14. **Safe tx 3:** `V2.unpause()`. Re-open deposits on the portal.
 
 ## After
@@ -63,12 +74,22 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
 
 ## Refunds under V2
 
+Every refund **spends its own deposit output** (and only it), so one output can fund at most
+one refund, by Dobbscoin consensus, whatever the DB says. A payout never spends a deposit
+output that still owes a refund. The refund address is re-derived from the node at signing.
 Every refund is recorded on V2 (`recordRefund`, relayer holds `REFUND_MARKER_ROLE`) before it
-is sent, and only after the backend's own node confirms the deposit output is the bridge's
-P2PKH at its hd_index with the recorded value. Refunds V2 has not recorded are never
-broadcast. A refund for an output imported from V1 is refused by the contract.
-If a stolen relayer key poisons an output's record, the Safe can `resetOutpointRecord(key)`
-(only for outputs that never minted), after revoking the role.
+is sent, and only after the backend's own node confirms, every time: the deposit output is the
+bridge's P2PKH at its hd_index, has the recorded value and FINAL_CONFIRMATIONS, and is unspent.
+Refunds V2 has not recorded are never broadcast. A refund for an output imported from V1 is
+refused by the contract; sent refunds are recorded too (outputs imported from V1 excepted).
+If a stolen relayer key poisons an output's record, revoke the role, then the Safe calls
+`resetOutpointRecord(key, trueValue, trueRefunded)` with the output's real value and the refund
+really paid from it (only for outputs that never minted). Never zero a refund that was paid.
+A `recordRefund` tx pending over 10 minutes raises one critical alert; it is never resent.
+
+Known limit: before the cutover, refunds lived only in Postgres. The export imports every
+deposit that is settled, has a refund row, or has any refund trace in the append-only
+`audit_events`; a DB writer who could also erase audit rows before step 8 could still hide one.
 
 ## If something is wrong
 

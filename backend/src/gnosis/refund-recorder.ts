@@ -42,6 +42,11 @@ export class RefundRecorder {
   private readonly account;
   /** outpoint key → recorded total we have already seen on-chain (avoids re-reading). */
   private readonly seen = new Map<string, bigint>();
+  /** outpoint key → recordRefund tx sent and not yet mined (never send a second one). */
+  private readonly pending = new Map<string, { hash: Hex; sentAt: number; alerted: boolean }>();
+  /** Called once when a recordRefund tx has been pending this long (default 10 min). */
+  stuckAfterMs = 10 * 60_000;
+  onStuck: ((key: Hex, hash: Hex, ageMs: number) => void) | null = null;
 
   constructor(private readonly config: BackendConfig) {
     this.account = privateKeyToAccount(config.executorPrivateKey as Hex);
@@ -86,16 +91,33 @@ export class RefundRecorder {
     return processed && minted === 0n;
   }
 
-  /** Record it if needed; resolves true once V2 shows it. Throws on a failed or reverted tx. */
+  /**
+   * Record it if needed. NEVER blocks on mining: sends at most one tx per
+   * output, returns false while it is pending, true once V2 shows the record.
+   * Throws if the tx reverted. A tx pending past stuckAfterMs is reported once
+   * (onStuck) and still not resent: a resend would only queue behind it.
+   */
   async ensureRecorded(r: RefundRecord): Promise<boolean> {
+    const k = this.key(r);
+    const p = this.pending.get(k);
+    if (p) {
+      const rc = await this.reader.getTransactionReceipt({ hash: p.hash }).catch(() => null);
+      if (rc === null) {
+        const age = Date.now() - p.sentAt;
+        if (age > this.stuckAfterMs && !p.alerted) { p.alerted = true; this.onStuck?.(k, p.hash, age); }
+        return false;
+      }
+      this.pending.delete(k);
+      this.seen.delete(k);
+      if (rc.status !== 'success') throw new Error(`recordRefund reverted (${p.hash})`);
+      return this.isRecorded(r);
+    }
     if (await this.isRecorded(r)) return true;
     const hash = await withRelayerLock(() => this.writer.writeContract({
       address: this.config.bridgeControllerAddress as Hex, abi: ABI, functionName: 'recordRefund',
       args: [this.txHash(r.depositTxid), r.depositVout, r.depositValueSat, r.refundedTotalSat],
     }));
-    const rc = await this.reader.waitForTransactionReceipt({ hash });
-    if (rc.status !== 'success') throw new Error(`recordRefund reverted (${hash})`);
-    this.seen.delete(this.key(r));
-    return this.isRecorded(r);
+    this.pending.set(k, { hash, sentAt: Date.now(), alerted: false });
+    return false;
   }
 }
