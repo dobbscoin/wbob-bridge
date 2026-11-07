@@ -133,9 +133,12 @@ describe('READ clients use fallback() across the RPC list', () => {
     expect(transportCount(m, 'publicClient')).toBe(cfg.gnosisRpcUrls.length);
   });
 
-  it('GnosisEventWatcher.publicClient is a fallback', () => {
+  it('GnosisEventWatcher.publicClient is PINNED to our node, not a fallback (review round 7 #3)', () => {
+    // Through fallback() a lagging public endpoint could answer the logs with []
+    // and the watermark moved past real burns: withdrawal scanning reads only
+    // the primary, and the recount + stall alert cover an outage.
     const w = new GnosisEventWatcher(fakeSql, cfg);
-    expect(transportType(w, 'publicClient')).toBe('fallback');
+    expect(transportType(w, 'publicClient')).toBe('http');
   });
 
   it('DripSender.publicClient is a fallback', () => {

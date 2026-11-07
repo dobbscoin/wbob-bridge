@@ -131,6 +131,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     sendRawTransaction: (hex: string) => Promise<string>,
     more: { getConfirmations?: (txid: string) => Promise<number>; getRawTransactionHex?: (txid: string) => Promise<string>;
             isInMempool?: (txid: string) => Promise<boolean>;
+            isUnspent?: (txid: string, vout: number) => Promise<boolean>;
             burn?: BurnVerifierLike } = {},
   ) {
     const rpc = {
@@ -138,6 +139,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       getRawTransactionHex: more.getRawTransactionHex ?? (async () => { throw new Error('must not fetch inputs for an unpayable payout'); }),
       getConfirmations: more.getConfirmations ?? (async () => -1),
       isInMempool: more.isInMempool ?? (async () => false),
+      isUnspent: more.isUnspent ?? (async () => true),
     };
     const burn = more.burn ?? { verify: async () => ({ ok: true as const }) };
     return new PayoutExecutor(sql as never, rpc as never, config, null, burn) as unknown as {
@@ -488,5 +490,25 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     }).processQueued();
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
     await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  // ── Review round 7 #2: a malleated copy of an earlier payout ─────────────
+  it('an earlier payout unknown by txid but with a spent input (malleated copy) blocks a second payment', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const spentCoin = rnd(32);
+    const v = Buffer.alloc(4);
+    const oldHex = Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(spentCoin, 'hex').reverse(), v,
+      Buffer.from([0]), Buffer.alloc(4, 0xff), Buffer.from([0]), Buffer.alloc(4)]).toString('hex');
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(oldHex), signedHex: oldHex })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async () => -1,                                  // the original txid never confirmed...
+      isUnspent: async (t) => t !== spentCoin,                           // ...but its input was spent
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+    const [a] = await sql<{ error: string }[]>`
+      SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${orderId} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/malleated/);
   });
 });

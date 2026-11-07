@@ -523,3 +523,48 @@ describe('GnosisEventWatcher.processNewWithdrawals', () => {
     expect(rows).toEqual([{ wid: '21', controller: BRIDGE_ADDR }, { wid: '22', controller: V2 }]);
   });
 });
+
+// ─── review round 7 #3: independent recount ──────────────────────────────────
+
+describe('GnosisEventWatcher.recount', () => {
+  function watcherWithAlerts(config: BackendConfig, mock: MockPublicClient) {
+    const w = makeWatcher(config, mock);
+    const sent: string[] = [];
+    (w as unknown as { alerts: unknown }).alerts = { dispatch: async (a: { message: string }) => { sent.push(a.message); } };
+    return { w, sent };
+  }
+
+  it('a burn below the watermark with no DB row (skipped scan / moved watermark) is ingested and alerted', async () => {
+    const config = makeConfig({ gnosisStartBlock: 100_000n, gnosisLogScanChunk: 1000 } as Partial<BackendConfig>);
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(200_000n);
+    mock.setLogsForRange(100_000n, 100_999n, [makeLog(100_500n, 77n)]);
+    await setLastBlock(100_999n);                       // the main scanner "already" passed it
+    const { w, sent } = watcherWithAlerts(config, mock);
+    await w.recount();
+    expect(await countWithdrawals()).toBe(1);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatch(/missing from the database/);
+  });
+
+  it('burns already in the DB are not touched or alerted; burns above the watermark wait for the scanner', async () => {
+    const config = makeConfig({ gnosisStartBlock: 100_000n, gnosisLogScanChunk: 1000 } as Partial<BackendConfig>);
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(200_000n);
+    mock.setLogsForRange(100_000n, 100_999n, [makeLog(100_500n, 78n)]);
+    await setLastBlock(100_999n);
+    const { w, sent } = watcherWithAlerts(config, mock);
+    await w.recount();                                  // ingests 78 (missing)
+    sent.length = 0;
+    await w.recount();                                  // cursor is in memory: nothing re-read, nothing alerted
+    expect(await countWithdrawals()).toBe(1);
+    expect(sent).toHaveLength(0);
+    // a fresh watcher (restart) re-reads from the start: row present, no alert
+    const again = watcherWithAlerts(config, mock);
+    await again.w.recount();
+    expect(again.sent).toHaveLength(0);
+    // nothing at or above the watermark is read by the recount
+    expect(mock.getLogsCalls.every((c) => c.toBlock <= 100_999n)).toBe(true);
+  });
+});
+
