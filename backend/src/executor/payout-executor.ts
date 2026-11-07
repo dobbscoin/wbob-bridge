@@ -251,6 +251,20 @@ export class PayoutExecutor {
         }
       }
 
+      // ── This burn must never have been paid before ──
+      // Payout rows and UTXO links are ordinary rows a DB writer can erase; the
+      // append-only audit trail and our node cannot be. Every payout ever signed
+      // for this withdrawalId (on ANY order) must be unknown to the node.
+      const paid = await this._alreadyPaidReason(row);
+      if (paid !== null) {
+        if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); continue; }
+        await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, paid.reason);
+        await this._alertCritical(`Payout REFUSED for order ${row.order_id}: ${paid.reason}. ` +
+          `Paying again would pay one burn twice: possible DB tampering. Do not pay by hand.`,
+          { orderId: row.order_id, reason: paid.reason });
+        continue;
+      }
+
       // ── The burn must exist on Gnosis exactly as we are about to pay it ──
       // (only here: this is the one place a NEW payout signature is created).
       const bad = await this._burnNotBackedReason(row);
@@ -274,6 +288,37 @@ export class PayoutExecutor {
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, String(err));
       }
     }
+  }
+
+  /**
+   * Null if no payout was ever signed for this withdrawal, or every one signed is
+   * unknown to our node (refused outright, never relayed). Looks across ALL orders
+   * whose ORDER_CREATED audit row names this withdrawalId, so re-creating the
+   * order, deleting the payouts row or unlinking UTXOs does not hide a payment.
+   */
+  private async _alreadyPaidReason(row: QueuedPayoutRow): Promise<{ defer: boolean; reason: string } | null> {
+    if (row.withdrawal_id === null) return { defer: false, reason: 'no withdrawal_requests row for this order' };
+    const signed = await this.sql<{ order_id: string; txid: string | null; hex: string | null }[]>`
+      SELECT a.order_id::text, a.metadata->>'txid' AS txid, a.metadata->>'signedHex' AS hex
+      FROM audit_events a
+      WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
+        AND a.order_id IN (
+          SELECT o.order_id FROM audit_events o
+          WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${row.withdrawal_id}
+          UNION SELECT ${row.order_id}::uuid)
+    `;
+    const seen = new Set<string>();
+    for (const e of signed) {
+      const t = e.txid ?? (e.hex ? txidFromRawHex(e.hex) : null);
+      if (t === null || seen.has(t)) continue;
+      seen.add(t);
+      const has = await this._nodeHas(t);
+      if (has === null) return { defer: true, reason: `node unreachable while checking earlier payout ${t}` };
+      if (has !== 'no') {
+        return { defer: false, reason: `withdrawalId ${row.withdrawal_id} was already paid: payout ${t} (order ${e.order_id}) is ${has === 'chain' ? 'confirmed' : 'in the mempool'}` };
+      }
+    }
+    return null;
   }
 
   /** Null if the burn on Gnosis backs this payout exactly; else why not (defer = retry later). */

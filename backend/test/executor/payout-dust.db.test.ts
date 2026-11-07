@@ -433,4 +433,60 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     }).processQueued();
     expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
   });
+
+  // ── Review round 6 #1: one burn is paid once, whatever the DB says ───────
+  it('a burn already paid is never paid again, even after its payout rows are erased and the order re-created', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const [w] = await sql<{ withdrawal_id: string }[]>`SELECT withdrawal_id::text FROM withdrawal_requests WHERE order_id = ${orderId}`;
+    const paidTx = rnd(32);
+    // The first payment, as the audit trail recorded it (this row can't be erased).
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'ORDER_CREATED', 'WITHDRAW_REQUEST_CREATED', 'BURN_TX_SEEN', 'test', ${sql.json({ withdrawalId: w!.withdrawal_id })})`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: paidTx, payoutId: 'gone' })})`;
+    // Attacker: drop the withdrawal row, re-create the order for the same burn, queue it.
+    await sql`UPDATE withdrawal_requests SET withdrawal_id = withdrawal_id + 1000000000000 WHERE order_id = ${orderId}`;
+    await sql`UPDATE bridge_orders SET state = 'COMPLETED' WHERE id = ${orderId}`;
+    const [o2] = await sql<{ id: string }[]>`
+      INSERT INTO bridge_orders (order_type, state, user_gnosis_address, user_dobbscoin_address, amount_sat)
+      VALUES ('outbound', 'PAYOUT_QUEUED', ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000) RETURNING id`;
+    await sql`INSERT INTO withdrawal_requests (order_id, withdrawal_id, sender_address, dobbscoin_address, amount_sat, user_nonce)
+              VALUES (${o2!.id}, ${w!.withdrawal_id}, ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000, 0)`;
+    const big = await utxo(o2!.id, 5_000_000_000n);
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async (t) => (t === paidTx ? 7 : -1),
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(o2!.id)).toBe(OutboundState.MANUAL_REVIEW);
+    expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
+    const [a] = await sql<{ error: string }[]>`
+      SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${o2!.id} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/already paid/);
+  });
+
+  it('an earlier payout the node refused outright (unknown to it) does not block paying', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: rnd(32) })})`;
+    const seen: string[] = [];
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async () => -1,
+      burn: { verify: async () => { seen.push('burn'); return { ok: false, defer: true, reason: 'stop here' }; } },
+    }).processQueued();
+    expect(seen).toEqual(['burn']);                       // got past the paid check to the burn check
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  it('node unreachable while checking an earlier payout: defers, signs nothing', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: rnd(32) })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async () => { throw new Error('ECONNREFUSED'); },
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
 });
