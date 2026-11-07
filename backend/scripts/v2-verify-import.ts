@@ -23,7 +23,7 @@
  * closed; but never unpause with one open.)
  */
 import { readFileSync } from 'node:fs';
-import { createPublicClient, http, parseAbi, parseAbiItem, keccak256, toBytes, type Hex } from 'viem';
+import { createPublicClient, http, parseAbi, parseAbiItem, keccak256, toBytes, encodeAbiParameters, parseAbiParameters, type Hex } from 'viem';
 import { gnosis } from 'viem/chains';
 
 const V2_ABI = parseAbi([
@@ -38,6 +38,7 @@ const V2_ABI = parseAbi([
   'function isSigner(address) view returns (bool)',
   'function mintLimitPerWindow() view returns (uint256)',
   'function minWithdrawal() view returns (uint256)',
+  'function refundedAmount(bytes32) view returns (uint256)',
 ]);
 const MODULE_ABI = parseAbi(['function safe() view returns (address)', 'function operator() view returns (address)']);
 const MINT_EXECUTED = parseAbiItem(
@@ -57,7 +58,8 @@ function arg(name: string, fallback?: string): string {
 async function main(): Promise<void> {
   const file = JSON.parse(readFileSync(arg('file'), 'utf8')) as
     { final: boolean; keys: Hex[]; v1: Hex; count: number; toBlock: string; wbob: Hex;
-      sourceChainId?: string; gnosisChainId?: number };
+      sourceChainId?: string; gnosisChainId?: number;
+      leftToV2?: { outpoint: string; refundTotalSat: string }[] };
   const v2 = arg('v2') as Hex;
   const stage = arg('stage');
   if (stage !== 'pre-seal' && stage !== 'pre-unpause') throw new Error('--stage must be pre-seal or pre-unpause');
@@ -155,6 +157,19 @@ async function main(): Promise<void> {
     if (limit !== wantLimit) problems.push(`V2 mintLimitPerWindow is ${limit}, expected ${wantLimit} (units are sat per 24h)`);
     const payoutMin = BigInt(arg('payout-min', process.env['PAYOUT_MIN_SAT'] ?? '100000'));
     if (minW < payoutMin) problems.push(`V2 minWithdrawal ${minW} is under the backend payout minimum ${payoutMin}: such burns can't be paid`);
+
+    // Deposits left to V2 with refunds: V2 must already hold each refund, or the
+    // refunded coins could be minted again (the backend records them at the flip).
+    for (const x of file.leftToV2 ?? []) {
+      if (BigInt(x.refundTotalSat) === 0n) continue;
+      const [txid, vout] = x.outpoint.split(':') as [string, string];
+      const key = keccak256(encodeAbiParameters(parseAbiParameters('uint256, bytes32, uint32'),
+        [srcChain, `0x${txid}` as Hex, Number(vout)]));
+      const got = await client.readContract({ address: v2, abi: V2_ABI, functionName: 'refundedAmount', args: [key] }) as bigint;
+      if (got < BigInt(x.refundTotalSat)) {
+        problems.push(`left-to-V2 deposit ${x.outpoint}: V2 records ${got} refunded, the bridge refunds ${x.refundTotalSat}: wait for the backend to record it`);
+      }
+    }
   }
 
   let missing = 0;

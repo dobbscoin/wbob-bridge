@@ -97,6 +97,7 @@ interface QueuedPayoutRow {
   spent_utxos:       number;   // bridge_utxos marked spent by that payout
   withdrawal_id:     string | null;
   burn_tx_hash:      string | null;
+  burn_block_number: bigint | string | null;
   sender_address:    string | null;
   wr_amount_sat:     bigint | null;
   wr_dobbscoin_address: string | null;
@@ -191,6 +192,7 @@ export class PayoutExecutor {
         (SELECT count(*)::int FROM bridge_utxos u WHERE p.id IS NOT NULL AND u.spent_payout_id = p.id AND u.status = 'spent')    AS spent_utxos,
         wr.withdrawal_id::text    AS withdrawal_id,
         wr.burn_tx_hash,
+        wr.burn_block_number,
         wr.sender_address,
         wr.amount_sat             AS wr_amount_sat,
         wr.dobbscoin_address      AS wr_dobbscoin_address,
@@ -289,6 +291,7 @@ export class PayoutExecutor {
     }
     const v = await this.burnVerifier.verify({
       withdrawalId: row.withdrawal_id, burnTxHash: row.burn_tx_hash, senderAddress: row.sender_address,
+      burnBlockNumber: row.burn_block_number === null ? null : BigInt(row.burn_block_number),
       amountSat: row.amount_sat, dobbscoinAddress: row.dobbscoin_address,
     });
     return v.ok ? null : { defer: v.defer, reason: v.reason };

@@ -34,9 +34,22 @@ describe('BurnVerifier', () => {
   it('refuses a log from another contract (fake controller)', async () => { expect(await v({ logs: [log({ address: '0x' + '9'.repeat(40) })] })).toMatchObject({ ok: false, defer: false }); });
   it('refuses a burn tx with a different withdrawalId', async () => { expect(await v({ logs: [log({ id: 8n })] })).toMatchObject({ ok: false, defer: false }); });
   it('refuses a reverted tx', async () => { expect(await v({ status: 'reverted' })).toMatchObject({ ok: false, defer: false }); });
-  it('refuses a missing hash and a tx the node does not know', async () => {
+  it('refuses a missing hash', async () => {
     expect(await v({}, { ...claim, burnTxHash: null })).toMatchObject({ ok: false, defer: false });
-    expect(await v({ err: new Error('Transaction receipt with hash "0xab" could not be found.') })).toMatchObject({ ok: false, defer: false });
+  });
+  const notFound = () => Object.assign(new Error('Transaction receipt with hash "0xab" could not be found.'), { name: 'TransactionReceiptNotFoundError' });
+  it('a receipt our node lacks: defers while the node is behind the burn, refuses only after the grace period', async () => {
+    const lagging = new BurnVerifier(config, reader({ err: notFound(), tip: 105n }));
+    expect(await lagging.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });
+    const caughtUp = new BurnVerifier(config, reader({ err: notFound(), tip: 500n }));
+    expect(await caughtUp.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });   // first sighting
+    caughtUp.notFoundGraceMs = 0;
+    expect(await caughtUp.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: false });
+  });
+  it('a proxy 404 page or any other error is never "does not exist"', async () => {
+    const r = new BurnVerifier(config, reader({ err: new Error('HTTP request failed. Status: 404 Not Found'), tip: 500n }));
+    r.notFoundGraceMs = 0;
+    expect(await r.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });
   });
   it('defers (does not refuse) when the node is unreachable or the burn is shallow', async () => {
     expect(await v({ err: new Error('fetch failed') })).toMatchObject({ ok: false, defer: true });

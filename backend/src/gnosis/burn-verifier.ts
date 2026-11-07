@@ -31,6 +31,7 @@ const WITHDRAWAL_EVENT = parseAbiItem(
 export interface BurnClaim {
   withdrawalId: string;           // uint256 as decimal string (withdrawal_requests.withdrawal_id)
   burnTxHash: string | null;
+  burnBlockNumber?: bigint | null; // withdrawal_requests.burn_block_number (where ingest saw it)
   senderAddress: string;          // withdrawal_requests.sender_address
   amountSat: bigint;              // what will be paid (bridge_orders.amount_sat)
   dobbscoinAddress: string;       // where it will be paid (bridge_orders.user_dobbscoin_address)
@@ -58,6 +59,10 @@ export interface BurnChainReader {
 export class BurnVerifier implements BurnVerifierLike {
   private readonly client: BurnChainReader;
   private readonly controllers: Set<string>;
+  /** withdrawalId -> first time our caught-up node said "no such receipt" (review round 6 #5). */
+  private readonly notFoundSince = new Map<string, number>();
+  /** "Does not exist" only after the node, caught up past the burn, says so for this long. */
+  notFoundGraceMs = 10 * 60_000;
 
   constructor(private readonly config: BackendConfig, client?: BurnChainReader) {
     this.client = client ?? (createPublicClient({ chain: gnosis, transport: http(config.gnosisRpcUrl) }) as unknown as BurnChainReader);
@@ -79,12 +84,27 @@ export class BurnVerifier implements BurnVerifierLike {
       ]);
     } catch (err) {
       const msg = String((err as Error)?.message ?? err);
-      // "not found" from a healthy node means there is no such tx on our chain.
-      if (/could not be found|not found/i.test(msg) && !/fetch|timeout|ECONN|network/i.test(msg)) {
-        return no(`burn tx ${c.burnTxHash} does not exist on Gnosis`);
+      // Only viem's own "receipt not found" is evidence, and only from a node that
+      // is past the burn's block, repeatedly: a lagging or resyncing node (or a
+      // proxy's 404 page) must defer, never cry tampering.
+      if ((err as Error)?.name !== 'TransactionReceiptNotFoundError') {
+        return { ok: false, defer: true, reason: `Gnosis node unreachable for burn check: ${msg.slice(0, 160)}` };
       }
-      return { ok: false, defer: true, reason: `Gnosis node unreachable for burn check: ${msg.slice(0, 160)}` };
+      let tipNow: bigint;
+      try { tipNow = await this.client.getBlockNumber(); }
+      catch { return { ok: false, defer: true, reason: 'Gnosis node unreachable for burn check' }; }
+      const need = (c.burnBlockNumber ?? 0n) + BigInt(this.config.gnosisConfirmationDepth);
+      if (c.burnBlockNumber == null || tipNow < need) {
+        return { ok: false, defer: true, reason: `our Gnosis node (at ${tipNow}) has no receipt for ${c.burnTxHash} yet; waiting until it is past ${need}` };
+      }
+      const first = this.notFoundSince.get(c.withdrawalId) ?? Date.now();
+      this.notFoundSince.set(c.withdrawalId, first);
+      if (Date.now() - first < this.notFoundGraceMs) {
+        return { ok: false, defer: true, reason: `our Gnosis node has no receipt for ${c.burnTxHash}; re-checking before refusing` };
+      }
+      return no(`burn tx ${c.burnTxHash} does not exist on our Gnosis node (caught up to ${tipNow}, still missing after ${Math.round((Date.now() - first) / 60_000)} min)`);
     }
+    this.notFoundSince.delete(c.withdrawalId);
 
     if (rc.status !== 'success') return no(`burn tx ${c.burnTxHash} reverted`);
 

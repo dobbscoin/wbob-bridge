@@ -99,4 +99,20 @@ describe('checkMintAgainstNode', () => {
     expect(checkMintAgainstNode(row({ deposit_value_sat: null, require_deposit_value: true }), node(), FINAL)).toMatch(/no recorded deposit value/);
     expect(checkMintAgainstNode(row({ deposit_value_sat: null }), node(), FINAL)).toBeNull();
   });
+
+  // ── review round 6 #2: the V2 cutover floor ──
+  const floor = (depositHeight: number | null, allowed: string[] = []) =>
+    ({ minHeight: 1_950_000, allowed: new Set(allowed), depositHeight });
+  it('V2 floor: a deposit confirmed at or after the cutover height signs', () => {
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(1_950_000) }), node(), FINAL)).toBeNull();
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(1_960_123) }), node(), FINAL)).toBeNull();
+  });
+  it('V2 floor: an older deposit is refused unless it is on the reviewed list', () => {
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(1_949_999) }), node(), FINAL)).toMatch(/before the V2 cutover/);
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(1_900_000, [`${TXID}:0`]) }), node(), FINAL)).toBeNull();
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(1_900_000, [`${TXID}:1`]) }), node(), FINAL)).toMatch(/before the V2 cutover/);
+  });
+  it('V2 floor: an unknown deposit height is a refusal, never a pass', () => {
+    expect(checkMintAgainstNode(row({ cutover_floor: floor(null) }), node(), FINAL)).toMatch(/block height/);
+  });
 });

@@ -43,6 +43,8 @@ import type { Alert } from '../monitor/types.js';
 import { fmtBob } from './mint-capacity.js';
 
 export const REFUND_MIN_CONFIRMATIONS = 3;
+/** A refund that cannot be built for this long gets one critical alert. */
+const STUCK_ALERT_MS = 60 * 60_000;
 const EXPLORER = 'https://explorer.dobbscoin.info';
 
 export type RefundStatus =
@@ -393,9 +395,10 @@ export class RefundExecutor {
           err instanceof RpcNetworkError ||
           (err instanceof Error && /^Insufficient UTXOs|is no longer available$/.test(err.message))
         ) {
-          // Node unreachable, or coins reserved by an in-flight payout (they come
-          // back as change). Transient: retry next poll.
+          // Node unreachable, or the deposit output held by another tx. Usually
+          // transient: retry next poll. But never silently forever (round 6 #7).
           console.warn(`[refund-executor] refundId=${r.id} not built yet, will retry: ${err.message}`);
+          await this._alertIfStuck(r, err.message);
           continue;
         }
         if (err instanceof RefundTooSmallError) {
@@ -517,6 +520,7 @@ export class RefundExecutor {
         )
       `;
     });
+    this.stuckSince.delete(r.id);
     console.log(
       `[refund-executor] signed refund refundId=${r.id} txid=${built.txid} ` +
       `to=${r.refund_address} amount=${built.recipientSat} fee=${built.feeSat}`,
@@ -552,7 +556,7 @@ export class RefundExecutor {
         const recorded = await this.recorder.isRecorded({
           depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
           depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat,
-        }).catch(() => false);
+        }, true).catch(() => false);
         if (!recorded) {
           console.warn(`[refund-executor] refund ${r.id} not recorded on V2 yet; holding the broadcast`);
           continue;
@@ -664,6 +668,20 @@ export class RefundExecutor {
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
+
+  /** Refund id -> first time it could not be built. One critical alert after STUCK_ALERT_MS. */
+  private readonly stuckSince = new Map<string, number>();
+  private readonly stuckAlerted = new Set<string>();
+  private async _alertIfStuck(r: RefundRow, why: string): Promise<void> {
+    const first = this.stuckSince.get(r.id) ?? Date.now();
+    this.stuckSince.set(r.id, first);
+    if (Date.now() - first < STUCK_ALERT_MS || this.stuckAlerted.has(r.id)) return;
+    this.stuckAlerted.add(r.id);
+    await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+      message: `Refund ${r.id} (order ${r.order_id}) has not been sendable for ${Math.round((Date.now() - first) / 60_000)} min: ${why}. ` +
+        `If its deposit output is held by a stuck payout, settle that payout first.`,
+      data: { refundId: r.id, orderId: r.order_id, reason: why } });
+  }
 
   private async _park(
     r: RefundRow,

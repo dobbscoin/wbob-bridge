@@ -379,8 +379,10 @@ export class MintExecutor {
         }
       } catch (err) {
         console.error(`[executor] already-minted check failed orderId=${order.order_id}; not authorizing this poll:`, err);
+        await this._alertIfCheckStuck(order.order_id, err);
         continue;
       }
+      this.checkFailingSince.delete(order.order_id);
       try {
         const outcome = await this.sql.begin(async (tx) => {
           // Serialise capacity decisions bridge-wide (all backend instances).
@@ -529,6 +531,20 @@ export class MintExecutor {
    * controller's processedDeposits: a V1 mint whose tx the DB never recorded
    * (and which an incomplete import missed) must never be re-authorized on V2.
    */
+  /** Order -> first time its already-minted check threw (review round 6 #9: never stall silently). */
+  private readonly checkFailingSince = new Map<string, number>();
+  private checkFailAlerted = false;
+  private async _alertIfCheckStuck(orderId: string, err: unknown): Promise<void> {
+    const first = this.checkFailingSince.get(orderId) ?? Date.now();
+    this.checkFailingSince.set(orderId, first);
+    if (Date.now() - first < 15 * 60_000 || this.checkFailAlerted) return;
+    this.checkFailAlerted = true;    // once per process; it repeats on restart if still failing
+    await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
+      message: `Mints are not being authorized: the already-minted check has failed for ${Math.round((Date.now() - first) / 60_000)} min ` +
+        `(order ${orderId}): ${String(err).slice(0, 200)}. Check the Gnosis RPC and LEGACY_BRIDGE_CONTROLLER_ADDRESSES.`,
+      data: { orderId } });
+  }
+
   private async _alreadyMintedReason(depositIdHex: ViemHex, txid: string, vout: number): Promise<string | null> {
     const read = (address: string, functionName: 'processedDeposits' | 'processedOutpoints', arg: ViemHex) =>
       this.publicClient.readContract({ address: address as ViemHex, abi: BRIDGE_ABI, functionName, args: [arg] }) as Promise<boolean>;

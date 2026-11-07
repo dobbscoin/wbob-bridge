@@ -63,10 +63,14 @@ export class RefundRecorder {
       [this.config.dobbscoinChainId, this.txHash(r.depositTxid), r.depositVout]));
   }
 
-  /** True if V2 already holds at least this refund for this output. */
-  async isRecorded(r: RefundRecord): Promise<boolean> {
+  /**
+   * True if V2 already holds at least this refund for this output. fresh=true
+   * always reads the chain (the broadcast gate: the Safe may have LOWERED it with
+   * resetOutpointRecord since we cached it, review round 6 #6).
+   */
+  async isRecorded(r: RefundRecord, fresh = false): Promise<boolean> {
     const k = this.key(r);
-    if ((this.seen.get(k) ?? -1n) >= r.refundedTotalSat) return true;
+    if (!fresh && (this.seen.get(k) ?? -1n) >= r.refundedTotalSat) return true;
     const onChain = await this.reader.readContract({
       address: this.config.bridgeControllerAddress as Hex, abi: ABI, functionName: 'refundedAmount', args: [k],
     }) as bigint;

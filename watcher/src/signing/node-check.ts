@@ -38,6 +38,11 @@ export interface MintCheckRow {
   deposit_value_sat?: bigint | string | number | null;
   /** V2: the recorded deposit value is required and must equal the node's (it is signed as sourceValue). */
   require_deposit_value?: boolean;
+  /**
+   * V2 cutover floor (review round 6 #2): the deposit's block height on our node
+   * must be >= minHeight, unless "txid:vout" is in allowed.
+   */
+  cutover_floor?: { minHeight: number; allowed: Set<string>; depositHeight: number | null } | null;
 }
 
 export function checkMintAgainstNode(
@@ -48,6 +53,13 @@ export function checkMintAgainstNode(
   if (st === null) return 'node does not know the tx';
   if (st.confirmations < finalConfirmations) {
     return `node shows ${st.confirmations} confirmations (< ${finalConfirmations})`;
+  }
+  if (row.cutover_floor) {
+    const f = row.cutover_floor;
+    if (f.depositHeight === null) return 'cannot read the deposit block height (needed for the V2 cutover floor)';
+    if (f.depositHeight < f.minHeight && !f.allowed.has(`${row.txid.replace(/^0x/, '').toLowerCase()}:${row.vout}`)) {
+      return `deposit confirmed at height ${f.depositHeight}, before the V2 cutover (${f.minHeight}), and not on the reviewed pre-cutover list`;
+    }
   }
   if (row.expected_deposit_address === null) return 'cannot derive the bridge address for this row (no hd_index?)';
   if (row.deposit_address !== row.expected_deposit_address) {

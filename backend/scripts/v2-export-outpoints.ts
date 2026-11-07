@@ -142,8 +142,11 @@ async function main(): Promise<void> {
       FROM mint_requests mr JOIN source_deposits sd ON sd.order_id = mr.order_id
     `,
     await tx<{ txid: string; vout: number; state: string; order_id: string; first_seen: Date;
-                has_refund: boolean; refund_activity: boolean; unsent_refunds: string[] }[]>`
-      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id,
+                has_refund: boolean; refund_activity: boolean; unsent_refunds: string[];
+                value_sat: string | null; refund_total_sat: string }[]>`
+      SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id, sd.amount_sat::text AS value_sat,
+             COALESCE((SELECT sum(r.excess_sat) FROM deposit_refunds r WHERE r.order_id = bo.id
+                        AND r.status <> 'too_small'), 0)::text AS refund_total_sat,
              -- Earliest trace of the order: audit_events is append-only (trigger +
              -- RLS), so moving bridge_orders.created_at can't hide an old order.
              LEAST(bo.created_at, COALESCE((SELECT min(a.created_at) FROM audit_events a WHERE a.order_id = bo.id), bo.created_at)) AS first_seen,
@@ -239,40 +242,56 @@ async function main(): Promise<void> {
     problems.push(`wBOB minted in [${from}, ${to}] is ${tokenMinted} but V1 MintExecuted sum is ${logMinted}: some mint is missing from the logs`);
   }
 
-  // ── Settled pre-cutover deposits are blocked too ──
-  // Refunds before the cutover never touched the chain, so a fully refunded
-  // deposit is not in the V1 logs. Import every deposit that is SETTLED
-  // (COMPLETED, REFUNDED, or with a deposit_refunds row); an extra key can only
-  // block a mint. A FAILED order without a refund is not settled (FAILED →
-  // REFUNDED is still possible) and is left to V2. Orders created after --to
-  // arrived when V1 could no longer mint: they belong to V2, not in-flight.
+  // ── Pre-cutover deposits the V1 logs don't cover ──
+  // (review round 6 #2-#4) Only two kinds are imported here:
+  //   - minted on V1 (already in the keys, from the logs): an unsent refund on
+  //     one is a blocker, because V2 refuses refunds on imported outputs;
+  //   - fully refunded (REFUNDED, every refund sent): nothing is left to mint.
+  // Everything else is LEFT TO V2 and listed: deposits after --to, unminted
+  // deposits (V1 was stopped before minting them) with or without refunds.
+  // V2 records their refunds before it can mint them (recordRefund works while
+  // V2 is paused; verify --stage pre-unpause checks it), and the watchers sign
+  // pre-cutover deposits only from this reviewed list (V2_MIN_DEPOSIT_HEIGHT +
+  // V2_PRE_CUTOVER_ALLOW). So a DB row edited to hide a refund cannot get an
+  // old output minted: it is either imported, on the reviewed list, or refused.
   const toTime = (await client.getBlock({ blockNumber: to })).timestamp;
+  const v1Minted = new Set(keys);
   let settledAdded = 0;
-  const inFlight: string[] = [];
-  const leftToV2: string[] = [];
-  const unsentRefunds: string[] = [];
+  const unsentOnMinted: string[] = [];
+  const leftToV2: { outpoint: string; orderId: string; state: string; valueSat: string | null;
+                    refundTotalSat: string; afterCutover: boolean }[] = [];
   for (const d of deposits) {
-    const createdAfterTo = BigInt(Math.floor(d.first_seen.getTime() / 1000)) > toTime;
-    // An imported output can never be refunded on V2, so every refund of a
-    // pre-cutover deposit must be SENT before the import (runbook: drain refunds).
-    if (!createdAfterTo && d.unsent_refunds.length > 0) unsentRefunds.push(`${d.order_id} (${d.unsent_refunds.join(',')})`);
-    const settled = d.state === 'COMPLETED' || d.state === 'REFUNDED' || d.has_refund || d.refund_activity;
-    if (!settled) {
-      if (createdAfterTo || d.state === 'FAILED') leftToV2.push(`${d.order_id} (${d.state})`);
-      else inFlight.push(`${d.order_id} (${d.state})`);
+    const k = keyOf(d.txid, d.vout);
+    const afterTo = BigInt(Math.floor(d.first_seen.getTime() / 1000)) > toTime;
+    if (v1Minted.has(k)) {
+      if (d.unsent_refunds.length > 0) unsentOnMinted.push(`${d.order_id} (${d.unsent_refunds.join(',')})`);
       continue;
     }
-    const k = keyOf(d.txid, d.vout);
-    if (!seen.has(k)) { seen.add(k); keys.push(k); settledAdded++; }
+    if (!afterTo && d.state === 'REFUNDED' && d.unsent_refunds.length === 0) {
+      if (!seen.has(k)) { seen.add(k); keys.push(k); settledAdded++; }
+      continue;
+    }
+    if (!afterTo && d.state === 'COMPLETED') {
+      // COMPLETED means minted, but V1's logs have no mint for it: the DB is wrong. Block it and say so.
+      if (!seen.has(k)) { seen.add(k); keys.push(k); settledAdded++; }
+      notes.push(`${d.order_id} is COMPLETED but V1 never minted ${opOf(d.txid, d.vout)}: imported (blocked); check by hand`);
+      continue;
+    }
+    leftToV2.push({ outpoint: opOf(d.txid, d.vout), orderId: d.order_id, state: d.state, valueSat: d.value_sat,
+                    refundTotalSat: d.refund_total_sat, afterCutover: afterTo });
   }
-  if (inFlight.length > 0) {
-    problems.push(`${inFlight.length} inbound order(s) created before --to are still in flight — drain them first: ${inFlight.slice(0, 5).join(', ')}`);
+  if (unsentOnMinted.length > 0) {
+    problems.push(`${unsentOnMinted.length} refund(s) on outputs V1 minted are not sent yet — send them first ` +
+      `(V2 refuses refunds on imported outputs): ${unsentOnMinted.slice(0, 5).join(', ')}`);
   }
-  if (unsentRefunds.length > 0) {
-    problems.push(`${unsentRefunds.length} refund(s) of pre-cutover deposits are not sent yet — send or settle them first ` +
-      `(V2 refuses refunds on imported outputs): ${unsentRefunds.slice(0, 5).join(', ')}`);
+  if (leftToV2.length > 0) {
+    notes.push(`${leftToV2.length} deposit(s) left to V2 (not imported; review each, see leftToV2 in the file): ` +
+      leftToV2.slice(0, 5).map((x) => `${x.outpoint} ${x.state}${x.refundTotalSat !== '0' ? ` refund ${x.refundTotalSat}` : ''}`).join(', '));
   }
-  if (leftToV2.length > 0) notes.push(`${leftToV2.length} unsettled order(s) left to V2 (not imported): ${leftToV2.slice(0, 5).join(', ')}`);
+  const allowOut = process.argv.includes('--allow-out') ? arg('allow-out') : null;
+  if (allowOut) {
+    writeFileSync(allowOut, JSON.stringify({ toBlock: to.toString(), outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
+  }
 
   const batches: Hex[][] = [];
   for (let i = 0; i < keys.length; i += BATCH) batches.push(keys.slice(i, i + BATCH));
@@ -284,7 +303,7 @@ async function main(): Promise<void> {
     count: keys.length, v1MintCount: logs.length, settledDepositsAdded: settledAdded,
     dbMintCount: dbRows.length, dbRowsChecked: allRows.length,
     tokenMinted: tokenMinted.toString(), logMinted: logMinted.toString(),
-    problems, allowed, notes,
+    problems, allowed, notes, leftToV2,
     // Never hand out import batches from a list that is not final.
     keys: final ? keys : [], batches: final ? batches : [],
   }, null, 2));
