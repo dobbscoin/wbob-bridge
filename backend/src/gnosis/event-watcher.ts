@@ -99,7 +99,7 @@ export class GnosisEventWatcher {
     while (from <= end) {
       const to = from + chunk - 1n < end ? from + chunk - 1n : end;
       const logs = await this.publicClient.getLogs({
-        address: this.config.bridgeControllerAddress as ViemHex, event: WITHDRAWAL_EVENT, fromBlock: from, toBlock: to,
+        address: this.controllerAddresses(), event: WITHDRAWAL_EVENT, fromBlock: from, toBlock: to,
       });
       if (logs.length > 0) {
         const ids = logs.map((l) => (l.args as { withdrawalId: bigint }).withdrawalId.toString());

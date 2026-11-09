@@ -10,10 +10,10 @@
  * of a deposit will not be minted, and never broadcasts a refund until this
  * reports it recorded. recordRefund is monotonic and idempotent on-chain, and
  * can only BLOCK mints, so the relayer key holding the role is low-risk.
- * Reads go through the fallback RPC list; the write is pinned to the primary.
+ * Reads and the write are pinned to the primary (our node).
  */
 import {
-  createPublicClient, createWalletClient, http, fallback, parseAbi,
+  createPublicClient, createWalletClient, http, parseAbi,
   keccak256, encodeAbiParameters, parseAbiParameters, type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -50,7 +50,9 @@ export class RefundRecorder {
 
   constructor(private readonly config: BackendConfig) {
     this.account = privateKeyToAccount(config.executorPrivateKey as Hex);
-    this.reader = createPublicClient({ chain: gnosis, transport: fallback(config.gnosisRpcUrls.map((u) => http(u))) });
+    // Security reads (is it recorded? imported? minted?) gate sending coins:
+    // only our node answers them, never a public fallback (review round 7 #5).
+    this.reader = createPublicClient({ chain: gnosis, transport: http(config.gnosisRpcUrl) });
     this.writer = createWalletClient({ account: this.account, chain: gnosis, transport: http(config.gnosisRpcUrl) });
   }
 

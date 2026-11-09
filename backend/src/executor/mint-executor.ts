@@ -383,6 +383,7 @@ export class MintExecutor {
         continue;
       }
       this.checkFailingSince.delete(order.order_id);
+      if (this.checkFailingSince.size === 0) this.checkFailAlerted = false;   // recovered: the next outage alerts again
       try {
         const outcome = await this.sql.begin(async (tx) => {
           // Serialise capacity decisions bridge-wide (all backend instances).
@@ -538,7 +539,7 @@ export class MintExecutor {
     const first = this.checkFailingSince.get(orderId) ?? Date.now();
     this.checkFailingSince.set(orderId, first);
     if (Date.now() - first < 15 * 60_000 || this.checkFailAlerted) return;
-    this.checkFailAlerted = true;    // once per process; it repeats on restart if still failing
+    this.checkFailAlerted = true;    // once per outage; re-armed when every check succeeds again
     await this._alert({ level: 'critical', type: 'MINT_SUBMIT_BLOCKED',
       message: `Mints are not being authorized: the already-minted check has failed for ${Math.round((Date.now() - first) / 60_000)} min ` +
         `(order ${orderId}): ${String(err).slice(0, 200)}. Check the Gnosis RPC and LEGACY_BRIDGE_CONTROLLER_ADDRESSES.`,

@@ -143,10 +143,16 @@ async function main(): Promise<void> {
     `,
     await tx<{ txid: string; vout: number; state: string; order_id: string; first_seen: Date;
                 has_refund: boolean; refund_activity: boolean; unsent_refunds: string[];
-                value_sat: string | null; refund_total_sat: string }[]>`
+                value_sat: string | null; refund_total_sat: string; audit_refund_sat: string }[]>`
       SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id, sd.amount_sat::text AS value_sat,
              COALESCE((SELECT sum(r.excess_sat) FROM deposit_refunds r WHERE r.order_id = bo.id
                         AND r.status <> 'too_small'), 0)::text AS refund_total_sat,
+             -- What the append-only trail says was SIGNED as refunds for this order
+             -- (one REFUND_SIGNED per refund id; a re-sign keeps the id).
+             COALESCE((SELECT sum(x.ex) FROM (
+                 SELECT DISTINCT ON (a.metadata->>'refundId') (a.metadata->>'excessSat')::numeric AS ex
+                 FROM audit_events a WHERE a.order_id = bo.id AND a.event_type = 'REFUND_SIGNED'
+                 ORDER BY a.metadata->>'refundId', a.id) x), 0)::text AS audit_refund_sat,
              -- Earliest trace of the order: audit_events is append-only (trigger +
              -- RLS), so moving bridge_orders.created_at can't hide an old order.
              LEAST(bo.created_at, COALESCE((SELECT min(a.created_at) FROM audit_events a WHERE a.order_id = bo.id), bo.created_at)) AS first_seen,
@@ -259,7 +265,7 @@ async function main(): Promise<void> {
   let settledAdded = 0;
   const unsentOnMinted: string[] = [];
   const leftToV2: { outpoint: string; orderId: string; state: string; valueSat: string | null;
-                    refundTotalSat: string; afterCutover: boolean }[] = [];
+                    refundTotalSat: string; auditRefundSat: string; afterCutover: boolean }[] = [];
   for (const d of deposits) {
     const k = keyOf(d.txid, d.vout);
     const afterTo = BigInt(Math.floor(d.first_seen.getTime() / 1000)) > toTime;
@@ -277,8 +283,27 @@ async function main(): Promise<void> {
       notes.push(`${d.order_id} is COMPLETED but V1 never minted ${opOf(d.txid, d.vout)}: imported (blocked); check by hand`);
       continue;
     }
+    // (review round 7 #1) The refund total must come from the append-only trail
+    // too: a DB writer could delete or shrink a deposit_refunds row so the deposit
+    // looks unrefunded and mints in full on V2. Rows may exceed the trail (a
+    // refund queued, not signed yet), never the other way round.
+    const dbTotal = BigInt(d.refund_total_sat);
+    const auditTotal = BigInt(Math.round(Number(d.audit_refund_sat)));
+    if (auditTotal > dbTotal) {
+      problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}): the audit trail shows ${auditTotal} sat signed as refunds, ` +
+        `deposit_refunds only ${dbTotal}: refund rows were removed or shrunk`);
+    }
+    if (d.refund_activity && !d.has_refund) {
+      problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}): refund activity in the audit trail but no deposit_refunds row`);
+    }
+    // (review round 7 #6) A FAILED order is terminal: V2 never picks it up again.
+    if (d.state === 'FAILED') {
+      problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}) is FAILED and V1 never minted it: nothing will mint or ` +
+        `refund it on V2. Settle it by hand (refund, or re-queue), or --allow it with the plan written down`);
+    }
     leftToV2.push({ outpoint: opOf(d.txid, d.vout), orderId: d.order_id, state: d.state, valueSat: d.value_sat,
-                    refundTotalSat: d.refund_total_sat, afterCutover: afterTo });
+                    refundTotalSat: (auditTotal > dbTotal ? auditTotal : dbTotal).toString(),
+                    auditRefundSat: auditTotal.toString(), afterCutover: afterTo });
   }
   if (unsentOnMinted.length > 0) {
     problems.push(`${unsentOnMinted.length} refund(s) on outputs V1 minted are not sent yet — send them first ` +
@@ -288,9 +313,18 @@ async function main(): Promise<void> {
     notes.push(`${leftToV2.length} deposit(s) left to V2 (not imported; review each, see leftToV2 in the file): ` +
       leftToV2.slice(0, 5).map((x) => `${x.outpoint} ${x.state}${x.refundTotalSat !== '0' ? ` refund ${x.refundTotalSat}` : ''}`).join(', '));
   }
+  // (review round 7 #4) The watchers' floor is the Dobbscoin height at which
+  // REFUNDS_AUTO_SEND went off (runbook step 5), given here and written into the
+  // allow file, never copied by hand: refunds sent before it are the only ones
+  // V2 cannot learn from the backend, and every deposit below it that V1 did not
+  // mint is on this list.
   const allowOut = process.argv.includes('--allow-out') ? arg('allow-out') : null;
+  let floorHeight: number | null = null;
   if (allowOut) {
-    writeFileSync(allowOut, JSON.stringify({ toBlock: to.toString(), outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
+    floorHeight = Number(arg('floor-height'));
+    if (!Number.isInteger(floorHeight) || floorHeight <= 0) throw new Error('--floor-height must be the Dobbscoin height from runbook step 5');
+    writeFileSync(allowOut, JSON.stringify({ toBlock: to.toString(), minDepositHeight: floorHeight,
+                                             outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
   }
 
   const batches: Hex[][] = [];

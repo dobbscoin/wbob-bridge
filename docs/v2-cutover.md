@@ -32,7 +32,9 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
    every refund you can. Only one thing blocks the export: an unsent refund on an output **V1
    minted** (V2 can never record a refund on an imported output). Anything V1 did not mint
    (a stray deposit, an unfinished mint, a deposit after B1) is **left to V2** and listed.
-   Then set **`REFUNDS_AUTO_SEND=false`** on the backend and restart it, until step 12: a
+   Then set **`REFUNDS_AUTO_SEND=false`** on the backend and restart it, and write down the
+   **Dobbscoin tip height F** at that moment (`dobbscoin-cli getblockcount`). F becomes the
+   watchers' V2 floor in step 8. Keep auto-send off until step 12: a
    refund sent in between would not be in the import, and V2 could later mint those coins too.
    Refunds decided in the window wait in `queued` and are recorded on V2, then sent, after the
    flip. A refund paid **by hand** at any time must get a `deposit_refunds` row (status
@@ -42,10 +44,11 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
    Note the block number **B1**.
 7. Wait until B1 is **finalized** on Gnosis.
 8. **Export** (read-only):
-   `node --import=tsx scripts/v2-export-outpoints.ts --from 45811925 --to B1 --v1 <V1> --out v1-outpoints.json`
-   `node --import=tsx scripts/v2-export-outpoints.ts --from 45811925 --to B1 --v1 <V1> --out v1-outpoints.json --allow-out v2-pre-cutover-allow.json`
+   `node --import=tsx scripts/v2-export-outpoints.ts --from 45811925 --to B1 --v1 <V1> --out v1-outpoints.json --allow-out v2-pre-cutover-allow.json --floor-height F`
    It must print `final: true` with 0 problems. Any `--allow` entry needs a written reason.
-   Note the Dobbscoin tip height **H** right after the export.
+   The export refuses when the append-only audit trail shows more refunded than `deposit_refunds`
+   (rows removed or shrunk), and for a `FAILED` order V1 never minted (nothing would pick it up
+   on V2: settle it by hand, or `--allow` it with the plan written down).
    **Review `leftToV2`** in the file, one by one, on the explorer: each is a deposit V1 never
    minted, with the refund the bridge already decided (`refundTotalSat`). These are the only
    pre-cutover deposits the watchers will sign for on V2 (`v2-pre-cutover-allow.json`): remove any
@@ -63,9 +66,9 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
     `LEGACY_BRIDGE_CONTROLLER_ADDRESSES=<V1>` · `BRIDGE_EXECUTOR_MODULE_ADDRESS=<new module>` ·
     `EMERGENCY_OPERATOR_PRIVATE_KEY=<new key>` (never the relayer key; verify checks) ·
     `REFUNDS_AUTO_SEND` back to `true` ·
-    watchers: `V2_MIN_DEPOSIT_HEIGHT=<H>` · `V2_PRE_CUTOVER_ALLOW=<path to v2-pre-cutover-allow.json>`
-    (a V2 watcher refuses to start without the height; it never signs for a deposit confirmed
-    below H unless it is on that list) ·
+    watchers: `V2_PRE_CUTOVER_ALLOW=<path to v2-pre-cutover-allow.json>` (it carries the floor F;
+    a V2 watcher refuses to start without it, and never signs for a deposit confirmed below F
+    unless it is on that list) ·
     portal `NEXT_PUBLIC_BRIDGE_CONTROLLER_ADDRESS=<V2>`,
     `NEXT_PUBLIC_BRIDGE_CONTROLLER_VERSION=2` (rebuild). Restart; the backend must log
     `controller … verified as V2` and no `BridgeGuard NOT READY`.

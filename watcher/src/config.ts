@@ -69,15 +69,19 @@ function optionalEnvInt(key: string, defaultVal: number): number {
   return parsed;
 }
 
-function loadPreCutoverAllowed(path: string | undefined): Set<string> {
-  if (path === undefined || path === '') return new Set();
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { outpoints?: unknown };
+function loadPreCutoverAllow(path: string | undefined): { minDepositHeight: number | null; outpoints: Set<string> } {
+  if (path === undefined || path === '') return { minDepositHeight: null, outpoints: new Set() };
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as { outpoints?: unknown; minDepositHeight?: unknown };
   if (!Array.isArray(raw.outpoints)) throw new Error(`V2_PRE_CUTOVER_ALLOW ${path}: expected {"outpoints": ["txid:vout", ...]}`);
-  return new Set(raw.outpoints.map((o) => {
+  const h = raw.minDepositHeight;
+  if (h !== undefined && (typeof h !== 'number' || !Number.isInteger(h) || h <= 0)) {
+    throw new Error(`V2_PRE_CUTOVER_ALLOW ${path}: minDepositHeight must be a positive integer`);
+  }
+  return { minDepositHeight: (h as number | undefined) ?? null, outpoints: new Set(raw.outpoints.map((o) => {
     const v = String(o).toLowerCase();
     if (!/^[0-9a-f]{64}:\d+$/.test(v)) throw new Error(`V2_PRE_CUTOVER_ALLOW ${path}: bad outpoint ${String(o)}`);
     return v;
-  }));
+  })) };
 }
 
 export function loadConfig(): WatcherConfig {
@@ -87,11 +91,17 @@ export function loadConfig(): WatcherConfig {
   }
 
   const version = parseBridgeControllerVersion(process.env['BRIDGE_CONTROLLER_VERSION']);
-  const minHeightRaw = process.env['V2_MIN_DEPOSIT_HEIGHT'];
-  if (version === 2 && (minHeightRaw === undefined || minHeightRaw === '')) {
-    throw new Error('BRIDGE_CONTROLLER_VERSION=2 needs V2_MIN_DEPOSIT_HEIGHT (the Dobbscoin height at the cutover; see docs/v2-cutover.md)');
+  // The floor comes from the export's allow file (V2_PRE_CUTOVER_ALLOW). A
+  // V2_MIN_DEPOSIT_HEIGHT env, if also set, must agree with it.
+  const allow = loadPreCutoverAllow(process.env['V2_PRE_CUTOVER_ALLOW']);
+  const envHeight = process.env['V2_MIN_DEPOSIT_HEIGHT'] ? optionalEnvInt('V2_MIN_DEPOSIT_HEIGHT', 0) : null;
+  if (envHeight !== null && allow.minDepositHeight !== null && envHeight !== allow.minDepositHeight) {
+    throw new Error(`V2_MIN_DEPOSIT_HEIGHT=${envHeight} disagrees with the allow file's minDepositHeight ${allow.minDepositHeight}`);
   }
-  const v2MinDepositHeight = minHeightRaw ? optionalEnvInt('V2_MIN_DEPOSIT_HEIGHT', 0) : null;
+  const v2MinDepositHeight = allow.minDepositHeight ?? envHeight;
+  if (version === 2 && v2MinDepositHeight === null) {
+    throw new Error('BRIDGE_CONTROLLER_VERSION=2 needs V2_PRE_CUTOVER_ALLOW (the export\'s allow file, with minDepositHeight); see docs/v2-cutover.md');
+  }
 
   return {
     rpc: {
@@ -115,6 +125,6 @@ export function loadConfig(): WatcherConfig {
     hdDerivationPath:        process.env['HD_DERIVATION_PATH'] || 'm/0',
     dobbscoinAddressVersion: optionalEnvInt('DOBBSCOIN_ADDRESS_VERSION', 0),
     v2MinDepositHeight,
-    v2PreCutoverAllowed:     loadPreCutoverAllowed(process.env['V2_PRE_CUTOVER_ALLOW']),
+    v2PreCutoverAllowed:     allow.outpoints,
   };
 }
