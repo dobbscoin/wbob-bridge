@@ -95,9 +95,9 @@ export class GnosisEventWatcher {
     const end = watermark < tip ? watermark : tip;
     let from = this.recountCursor ?? this.config.gnosisStartBlock;
     const chunk = BigInt(this.config.gnosisLogScanChunk);
-    const missing: string[] = [];
     while (from <= end) {
       const to = from + chunk - 1n < end ? from + chunk - 1n : end;
+      const missing: string[] = [];
       const logs = await this.publicClient.getLogs({
         address: this.controllerAddresses(), event: WITHDRAWAL_EVENT, fromBlock: from, toBlock: to,
       });
@@ -116,13 +116,28 @@ export class GnosisEventWatcher {
           });
         }
       }
+      // Self-check (review round 8 #4): every withdrawal the DB already has in
+      // this range must be in the node's answer. If not, the node is returning
+      // incomplete logs (pruned history, a bad answer) and this recount proves
+      // nothing for the range.
+      const seenIds = new Set(logs.map((l) => (l.args as { withdrawalId: bigint }).withdrawalId.toString()));
+      const dbHere = await this.sql<{ withdrawal_id: string }[]>`
+        SELECT withdrawal_id::text FROM withdrawal_requests WHERE burn_block_number BETWEEN ${from.toString()} AND ${to.toString()}
+      `;
+      const unseen = dbHere.filter((r) => !seenIds.has(r.withdrawal_id)).map((r) => r.withdrawal_id);
+      if (unseen.length > 0) {
+        await this._alert(`Withdrawal recount: our Gnosis node returned no WithdrawalRequested for ${unseen.length} withdrawal(s) ` +
+          `the database has in blocks ${from}-${to} (${unseen.slice(0, 3).join(', ')}): its logs are incomplete, so missing burns ` +
+          `could go unnoticed. Check the node (pruning? resync?).`, { from: from.toString(), to: to.toString(), unseen: unseen.slice(0, 20) });
+      }
+      // Alert per chunk, so a later failure in the same pass cannot swallow it.
+      if (missing.length > 0) {
+        await this._alert(`${missing.length} burned withdrawal(s) were missing from the database below the scan ` +
+          `watermark and have been ingested now: ${missing.slice(0, 5).join(', ')}. Either an RPC answered wrong or ` +
+          `the DB was edited; check how they went missing.`, { missing: missing.slice(0, 20) });
+      }
       this.recountCursor = to + 1n;
       from = to + 1n;
-    }
-    if (missing.length > 0) {
-      await this._alert(`${missing.length} burned withdrawal(s) were missing from the database below the scan ` +
-        `watermark and have been ingested now: ${missing.slice(0, 5).join(', ')}. Either an RPC answered wrong or ` +
-        `the DB was edited; check how they went missing.`, { missing: missing.slice(0, 20) });
     }
   }
 
@@ -132,6 +147,24 @@ export class GnosisEventWatcher {
     } catch (err) {
       console.error('[gnosis-watcher] alert failed:', err);
     }
+  }
+
+  private headStaleAlerted = false;
+  /**
+   * Our node can answer and still be stuck (stalled sync, resync): every scan
+   * then "succeeds" with nothing new. One critical alert when its newest block
+   * is more than 5 min old (Gnosis makes one every ~5 s); re-armed when fresh.
+   */
+  private async _checkHead(): Promise<void> {
+    let ts: bigint;
+    try { ts = (await this.publicClient.getBlock({ blockTag: 'latest' })).timestamp; }
+    catch { return; }                                  // unreachable: the scan-stall alert covers it
+    const age = Math.floor(Date.now() / 1000) - Number(ts);
+    if (age <= 300) { this.headStaleAlerted = false; return; }
+    if (this.headStaleAlerted) return;
+    this.headStaleAlerted = true;
+    await this._alert(`Our Gnosis node's newest block is ${Math.round(age / 60)} min old: it answers but is not syncing. ` +
+      `Withdrawals are not being picked up and payouts wait. Check erigon.`, { ageSeconds: age });
   }
 
   /** One critical alert when no scan has completed for 30 min; re-armed by the next success. */
@@ -166,15 +199,28 @@ export class GnosisEventWatcher {
       try { await this.poll(); }
       catch (err) { console.error('[gnosis-watcher] poll error:', err); }
       await this._checkStall();
+      await this._checkHead();
       await new Promise<void>((r) => setTimeout(r, this.config.executorPollIntervalMs));
     }
   }
 
+  /** Consecutive failed recount rounds; one alert at RECOUNT_FAIL_ALERT, re-armed by a success. */
+  private recountFailures = 0;
+
   /** Recount every 10 min, on its own loop so a slow full pass never delays ingestion. */
   private async _recountLoop(): Promise<void> {
     while (true) {
-      try { await this.recount(); }
-      catch (err) { console.error('[gnosis-watcher] recount failed (retrying next round):', err); }
+      try {
+        await this.recount();
+        this.recountFailures = 0;
+      } catch (err) {
+        console.error('[gnosis-watcher] recount failed (retrying next round):', err);
+        this.recountFailures++;
+        if (this.recountFailures === 3) {
+          await this._alert(`The withdrawal recount has failed 3 rounds in a row (~30 min): ${String(err).slice(0, 200)}. ` +
+            `Burns missing from the database are not being caught until it works again.`, {});
+        }
+      }
       await new Promise<void>((r) => setTimeout(r, 10 * 60_000));
     }
   }

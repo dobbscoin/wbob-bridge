@@ -511,4 +511,30 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${orderId} AND to_state = 'MANUAL_REVIEW'`;
     expect(a!.error).toMatch(/malleated/);
   });
+
+  // ── Review round 8 #2: a legit retry after the node refused the first tx ─
+  it('an earlier refused payout whose input was reused by ANOTHER payout we signed (confirmed) does not block the retry', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const { orderId: other } = await order(OutboundState.COMPLETED, 300_000n);
+    const coin = rnd(32);
+    const spend = (extra: number) => {
+      const v = Buffer.alloc(4); const pad = Buffer.alloc(4); pad.writeUInt32LE(extra, 0);
+      return Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(coin, 'hex').reverse(), v,
+        Buffer.from([0]), Buffer.alloc(4, 0xff), Buffer.from([0]), pad]).toString('hex');
+    };
+    const t1 = spend(1), t2 = spend(2);                                  // two different txs spending the same coin
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(t1), signedHex: t1 })})`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${other}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(t2), signedHex: t2 })})`;
+    const seen: string[] = [];
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async (t) => (t === txidFromRawHex(t2) ? 4 : -1),  // t1 refused, t2 (the other withdrawal) confirmed
+      isUnspent: async (t) => t !== coin,
+      burn: { verify: async () => { seen.push('burn'); return { ok: false, defer: true, reason: 'stop here' }; } },
+    }).processQueued();
+    expect(seen).toEqual(['burn']);                                      // past the already-paid check
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
 });

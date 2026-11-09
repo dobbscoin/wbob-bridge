@@ -333,12 +333,50 @@ export class PayoutExecutor {
         try { unspent = await this.rpc.isUnspent(i.txid, i.vout); }
         catch { return { defer: true, reason: `node unreachable while checking inputs of earlier payout ${t}` }; }
         if (!unspent) {
-          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent although ` +
-            `${t} itself is unknown: possibly a malleated copy that paid this withdrawal; check by hand` };
+          // Usually innocent (review round 8 #2): after a definite rejection the
+          // inputs are released and the next payout or refund reuses them. If
+          // another tx WE signed spends this outpoint and the node has it, the
+          // outpoint is taken: neither ${t} nor any malleated copy of it can be
+          // in the chain. Only an input spent by something we never signed is
+          // a reason to stop.
+          const spender = await this._knownSpender(i.txid, i.vout, t);
+          if (spender === null) return { defer: true, reason: `node unreachable while checking who spent ${i.txid}:${i.vout}` };
+          if (spender !== false) continue;
+          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent by a tx ` +
+            `the bridge never signed, although ${t} itself is unknown: possibly a malleated copy that paid this withdrawal; check by hand` };
         }
       }
     }
     return null;
+  }
+
+  /**
+   * A tx the bridge signed (append-only audit trail: PAYOUT_SIGNED hex or
+   * REFUND_SIGNED inputs), other than `except`, that spends txid:vout and that
+   * the node has (confirmed or mempool). Returns its txid, false if none, null
+   * if the node could not be asked.
+   */
+  private async _knownSpender(txid: string, vout: number, except: string): Promise<string | false | null> {
+    const le = Buffer.alloc(4); le.writeUInt32LE(vout, 0);
+    const needle = Buffer.from(txid, 'hex').reverse().toString('hex') + le.toString('hex');
+    const cands = await this.sql<{ txid: string | null; hex: string | null }[]>`
+      SELECT metadata->>'txid' AS txid, metadata->>'signedHex' AS hex FROM audit_events
+      WHERE (event_type = 'PAYOUT_SIGNED' AND position(${needle} IN lower(metadata->>'signedHex')) > 0)
+         OR (event_type = 'REFUND_SIGNED' AND metadata->'inputs' ? ${`${txid}:${vout}`})
+    `;
+    for (const c of cands) {
+      const ct = c.txid ?? (c.hex ? txidFromRawHex(c.hex) : null);
+      if (ct === null || ct === except) continue;
+      if (c.hex) {   // the substring could sit in a script: confirm it is really an input
+        let ins: { txid: string; vout: number }[] = [];
+        try { ins = txInputsFromRawHex(c.hex); } catch { continue; }
+        if (!ins.some((x) => x.txid === txid && x.vout === vout)) continue;
+      }
+      const has = await this._nodeHas(ct);
+      if (has === null) return null;
+      if (has !== 'no') return ct;
+    }
+    return false;
   }
 
   /** Null if the burn on Gnosis backs this payout exactly; else why not (defer = retry later). */
