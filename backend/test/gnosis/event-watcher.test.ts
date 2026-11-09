@@ -541,3 +541,56 @@ describe('GnosisEventWatcher.recount', () => {
   });
 });
 
+// ─── review round 8 #3 / #4 ──────────────────────────────────────────────────
+
+describe('GnosisEventWatcher round 8: recount self-check, per-chunk alerts, stale head', () => {
+  function withAlerts(config: BackendConfig, mock: MockPublicClient) {
+    const w = makeWatcher(config, mock);
+    const sent: string[] = [];
+    (w as unknown as { alerts: unknown }).alerts = { dispatch: async (a: { message: string }) => { sent.push(a.message); } };
+    return { w, sent };
+  }
+  const cfg = () => makeConfig({ gnosisStartBlock: 100_000n, gnosisLogScanChunk: 1000 } as Partial<BackendConfig>);
+
+  it('a node that returns no logs for a withdrawal the DB has in that range raises "incomplete"', async () => {
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(200_000n);
+    mock.setLogsForRange(100_000n, 100_999n, [makeLog(100_400n, 90n)]);
+    await setLastBlock(100_999n);
+    const a = withAlerts(cfg(), mock);
+    await a.w.recount();                                // ingests 90
+    mock.setLogsForRange(100_000n, 100_999n, []);       // now the node "forgets" it
+    const b = withAlerts(cfg(), mock);                  // fresh process re-reads from the start
+    await b.w.recount();
+    expect(b.sent.some((m) => /logs are incomplete/.test(m))).toBe(true);
+  });
+
+  it('a burn ingested in chunk 1 is alerted even when chunk 2 fails', async () => {
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(200_000n);
+    mock.setLogsForRange(100_000n, 100_999n, [makeLog(100_300n, 91n)]);
+    const real = mock.getLogs.bind(mock);
+    mock.getLogs = async (p) => { if (p.fromBlock === 101_000n) throw new Error('rpc blew up'); return real(p); };
+    await setLastBlock(101_999n);
+    const { w, sent } = withAlerts(cfg(), mock);
+    await expect(w.recount()).rejects.toThrow(/rpc blew up/);
+    expect(sent.some((m) => /missing from the database/.test(m))).toBe(true);
+    expect(await countWithdrawals()).toBe(1);
+  });
+
+  it('a node whose newest block is old raises one stale-head alert; a fresh head re-arms it', async () => {
+    const mock = new MockPublicClient();
+    let ts = BigInt(Math.floor(Date.now() / 1000) - 3600);
+    (mock as unknown as { getBlock: unknown }).getBlock = async () => ({ timestamp: ts });
+    const { w, sent } = withAlerts(cfg(), mock);
+    const check = () => (w as unknown as { _checkHead(): Promise<void> })._checkHead();
+    await check(); await check();
+    expect(sent.filter((m) => /not syncing/.test(m))).toHaveLength(1);
+    ts = BigInt(Math.floor(Date.now() / 1000));
+    await check();
+    ts = BigInt(Math.floor(Date.now() / 1000) - 3600);
+    await check();
+    expect(sent.filter((m) => /not syncing/.test(m))).toHaveLength(2);
+  });
+});
+
