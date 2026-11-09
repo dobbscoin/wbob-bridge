@@ -143,16 +143,40 @@ async function main(): Promise<void> {
     `,
     await tx<{ txid: string; vout: number; state: string; order_id: string; first_seen: Date;
                 has_refund: boolean; refund_activity: boolean; unsent_refunds: string[];
-                value_sat: string | null; refund_total_sat: string; audit_refund_sat: string }[]>`
+                value_sat: string | null; refund_total_sat: string; refund_all_sat: string; audit_refund_sat: string;
+                audit_orders: string[]; bad_refund_rows: number }[]>`
+      WITH ad AS (
+        -- (review round 8 #1) The orders the append-only trail ties to each deposit
+        -- OUTPOINT (watcher ORDER_CREATED / STATE_TRANSITION rows carry txid + vout),
+        -- not the mutable source_deposits.order_id: re-pointing a refunded deposit at
+        -- a fresh order must not shed its refund history.
+        SELECT lower(a.metadata->>'txid') AS txid, (a.metadata->>'vout') AS vout, array_agg(DISTINCT a.order_id::text) AS orders
+        FROM audit_events a
+        WHERE a.metadata ? 'txid' AND a.metadata ? 'vout' AND a.event_type IN ('ORDER_CREATED', 'STATE_TRANSITION')
+        GROUP BY 1, 2
+      )
       SELECT sd.txid, sd.vout, bo.state, bo.id::text AS order_id, sd.amount_sat::text AS value_sat,
-             COALESCE((SELECT sum(r.excess_sat) FROM deposit_refunds r WHERE r.order_id = bo.id
-                        AND r.status <> 'too_small'), 0)::text AS refund_total_sat,
-             -- What the append-only trail says was SIGNED as refunds for this order
-             -- (one REFUND_SIGNED per refund id; a re-sign keeps the id).
+             COALESCE(ad.orders, '{}') AS audit_orders,
+             COALESCE((SELECT sum(r.excess_sat) FROM deposit_refunds r
+                        WHERE ((lower(r.deposit_txid) = lower(sd.txid) AND r.deposit_vout = sd.vout) OR r.order_id = bo.id)
+                          AND r.status <> 'too_small'), 0)::text AS refund_total_sat,
+             COALESCE((SELECT sum(r.excess_sat) FROM deposit_refunds r
+                        WHERE (lower(r.deposit_txid) = lower(sd.txid) AND r.deposit_vout = sd.vout) OR r.order_id = bo.id), 0)::text AS refund_all_sat,
+             -- What the trail says was SIGNED as refunds for this deposit, across every
+             -- order tied to it: one REFUND_SIGNED per refund id (a re-sign keeps the
+             -- id), written by the refund executor, a positive integer. A DB writer can
+             -- INSERT audit rows, so any other REFUND_SIGNED is counted as bad, not summed.
              COALESCE((SELECT sum(x.ex) FROM (
                  SELECT DISTINCT ON (a.metadata->>'refundId') (a.metadata->>'excessSat')::numeric AS ex
-                 FROM audit_events a WHERE a.order_id = bo.id AND a.event_type = 'REFUND_SIGNED'
+                 FROM audit_events a
+                 WHERE a.event_type = 'REFUND_SIGNED' AND a.actor = 'refund-executor'
+                   AND a.metadata->>'excessSat' ~ '^[1-9][0-9]*$'
+                   AND (a.order_id = bo.id OR a.order_id::text = ANY(COALESCE(ad.orders, '{}')))
                  ORDER BY a.metadata->>'refundId', a.id) x), 0)::text AS audit_refund_sat,
+             (SELECT count(*)::int FROM audit_events a
+               WHERE a.event_type = 'REFUND_SIGNED'
+                 AND (a.order_id = bo.id OR a.order_id::text = ANY(COALESCE(ad.orders, '{}')))
+                 AND (a.actor IS DISTINCT FROM 'refund-executor' OR NOT (a.metadata->>'excessSat' ~ '^[1-9][0-9]*$'))) AS bad_refund_rows,
              -- Earliest trace of the order: audit_events is append-only (trigger +
              -- RLS), so moving bridge_orders.created_at can't hide an old order.
              LEAST(bo.created_at, COALESCE((SELECT min(a.created_at) FROM audit_events a WHERE a.order_id = bo.id), bo.created_at)) AS first_seen,
@@ -163,6 +187,7 @@ async function main(): Promise<void> {
              COALESCE((SELECT array_agg(r.status) FROM deposit_refunds r WHERE r.order_id = bo.id
                         AND r.status NOT IN ('broadcast', 'confirmed', 'too_small')), '{}') AS unsent_refunds
       FROM source_deposits sd JOIN bridge_orders bo ON bo.id = sd.order_id
+      LEFT JOIN ad ON ad.txid = lower(sd.txid) AND ad.vout = sd.vout::text
       WHERE bo.order_type = 'inbound' AND sd.txid IS NOT NULL AND sd.vout IS NOT NULL
     `,
   ] as const);
@@ -287,18 +312,39 @@ async function main(): Promise<void> {
     // too: a DB writer could delete or shrink a deposit_refunds row so the deposit
     // looks unrefunded and mints in full on V2. Rows may exceed the trail (a
     // refund queued, not signed yet), never the other way round.
+    const op = opOf(d.txid, d.vout);
     const dbTotal = BigInt(d.refund_total_sat);
-    const auditTotal = BigInt(Math.round(Number(d.audit_refund_sat)));
-    if (auditTotal > dbTotal) {
-      problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}): the audit trail shows ${auditTotal} sat signed as refunds, ` +
-        `deposit_refunds only ${dbTotal}: refund rows were removed or shrunk`);
+    const dbAll = BigInt(d.refund_all_sat);        // incl. too_small: a signed refund later marked too_small
+    const auditTotal = BigInt(d.audit_refund_sat.split('.')[0]!);
+    const others = d.audit_orders.filter((o) => o !== d.order_id);
+    if (d.audit_orders.length === 0) {
+      problem(op, `${op} (order ${d.order_id}): no watcher audit row names this deposit: its history can't be checked`);
+    } else if (others.length > 0) {
+      problem(op, `${op}: the audit trail ties it to order(s) ${others.join(', ')}, but source_deposits points at ${d.order_id}: re-pointed`);
+    }
+    if (d.bad_refund_rows > 0) {
+      problem(op, `${op} (order ${d.order_id}): ${d.bad_refund_rows} REFUND_SIGNED audit row(s) not written by the refund executor ` +
+        `or without a positive amount: forged?`);
+    }
+    if (auditTotal > dbAll) {
+      problem(op, `${op} (order ${d.order_id}): the audit trail shows ${auditTotal} sat signed as refunds, ` +
+        `deposit_refunds only ${dbAll}: refund rows were removed or shrunk`);
     }
     if (d.refund_activity && !d.has_refund) {
       problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}): refund activity in the audit trail but no deposit_refunds row`);
     }
     // (review round 7 #6) A FAILED order is terminal: V2 never picks it up again.
     if (d.state === 'FAILED') {
-      problem(opOf(d.txid, d.vout), `${opOf(d.txid, d.vout)} (order ${d.order_id}) is FAILED and V1 never minted it: nothing will mint or ` +
+      // (review round 8 #7) A deposit our node never saw (dropped or double-spent
+      // before confirming) has nothing to settle.
+      let known = true;
+      try { await rpc.getRawTransactionVerbose(d.txid.replace(/^0x/, '')); }
+      catch (err) { if (err instanceof RpcCallError && err.code === -5) known = false; else throw err; }
+      if (!known) {
+        notes.push(`${op} (order ${d.order_id}) is FAILED and our node never saw its tx: nothing to settle; skipped`);
+        continue;
+      }
+      problem(op, `${op} (order ${d.order_id}) is FAILED and V1 never minted it: nothing will mint or ` +
         `refund it on V2. Settle it by hand (refund, or re-queue), or --allow it with the plan written down`);
     }
     leftToV2.push({ outpoint: opOf(d.txid, d.vout), orderId: d.order_id, state: d.state, valueSat: d.value_sat,
@@ -323,6 +369,14 @@ async function main(): Promise<void> {
   if (allowOut) {
     floorHeight = Number(arg('floor-height'));
     if (!Number.isInteger(floorHeight) || floorHeight <= 0) throw new Error('--floor-height must be the Dobbscoin height from runbook step 5');
+    // (review round 8 #6) Sanity-check it against our node: F was the tip a few
+    // hours ago, so it is at most the tip and not far below it.
+    const dobTip = await rpc.call<number>('getblockcount');
+    const window = Number(process.argv.includes('--floor-window') ? arg('floor-window') : '5000');
+    if (floorHeight > dobTip) throw new Error(`--floor-height ${floorHeight} is above the Dobbscoin tip ${dobTip}: typo?`);
+    if (floorHeight < dobTip - window) {
+      throw new Error(`--floor-height ${floorHeight} is more than ${window} blocks below the tip ${dobTip}: typo? (--floor-window to widen)`);
+    }
     writeFileSync(allowOut, JSON.stringify({ toBlock: to.toString(), minDepositHeight: floorHeight,
                                              outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
   }

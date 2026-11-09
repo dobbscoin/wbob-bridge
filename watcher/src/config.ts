@@ -95,11 +95,12 @@ export function loadConfig(): WatcherConfig {
   // V2_MIN_DEPOSIT_HEIGHT env, if also set, must agree with it.
   const allow = loadPreCutoverAllow(process.env['V2_PRE_CUTOVER_ALLOW']);
   const envHeight = process.env['V2_MIN_DEPOSIT_HEIGHT'] ? optionalEnvInt('V2_MIN_DEPOSIT_HEIGHT', 0) : null;
+  if (envHeight !== null && envHeight <= 0) throw new Error(`V2_MIN_DEPOSIT_HEIGHT must be > 0, got ${envHeight}`);
   if (envHeight !== null && allow.minDepositHeight !== null && envHeight !== allow.minDepositHeight) {
     throw new Error(`V2_MIN_DEPOSIT_HEIGHT=${envHeight} disagrees with the allow file's minDepositHeight ${allow.minDepositHeight}`);
   }
   const v2MinDepositHeight = allow.minDepositHeight ?? envHeight;
-  if (version === 2 && v2MinDepositHeight === null) {
+  if (version === 2 && (allow.minDepositHeight === null)) {
     throw new Error('BRIDGE_CONTROLLER_VERSION=2 needs V2_PRE_CUTOVER_ALLOW (the export\'s allow file, with minDepositHeight); see docs/v2-cutover.md');
   }
 

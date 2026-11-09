@@ -358,6 +358,12 @@ export class MintExecutor {
       ORDER BY sd.finalized_at NULLS LAST, bo.created_at
     `;
 
+    // (review round 8 #5) Forget check failures of orders no longer pending
+    // (minted, parked, refunded), so the stuck alert re-arms after an outage.
+    const pendingIds = new Set(orders.map((o) => o.order_id));
+    for (const id of [...this.checkFailingSince.keys()]) if (!pendingIds.has(id)) this.checkFailingSince.delete(id);
+    if (this.checkFailingSince.size === 0) this.checkFailAlerted = false;
+
     if (orders.length === 0) return;
 
     // Fetch current mintNonce once (same for all pending auths this round)
@@ -368,6 +374,7 @@ export class MintExecutor {
       try {
         const reason = await this._alreadyMintedReason(bufferToHex(order.deposit_id) as ViemHex, order.txid, order.vout);
         if (reason !== null) {
+          this.checkFailingSince.delete(order.order_id);   // the check itself worked
           if (!this.alertedAlreadyMinted.has(order.order_id)) {
             this.alertedAlreadyMinted.add(order.order_id);
             console.error(`[executor] NOT authorizing orderId=${order.order_id}: ${reason}`);

@@ -113,6 +113,7 @@ export class GnosisEventWatcher {
           await this._createWithdrawalOrder({
             withdrawalId: a.withdrawalId, sender: a.sender, amount: a.amount, dobbscoinAddress: a.dobbscoinAddress,
             nonce: a.nonce, burnTxHash: log.transactionHash ?? '', burnBlockNumber: log.blockNumber ?? 0n,
+            controller: (log.address ?? this.config.bridgeControllerAddress) as string,
           });
         }
       }

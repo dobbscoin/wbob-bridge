@@ -54,4 +54,17 @@ describe('watcher V2 cutover floor config', () => {
     process.env['V2_PRE_CUTOVER_ALLOW'] = allowFile({ minDepositHeight: -3, outpoints: [] });
     expect(() => loadConfig()).toThrow(/minDepositHeight/);
   });
+
+  // review round 8 #6
+  it('V2 with only V2_MIN_DEPOSIT_HEIGHT (no allow file) refuses to start', () => {
+    process.env['BRIDGE_CONTROLLER_VERSION'] = '2';
+    process.env['V2_MIN_DEPOSIT_HEIGHT'] = '1950000';
+    expect(() => loadConfig()).toThrow(/V2_PRE_CUTOVER_ALLOW/);
+  });
+  it('a zero or negative V2_MIN_DEPOSIT_HEIGHT is refused', () => {
+    process.env['V2_MIN_DEPOSIT_HEIGHT'] = '0';
+    expect(() => loadConfig()).toThrow(/must be > 0/);
+    process.env['V2_MIN_DEPOSIT_HEIGHT'] = '-5';
+    expect(() => loadConfig()).toThrow(/must be > 0/);
+  });
 });
