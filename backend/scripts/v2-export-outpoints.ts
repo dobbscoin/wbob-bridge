@@ -340,9 +340,17 @@ async function main(): Promise<void> {
       let known = true;
       try { await rpc.getRawTransactionVerbose(d.txid.replace(/^0x/, '')); }
       catch (err) { if (err instanceof RpcCallError && err.code === -5) known = false; else throw err; }
-      if (!known) {
+      // (review round 9 #4) ...but only if it carries no refund trace at all: a
+      // deposit dropped by a deep reorg AFTER being refunded could be rebroadcast
+      // later and mint in full on V2 with its V1 refund unrecorded.
+      const refundTrace = auditTotal > 0n || dbAll > 0n || d.refund_activity || d.has_refund;
+      if (!known && !refundTrace) {
         notes.push(`${op} (order ${d.order_id}) is FAILED and our node never saw its tx: nothing to settle; skipped`);
         continue;
+      }
+      if (!known) {
+        problem(op, `${op} (order ${d.order_id}) is FAILED, our node doesn't know its tx, but it has refund history ` +
+          `(audit ${auditTotal}, rows ${dbAll}): settle it by hand or --allow it with the plan written down`);
       }
       problem(op, `${op} (order ${d.order_id}) is FAILED and V1 never minted it: nothing will mint or ` +
         `refund it on V2. Settle it by hand (refund, or re-queue), or --allow it with the plan written down`);
@@ -373,6 +381,8 @@ async function main(): Promise<void> {
     // hours ago, so it is at most the tip and not far below it.
     const dobTip = await rpc.call<number>('getblockcount');
     const window = Number(process.argv.includes('--floor-window') ? arg('floor-window') : '5000');
+    // (review round 9 #5) NaN would silently switch the lower bound off.
+    if (!Number.isInteger(window) || window <= 0) throw new Error('--floor-window must be a positive integer (blocks)');
     if (floorHeight > dobTip) throw new Error(`--floor-height ${floorHeight} is above the Dobbscoin tip ${dobTip}: typo?`);
     if (floorHeight < dobTip - window) {
       throw new Error(`--floor-height ${floorHeight} is more than ${window} blocks below the tip ${dobTip}: typo? (--floor-window to widen)`);
