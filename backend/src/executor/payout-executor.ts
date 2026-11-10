@@ -306,49 +306,73 @@ export class PayoutExecutor {
    */
   private async _alreadyPaidReason(row: QueuedPayoutRow): Promise<{ defer: boolean; reason: string } | null> {
     if (row.withdrawal_id === null) return { defer: false, reason: 'no withdrawal_requests row for this order' };
-    const signed = await this.sql<{ order_id: string; txid: string | null; hex: string | null }[]>`
-      SELECT a.order_id::text, a.metadata->>'txid' AS txid, a.metadata->>'signedHex' AS hex
+    const W = row.withdrawal_id;
+    // (review round 10 #1) Only an order the append-only trail created FOR this
+    // withdrawal may be paid. Otherwise a DB writer moves the withdrawal row onto
+    // fresh order after fresh order, each payout sitting on an order no later
+    // check reads. Forging an ORDER_CREATED row for it only makes it findable.
+    const [own] = await this.sql<{ n: number }[]>`
+      SELECT count(*)::int AS n FROM audit_events
+      WHERE order_id = ${row.order_id} AND event_type = 'ORDER_CREATED' AND metadata->>'withdrawalId' = ${W}
+    `;
+    if (!own || own.n === 0) {
+      return { defer: false, reason: `order ${row.order_id} has no ORDER_CREATED audit row for withdrawalId ${W}: ` +
+        `the withdrawal row may have been moved onto it` };
+    }
+    // Every payout ever signed for W: on any order the trail created for W, or
+    // stamped with W (PAYOUT_SIGNED.withdrawalId, review round 10 #1).
+    const signed = await this.sql<{ order_id: string; event_type: string; txid: string | null; hex: string | null }[]>`
+      SELECT a.order_id::text, a.event_type, a.metadata->>'txid' AS txid, a.metadata->>'signedHex' AS hex
       FROM audit_events a
       WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
-        AND a.order_id IN (
-          SELECT o.order_id FROM audit_events o
-          WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${row.withdrawal_id}
-          UNION SELECT ${row.order_id}::uuid)
+        AND (a.metadata->>'withdrawalId' = ${W}
+             OR a.order_id IN (
+               SELECT o.order_id FROM audit_events o
+               WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${W}
+               UNION SELECT ${row.order_id}::uuid))
     `;
+    // (review round 10 #2) A payout is identified ONLY by the hash of its own
+    // signed bytes; the `txid` field of a row is a claim (the bridge role can
+    // INSERT rows) and must agree with the bytes, or the row is a forgery.
     const hexOf = new Map<string, string>();
-    for (const e of signed) if (e.hex) hexOf.set(e.txid ?? txidFromRawHex(e.hex), e.hex);
-    const seen = new Set<string>();
+    const ids = new Set<string>();
     for (const e of signed) {
-      const t = e.txid ?? (e.hex ? txidFromRawHex(e.hex) : null);
-      if (t === null || seen.has(t)) continue;
-      seen.add(t);
+      if (e.hex) {
+        let h: string;
+        try { h = txidFromRawHex(e.hex); }
+        catch { return { defer: false, reason: `an audit row (order ${e.order_id}) holds signed payout data that does not parse` }; }
+        if (e.txid && e.txid.toLowerCase() !== h) {
+          return { defer: false, reason: `an audit ${e.event_type} row (order ${e.order_id}) claims txid ${e.txid} for data that hashes to ${h}: forged?` };
+        }
+        hexOf.set(h, e.hex);
+        ids.add(h);
+      } else if (e.txid) {
+        ids.add(e.txid.toLowerCase());
+      }
+    }
+    for (const t of ids) {
       const has = await this._nodeHas(t);
       if (has === null) return { defer: true, reason: `node unreachable while checking earlier payout ${t}` };
       if (has !== 'no') {
-        return { defer: false, reason: `withdrawalId ${row.withdrawal_id} was already paid: payout ${t} (order ${e.order_id}) is ${has === 'chain' ? 'confirmed' : 'in the mempool'}` };
+        return { defer: false, reason: `withdrawalId ${W} was already paid: payout ${t} is ${has === 'chain' ? 'confirmed' : 'in the mempool'}` };
       }
       // Unknown by its txid is not enough (review round 7 #2): Dobbscoin is
-      // pre-segwit, so a malleated copy can confirm under ANOTHER txid. If any
-      // input of that earlier payout is spent, something spent it: a human checks.
+      // pre-segwit, so a malleated copy can confirm under ANOTHER txid. Every
+      // earlier payout must be checkable: its signed bytes must be on record.
       const hex = hexOf.get(t);
-      if (!hex) continue;
+      if (!hex) return { defer: false, reason: `earlier payout ${t} of withdrawalId ${W} has no signed data on record: cannot rule out a malleated copy` };
       let ins: { txid: string; vout: number }[];
-      try { ins = txInputsFromRawHex(hex); } catch { continue; }
+      try { ins = txInputsFromRawHex(hex); }
+      catch { return { defer: false, reason: `earlier payout ${t} of withdrawalId ${W}: its signed data does not parse` }; }
       for (const i of ins) {
         let unspent: boolean;
         try { unspent = await this.rpc.isUnspent(i.txid, i.vout); }
         catch { return { defer: true, reason: `node unreachable while checking inputs of earlier payout ${t}` }; }
         if (!unspent) {
-          // Usually innocent (review round 8 #2): after a definite rejection the
-          // inputs are released and the next payout or refund reuses them. If
-          // another tx WE signed spends this outpoint and the node has it, the
-          // outpoint is taken: neither ${t} nor any malleated copy of it can be
-          // in the chain. Only an input spent by something we never signed is
-          // a reason to stop.
           const spender = await this._knownSpender(i.txid, i.vout, [...hexOf.values()]);
           if (spender.kind === 'ok') continue;
           if (spender.kind === 'wait') return { defer: true, reason: spender.why };
-          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent and ` +
+          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} is spent and ` +
             `${t} itself is unknown: ${spender.why}. Possibly a malleated copy that paid this withdrawal; check by hand` };
         }
       }
@@ -530,6 +554,9 @@ export class PayoutExecutor {
           'payout-executor',
           ${tx.json({
             payoutId,
+            // (review round 10 #1) so every payout of a withdrawal can be found by its id,
+            // whatever order row it was made on
+            withdrawalId: row.withdrawal_id,
             txid: result.txid,
             signedHex: result.rawHex,
             feeSat: result.feeSat.toString(),
