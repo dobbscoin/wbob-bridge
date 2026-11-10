@@ -29,7 +29,9 @@ const URL = process.env['PAYOUT_TEST_DATABASE_URL'];
 const rnd = (n: number) => randomBytes(n).toString('hex');
 const ADDR = '1L9YGqctBWaCmn7y8d8CBkTXzXXZ4EAECN';
 const ROOT = HDKey.fromMasterSeed(randomBytes(32));
-const DEADBEEF_TXID = txidFromRawHex('deadbeef');
+// A minimal legacy tx that parses (one input ee..ee:0, no outputs): round 10 parks on signed data that doesn't.
+const OLD_HEX = '01000000' + '01' + 'ee'.repeat(32) + '00000000' + '00' + 'ffffffff' + '00' + '00000000';
+const DEADBEEF_TXID = txidFromRawHex(OLD_HEX);
 
 /** A minimal prev tx paying `amountSat` to the bridge's deposit key m/0/0 (so the builder can really sign). */
 function prevTxPayingDepositKey0(amountSat: bigint): string {
@@ -89,10 +91,14 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     const [o] = await sql<{ id: string }[]>`
       INSERT INTO bridge_orders (order_type, state, user_gnosis_address, user_dobbscoin_address, amount_sat)
       VALUES ('outbound', ${state}, ${'0x' + '2'.repeat(40)}, ${ADDR}, ${amountSat}) RETURNING id`;
+    const wid = BigInt('0x' + rnd(8)).toString();
     const [wr] = await sql<{ id: string }[]>`
       INSERT INTO withdrawal_requests (order_id, withdrawal_id, sender_address, dobbscoin_address, amount_sat, user_nonce)
-      VALUES (${o!.id}, ${BigInt('0x' + rnd(8)).toString()}, ${'0x' + '2'.repeat(40)}, ${ADDR}, ${amountSat}, 0) RETURNING id`;
-    return { orderId: o!.id, wrId: wr!.id };
+      VALUES (${o!.id}, ${wid}, ${'0x' + '2'.repeat(40)}, ${ADDR}, ${amountSat}, 0) RETURNING id`;
+    // as the gnosis watcher writes it (review round 10 #1: only such an order may be paid)
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${o!.id}, 'ORDER_CREATED', 'WITHDRAW_REQUEST_CREATED', 'BURN_TX_SEEN', 'gnosis-watcher', ${sql.json({ withdrawalId: wid })})`;
+    return { orderId: o!.id, wrId: wr!.id, wid };
   }
 
   async function utxo(orderId: string, amountSat: bigint, status = 'available', payoutId: string | null = null) {
@@ -112,7 +118,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await sql`
       INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
       VALUES (${orderId}, 'PAYOUT_SIGNED', ${OutboundState.PAYOUT_QUEUED}, ${OutboundState.PAYOUT_SIGNED}, 'test',
-              ${sql.json({ payoutId: p!.id, signedHex: 'deadbeef', changeSat: '0', changeAddress: null, changeIndex: null })})`;
+              ${sql.json({ payoutId: p!.id, signedHex: OLD_HEX, changeSat: '0', changeAddress: null, changeIndex: null })})`;
     const big = await utxo(orderId, 5_000_000_000n, 'reserved', p!.id);
     return { orderId, payoutId: p!.id, big };
   }
@@ -196,7 +202,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     const { orderId, payoutId, big } = await signedPayout(200_000n);
     await sql`
       INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-      VALUES (${orderId}, 'PAYOUT_BROADCAST_ATTEMPT', 'PAYOUT_SIGNED', 'PAYOUT_SIGNED', 'test', ${sql.json({ payoutId, txid: txidFromRawHex('deadbeef'), attempt: 1 })})`;
+      VALUES (${orderId}, 'PAYOUT_BROADCAST_ATTEMPT', 'PAYOUT_SIGNED', 'PAYOUT_SIGNED', 'test', ${sql.json({ payoutId, txid: txidFromRawHex(OLD_HEX), attempt: 1 })})`;
     await executor(async () => { throw new RpcCallError('sendrawtransaction', -26, '64: dust'); }).broadcastSigned();
     expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
     expect(await utxoStatus(big)).toEqual({ status: 'reserved', spent_payout_id: payoutId });
@@ -210,7 +216,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
               ${sql.json({ payoutId: '00000000-0000-0000-0000-000000000000', signedHex: 'stale0ld', changeSat: '0', changeAddress: null, changeIndex: null })})`;
     const sent: string[] = [];
     await executor(async (hex) => { sent.push(hex); return rnd(32); }).broadcastSigned();
-    expect(sent).toContain('deadbeef');
+    expect(sent).toContain(OLD_HEX);
     expect(sent).not.toContain('stale0ld');
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_BROADCAST);
   });
@@ -266,7 +272,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
     await ex.broadcastSigned();                                   // 240th attempt
     expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
-    expect(new Set(sent.filter((h) => h === 'deadbeef')).size).toBe(1);   // only ever the same tx
+    expect(new Set(sent.filter((h) => h === OLD_HEX)).size).toBe(1);   // only ever the same tx
     expect(await utxoStatus(big)).toEqual({ status: 'reserved', spent_payout_id: payoutId });
   });
 
@@ -278,7 +284,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await ex.processQueued();
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
     await ex.broadcastSigned();
-    expect(sent).toContain('deadbeef');
+    expect(sent).toContain(OLD_HEX);
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_BROADCAST);
     expect(await payoutTxid(payoutId)).toBe(DEADBEEF_TXID);
   });
@@ -317,7 +323,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
     expect(await utxoStatus(coin)).toEqual({ status: 'reserved', spent_payout_id: payoutId });   // same payout row
     await ex.broadcastSigned();
-    expect(sent).not.toContain('deadbeef');                              // never the old, released tx
+    expect(sent).not.toContain(OLD_HEX);                              // never the old, released tx
     expect(sent).toHaveLength(1);
     expect(await payoutTxid(payoutId)).toBe(txidFromRawHex(sent[0]!));
     expect(txInputsFromRawHex(sent[0]!)).toEqual([{ txid: coin, vout: 0 }]);   // parser vs a real signed tx
@@ -333,7 +339,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     const ex = executor((h) => send(h));
     const unthrottle = () => { const st = (ex as unknown as { resendState: Map<string, { last: number }> }).resendState.get(payoutId); if (st) st.last = 0; };
     await ex.confirmBroadcast();
-    expect(sent).toContain('deadbeef');
+    expect(sent).toContain(OLD_HEX);
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_BROADCAST);
 
     send = async () => { throw new RpcCallError('sendrawtransaction', -25, 'Missing inputs'); };
@@ -457,6 +463,9 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       VALUES ('outbound', 'PAYOUT_QUEUED', ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000) RETURNING id`;
     await sql`INSERT INTO withdrawal_requests (order_id, withdrawal_id, sender_address, dobbscoin_address, amount_sat, user_nonce)
               VALUES (${o2!.id}, ${w!.withdrawal_id}, ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000, 0)`;
+    // (round 10) to be payable at all it needs its own ORDER_CREATED: forge one, as an attacker would
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${o2!.id}, 'ORDER_CREATED', 'WITHDRAW_REQUEST_CREATED', 'BURN_TX_SEEN', 'gnosis-watcher', ${sql.json({ withdrawalId: w!.withdrawal_id })})`;
     const big = await utxo(o2!.id, 5_000_000_000n);
     await executor(async () => { throw new Error('must not broadcast'); }, {
       getConfirmations: async (t) => (t === paidTx ? 7 : -1),
@@ -472,7 +481,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   it('an earlier payout the node refused outright (unknown to it) does not block paying', async () => {
     const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
     await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: rnd(32) })})`;
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(OLD_HEX), signedHex: OLD_HEX })})`;
     const seen: string[] = [];
     await executor(async () => { throw new Error('must not broadcast'); }, {
       getConfirmations: async () => -1,
@@ -611,4 +620,58 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(a!.error).toMatch(/malleated/);
   });
 
+
+  // ── Review round 10 #1 / #2 ──────────────────────────────────────────────
+  it('an order the trail never created for this withdrawal is not paid (withdrawal row moved onto it)', async () => {
+    const { orderId: o, wid } = await order(OutboundState.COMPLETED, 200_000n);
+    const [n1] = await sql<{ id: string }[]>`
+      INSERT INTO bridge_orders (order_type, state, user_gnosis_address, user_dobbscoin_address, amount_sat)
+      VALUES ('outbound', 'PAYOUT_QUEUED', ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000) RETURNING id`;
+    await sql`UPDATE withdrawal_requests SET order_id = ${n1!.id} WHERE order_id = ${o}`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(n1!.id)).toBe(OutboundState.MANUAL_REVIEW);
+    const [a] = await sql<{ error: string }[]>`SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${n1!.id} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/no ORDER_CREATED/);
+    expect(wid).toBeTruthy();
+  });
+
+  it('a payout stamped with the withdrawalId on an order with no ORDER_CREATED is still found', async () => {
+    const { orderId, wid } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const [stray] = await sql<{ id: string }[]>`
+      INSERT INTO bridge_orders (order_type, state, user_gnosis_address, user_dobbscoin_address, amount_sat)
+      VALUES ('outbound', 'COMPLETED', ${'0x' + '2'.repeat(40)}, ${ADDR}, 200000) RETURNING id`;
+    const hex = '01000000' + '01' + rnd(32) + '00000000' + '00' + 'ffffffff' + '00' + '00000000';
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${stray!.id}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ withdrawalId: wid, txid: txidFromRawHex(hex), signedHex: hex })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async (t) => (t === txidFromRawHex(hex) ? 9 : -1),
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+  });
+
+  it('a forged row whose txid does not match its signed data parks the order', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const hex = '01000000' + '01' + rnd(32) + '00000000' + '00' + 'ffffffff' + '00' + '00000000';
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: rnd(32), signedHex: hex })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+    const [a] = await sql<{ error: string }[]>`SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${orderId} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/forged/);
+  });
+
+  it('an earlier payout known only by txid (no signed data on record) parks the order', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_BROADCAST', 'PAYOUT_SIGNED', 'PAYOUT_BROADCAST', 'payout-executor', ${sql.json({ txid: rnd(32) })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+  });
 });
