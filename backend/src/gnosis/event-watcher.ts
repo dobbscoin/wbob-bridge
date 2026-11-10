@@ -80,6 +80,8 @@ export class GnosisEventWatcher {
   private stallAlerted = false;
   /** The recount's own cursor: in memory, so a DB writer cannot move it. */
   private recountCursor: bigint | null = null;
+  /** When the current full recount pass started (a new one starts every 24 h). */
+  private recountPassStartedAt = 0;
 
   /**
    * Independent recount (review round 7 #3): re-reads every WithdrawalRequested
@@ -93,6 +95,10 @@ export class GnosisEventWatcher {
     const watermark = BigInt(await this._getState('gnosis_last_block'));
     const tip = (await this.publicClient.getBlockNumber()) - BigInt(this.config.gnosisConfirmationDepth);
     const end = watermark < tip ? watermark : tip;
+    // (review round 9 #3) Re-read everything once a day: a row deleted after a
+    // pass is otherwise only caught after a restart.
+    if (this.recountCursor !== null && Date.now() - this.recountPassStartedAt > 24 * 3600_000) this.recountCursor = null;
+    if (this.recountCursor === null) this.recountPassStartedAt = Date.now();
     let from = this.recountCursor ?? this.config.gnosisStartBlock;
     const chunk = BigInt(this.config.gnosisLogScanChunk);
     while (from <= end) {

@@ -81,10 +81,39 @@ export function txInputsFromRawHex(rawHex: string): { txid: string; vout: number
     if (o + 36 > b.length) throw new Error('truncated tx');
     const txid = Buffer.from(b.subarray(o, o + 32)).reverse().toString('hex'); o += 32;
     const vout = b.readUInt32LE(o); o += 4;
-    o += varint() + 4;                                     // scriptSig + sequence
+    { const len = varint(); o += len + 4; }               // scriptSig + sequence (read the varint BEFORE adding: `o += varint()` loses its own length)
     ins.push({ txid, vout });
   }
   return ins;
+}
+
+/**
+ * Outputs of a serialized legacy (non-segwit) tx: value in satoshis + scriptPubKey hex.
+ * Used to tell a malleated copy (same outputs, different txid) from a real reuse.
+ */
+export function txOutputsFromRawHex(rawHex: string): { valueSat: bigint; script: string }[] {
+  const b = Buffer.from(rawHex, 'hex');
+  let o = 4;
+  const varint = (): number => {
+    const f = b[o++]!;
+    if (f < 0xfd) return f;
+    if (f === 0xfd) { const v = b.readUInt16LE(o); o += 2; return v; }
+    if (f === 0xfe) { const v = b.readUInt32LE(o); o += 4; return v; }
+    throw new Error('varint too large');
+  };
+  const nIn = varint();
+  if (nIn === 0) throw new Error('no inputs (segwit marker?): not a legacy tx');
+  for (let i = 0; i < nIn; i++) { o += 36; const len = varint(); o += len + 4; }
+  const nOut = varint();
+  const outs: { valueSat: bigint; script: string }[] = [];
+  for (let i = 0; i < nOut; i++) {
+    if (o + 8 > b.length) throw new Error('truncated tx');
+    const valueSat = b.readBigUInt64LE(o); o += 8;
+    const len = varint();
+    if (o + len > b.length) throw new Error('truncated tx');
+    outs.push({ valueSat, script: b.subarray(o, o + len).toString('hex') }); o += len;
+  }
+  return outs;
 }
 
 /** txid of a serialized (non-segwit) tx: double-SHA256, byte-reversed, as RPC displays it. */

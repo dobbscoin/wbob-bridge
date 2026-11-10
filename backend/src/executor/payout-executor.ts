@@ -16,7 +16,7 @@
 import type { Sql } from 'postgres';
 import { OutboundState, assertOutboundTransition } from '@wbob/shared';
 import { RpcCallError, RpcNetworkError, type DobbscoinBackendRpc } from '../dobbscoin/rpc.js';
-import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, txidFromRawHex, txInputsFromRawHex, type UtxoInput } from '../dobbscoin/tx-builder.js';
+import { DobbscoinTxBuilder, DUST_THRESHOLD_SAT, txidFromRawHex, txInputsFromRawHex, txOutputsFromRawHex, type UtxoInput } from '../dobbscoin/tx-builder.js';
 import type { BackendConfig } from '../config.js';
 import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 import { unpayableDestinationReason } from '../gnosis/destination.js';
@@ -62,6 +62,12 @@ export function isDefiniteRejection(err: unknown): boolean {
 
 
 const PAYOUT_MIN_CONFIRMATIONS = 3;
+/**
+ * How deep another tx spending an earlier payout's input must be before that
+ * payout counts as dead (review round 9 #2). Shallower, a miner could still
+ * swap the old payout in: wait instead.
+ */
+const SPENDER_MIN_CONFIRMATIONS = 6;
 /** Re-sends of the same signed tx on retryable failures before parking it (~1 h at the 15 s poll). */
 const MAX_SEND_ATTEMPTS = 240;
 /** A broadcast payout the node no longer knows is re-sent at most this often. */
@@ -339,11 +345,11 @@ export class PayoutExecutor {
           // outpoint is taken: neither ${t} nor any malleated copy of it can be
           // in the chain. Only an input spent by something we never signed is
           // a reason to stop.
-          const spender = await this._knownSpender(i.txid, i.vout, t);
-          if (spender === null) return { defer: true, reason: `node unreachable while checking who spent ${i.txid}:${i.vout}` };
-          if (spender !== false) continue;
-          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent by a tx ` +
-            `the bridge never signed, although ${t} itself is unknown: possibly a malleated copy that paid this withdrawal; check by hand` };
+          const spender = await this._knownSpender(i.txid, i.vout, [...hexOf.values()]);
+          if (spender.kind === 'ok') continue;
+          if (spender.kind === 'wait') return { defer: true, reason: spender.why };
+          return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} (order ${e.order_id}) is spent and ` +
+            `${t} itself is unknown: ${spender.why}. Possibly a malleated copy that paid this withdrawal; check by hand` };
         }
       }
     }
@@ -351,12 +357,19 @@ export class PayoutExecutor {
   }
 
   /**
-   * A tx the bridge signed (append-only audit trail: PAYOUT_SIGNED hex or
-   * REFUND_SIGNED inputs), other than `except`, that spends txid:vout and that
-   * the node has (confirmed or mempool). Returns its txid, false if none, null
-   * if the node could not be asked.
+   * Who spent txid:vout, an input of an earlier payout for this withdrawal?
+   * (review round 9 #1/#2) The audit trail only SUGGESTS candidates: the
+   * `bridge` DB role can INSERT audit rows, so every fact comes from our node:
+   *   - the node has the candidate, and ITS inputs include txid:vout;
+   *   - it pays out differently from every tx ever signed for this withdrawal
+   *     (a malleated copy keeps the outputs, a real reuse by another payout or
+   *     refund does not);
+   *   - it is SPENDER_MIN_CONFIRMATIONS deep (shallower: wait).
+   * 'ok' = the outpoint is provably taken by another tx, so no earlier payout
+   * for this withdrawal can ever confirm.
    */
-  private async _knownSpender(txid: string, vout: number, except: string): Promise<string | false | null> {
+  private async _knownSpender(txid: string, vout: number, withdrawalHexes: string[]):
+      Promise<{ kind: 'ok' | 'wait' | 'none'; why: string }> {
     const le = Buffer.alloc(4); le.writeUInt32LE(vout, 0);
     const needle = Buffer.from(txid, 'hex').reverse().toString('hex') + le.toString('hex');
     const cands = await this.sql<{ txid: string | null; hex: string | null }[]>`
@@ -364,19 +377,35 @@ export class PayoutExecutor {
       WHERE (event_type = 'PAYOUT_SIGNED' AND position(${needle} IN lower(metadata->>'signedHex')) > 0)
          OR (event_type = 'REFUND_SIGNED' AND metadata->'inputs' ? ${`${txid}:${vout}`})
     `;
+    const outKey = (outs: { valueSat: bigint; script: string }[]) =>
+      outs.map((o) => `${o.valueSat}:${o.script.toLowerCase()}`).sort().join('|');
+    const ours = new Set<string>();
+    for (const h of withdrawalHexes) { try { ours.add(outKey(txOutputsFromRawHex(h))); } catch { /* unparseable: no match */ } }
+    let waitWhy: string | null = null;
+    const tried = new Set<string>();
     for (const c of cands) {
-      const ct = c.txid ?? (c.hex ? txidFromRawHex(c.hex) : null);
-      if (ct === null || ct === except) continue;
-      if (c.hex) {   // the substring could sit in a script: confirm it is really an input
-        let ins: { txid: string; vout: number }[] = [];
-        try { ins = txInputsFromRawHex(c.hex); } catch { continue; }
-        if (!ins.some((x) => x.txid === txid && x.vout === vout)) continue;
+      // Candidate ids from the row, and (if it carries hex) the id its hex hashes to.
+      const ids = [c.txid, c.hex ? txidFromRawHex(c.hex) : null].filter((x): x is string => !!x && /^[0-9a-f]{64}$/i.test(x));
+      for (const ct of ids) {
+        if (tried.has(ct)) continue;
+        tried.add(ct);
+        let t;
+        try { t = await this.rpc.getRawTransactionVerbose(ct); }
+        catch (err) {
+          if (err instanceof RpcCallError && err.code === -5) continue;     // the node doesn't have it
+          return { kind: 'wait', why: `node unreachable while checking candidate spender ${ct}` };
+        }
+        if (!t.vin.some((x) => x.txid === txid && x.vout === vout)) continue;   // the node says it doesn't spend it
+        const outs = t.vout.map((o) => ({ valueSat: BigInt(Math.round(o.value * 1e8)), script: o.scriptPubKey.hex }));
+        if (ours.has(outKey(outs))) {
+          return { kind: 'none', why: `${ct} spends it with the same outputs as a payout of this withdrawal (a malleated copy)` };
+        }
+        const confs = t.confirmations ?? 0;
+        if (confs >= SPENDER_MIN_CONFIRMATIONS) return { kind: 'ok', why: `${ct} (${confs} confirmations) spends it` };
+        waitWhy = `the tx spending ${txid}:${vout} (${ct}) has ${confs} confirmation(s); waiting for ${SPENDER_MIN_CONFIRMATIONS}`;
       }
-      const has = await this._nodeHas(ct);
-      if (has === null) return null;
-      if (has !== 'no') return ct;
     }
-    return false;
+    return waitWhy ? { kind: 'wait', why: waitWhy } : { kind: 'none', why: 'no tx the node has and the bridge signed spends it' };
   }
 
   /** Null if the burn on Gnosis backs this payout exactly; else why not (defer = retry later). */
