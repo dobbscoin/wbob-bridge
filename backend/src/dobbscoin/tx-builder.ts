@@ -144,13 +144,21 @@ export function selectUtxos(
   available: UtxoInput[],
   targetSat: bigint,
   feeRateSatPerVbyte: number,
+  required: UtxoInput[] = [],
 ): { selected: UtxoInput[]; feeSat: bigint } {
-  const sorted = [...available].sort((a, b) =>
+  // `required` coins are always spent (review round 11: a re-signed payout must
+  // spend a coin of every earlier attempt still alive, so at most one confirms).
+  const isReq = (u: UtxoInput) => required.some((r) => r.txid === u.txid && r.vout === u.vout);
+  const sorted = [...available].filter((u) => !isReq(u)).sort((a, b) =>
     a.amountSat > b.amountSat ? -1 : a.amountSat < b.amountSat ? 1 : 0,
   );
 
-  const selected: UtxoInput[] = [];
-  let total = 0n;
+  const selected: UtxoInput[] = [...required];
+  let total = required.reduce((t, u) => t + u.amountSat, 0n);
+  if (selected.length > 0) {
+    const fee = estimateFee(selected.length, total > targetSat ? 2 : 1, feeRateSatPerVbyte);
+    if (total >= targetSat + fee) return { selected, feeSat: fee };
+  }
 
   for (const utxo of sorted) {
     selected.push(utxo);
@@ -280,13 +288,14 @@ export class DobbscoinTxBuilder {
     changeAddress: string,
     feeRateSatPerVbyte: number,
     rpc: DobbscoinBackendRpc,
+    required: UtxoInput[] = [],
   ): Promise<BuildTxResult> {
     // A dust recipient output is refused by every node; never sign one (the
     // caller would reserve the largest coins for a tx that can't be sent).
     if (payoutAmountSat <= DUST_THRESHOLD_SAT) {
       throw new Error(`payout of ${payoutAmountSat} sat is at or under dust (${DUST_THRESHOLD_SAT} sat); not signing`);
     }
-    const { selected, feeSat } = selectUtxos(utxos, payoutAmountSat, feeRateSatPerVbyte);
+    const { selected, feeSat } = selectUtxos(utxos, payoutAmountSat, feeRateSatPerVbyte, required);
     const inputTotal = selected.reduce((s, u) => s + u.amountSat, 0n);
     const changeSat = inputTotal - payoutAmountSat - feeSat;
 

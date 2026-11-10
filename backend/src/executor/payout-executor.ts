@@ -24,6 +24,11 @@ import { BurnVerifier, type BurnVerifierLike } from '../gnosis/burn-verifier.js'
 import { AlertDispatcher } from '../monitor/webhook.js';
 
 /** A selected UTXO was reserved by someone else before we could reserve it. */
+/** An earlier signed payout for this withdrawal is still alive and none of its coins is free to conflict with: wait. */
+export class EarlierPayoutBusyError extends Error {
+  constructor(txid: string) { super(`earlier payout ${txid} is still valid and none of its coins is free yet; waiting so the new payout can spend one`); this.name = 'EarlierPayoutBusyError'; }
+}
+
 export class UtxoRaceError extends Error {
   constructor(outpoint: string) { super(`UTXO ${outpoint} was taken before it could be reserved`); this.name = 'UtxoRaceError'; }
 }
@@ -261,7 +266,8 @@ export class PayoutExecutor {
       // Payout rows and UTXO links are ordinary rows a DB writer can erase; the
       // append-only audit trail and our node cannot be. Every payout ever signed
       // for this withdrawalId (on ANY order) must be unknown to the node.
-      const paid = await this._alreadyPaidReason(row);
+      const alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [];
+      const paid = await this._alreadyPaidReason(row, alive);
       if (paid !== null) {
         if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); continue; }
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, paid.reason);
@@ -284,8 +290,12 @@ export class PayoutExecutor {
       }
 
       try {
-        await this._buildAndSignPayout(row);
+        await this._buildAndSignPayout(row, alive);
       } catch (err) {
+        if (err instanceof EarlierPayoutBusyError) {
+          console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${err.message}`);
+          continue;
+        }
         if (err instanceof UtxoRaceError) {
           console.warn(`[payout-executor] ${err.message}; retrying orderId=${row.order_id} next poll`);
           continue;
@@ -302,7 +312,10 @@ export class PayoutExecutor {
    * whose ORDER_CREATED audit row names this withdrawalId, so re-creating the
    * order, deleting the payouts row or unlinking UTXOs does not hide a payment.
    */
-  private async _alreadyPaidReason(row: QueuedPayoutRow): Promise<{ defer: boolean; reason: string } | null> {
+  private async _alreadyPaidReason(
+    row: QueuedPayoutRow,
+    alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [],
+  ): Promise<{ defer: boolean; reason: string } | null> {
     if (row.withdrawal_id === null) return { defer: false, reason: 'no withdrawal_requests row for this order' };
     const W = row.withdrawal_id;
     // (review round 10 #1) Only an order the append-only trail created FOR this
@@ -362,18 +375,24 @@ export class PayoutExecutor {
       let ins: { txid: string; vout: number }[];
       try { ins = txInputsFromRawHex(hex); }
       catch { return { defer: false, reason: `earlier payout ${t} of withdrawalId ${W}: its signed data does not parse` }; }
+      let dead = false;
       for (const i of ins) {
         let unspent: boolean;
         try { unspent = await this.rpc.isUnspent(i.txid, i.vout); }
         catch { return { defer: true, reason: `node unreachable while checking inputs of earlier payout ${t}` }; }
         if (!unspent) {
           const spender = await this._knownSpender(i.txid, i.vout, [...hexOf.values()]);
-          if (spender.kind === 'ok') continue;
+          if (spender.kind === 'ok') { dead = true; continue; }
           if (spender.kind === 'wait') return { defer: true, reason: spender.why };
           return { defer: false, reason: `an input (${i.txid}:${i.vout}) of earlier payout ${t} is spent and ` +
             `${t} itself is unknown: ${spender.why}. Possibly a malleated copy that paid this withdrawal; check by hand` };
         }
       }
+      // (review round 11) Unknown to the node with every coin still unspent:
+      // it was refused or never sent, but it is STILL a valid signed tx that
+      // anyone holding its bytes could get mined. The new payout must spend
+      // one of its coins, so the two conflict and at most one ever confirms.
+      if (!dead) alive.push({ txid: t, inputs: ins });
     }
     return null;
   }
@@ -458,7 +477,10 @@ export class PayoutExecutor {
     }
   }
 
-  private async _buildAndSignPayout(row: QueuedPayoutRow): Promise<void> {
+  private async _buildAndSignPayout(
+    row: QueuedPayoutRow,
+    alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [],
+  ): Promise<void> {
     // Fetch available UTXOs
     const utxoRows = await this.sql<BridgeUtxoRow[]>`
       SELECT id, txid, vout, amount_sat, address, hd_index, derivation_path
@@ -483,6 +505,20 @@ export class PayoutExecutor {
     // resets on restart and would reuse the same change address, and also
     // desyncs across multiple backend instances).
     // Also skips indexes held by signed-not-yet-broadcast refunds.
+    // (review round 11) Spend a coin of every earlier attempt that is still a
+    // valid signed tx, so the new payout and it can never both confirm. If none
+    // of its coins is free (another signed tx holds them), wait: that holder
+    // either confirms (and the old attempt is dead, see _knownSpender) or is
+    // released.
+    const required: UtxoInput[] = [];
+    for (const e of alive) {
+      const mine = utxos.filter((u) => e.inputs.some((i) => i.txid === u.txid && i.vout === u.vout));
+      if (mine.length === 0) throw new EarlierPayoutBusyError(e.txid);
+      if (!mine.some((m) => required.some((r) => r.txid === m.txid && r.vout === m.vout))) {
+        required.push(mine.reduce((a, b) => (b.amountSat > a.amountSat ? b : a)));
+      }
+    }
+
     const changeIndex = await nextChangeIndex(this.sql);
     const changeAddress = this.txBuilder.deriveChangeAddress(changeIndex);
 
@@ -493,7 +529,13 @@ export class PayoutExecutor {
       changeAddress,
       this.config.dobbscoinFeeRateSatPerVbyte,
       this.rpc,
+      required,
     );
+    for (const e of alive) {
+      if (!result.inputs.some((u) => e.inputs.some((i) => i.txid === u.txid && i.vout === u.vout))) {
+        throw new Error(`refusing to sign: the new payout does not conflict with earlier payout ${e.txid}`);
+      }
+    }
 
     // Atomically: reserve UTXOs, create payout row, advance FSM
     await this.sql.begin(async (tx) => {
