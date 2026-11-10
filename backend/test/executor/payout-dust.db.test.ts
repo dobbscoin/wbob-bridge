@@ -132,6 +132,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     more: { getConfirmations?: (txid: string) => Promise<number>; getRawTransactionHex?: (txid: string) => Promise<string>;
             isInMempool?: (txid: string) => Promise<boolean>;
             isUnspent?: (txid: string, vout: number) => Promise<boolean>;
+            getRawTransactionVerbose?: (txid: string) => Promise<unknown>;
             burn?: BurnVerifierLike } = {},
   ) {
     const rpc = {
@@ -140,6 +141,8 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       getConfirmations: more.getConfirmations ?? (async () => -1),
       isInMempool: more.isInMempool ?? (async () => false),
       isUnspent: more.isUnspent ?? (async () => true),
+      getRawTransactionVerbose: more.getRawTransactionVerbose ??
+        (async () => { throw new RpcCallError('getrawtransaction', -5, 'No such mempool or blockchain transaction'); }),
     };
     const burn = more.burn ?? { verify: async () => ({ ok: true as const }) };
     return new PayoutExecutor(sql as never, rpc as never, config, null, burn) as unknown as {
@@ -512,29 +515,100 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(a!.error).toMatch(/malleated/);
   });
 
-  // ── Review round 8 #2: a legit retry after the node refused the first tx ─
-  it('an earlier refused payout whose input was reused by ANOTHER payout we signed (confirmed) does not block the retry', async () => {
+  // ── Review rounds 8 #2 / 9 #1-#2: who spent an earlier payout's input? ──
+  /** A legacy tx hex with the given inputs and outputs (enough for the parsers). */
+  function txHex(ins: { txid: string; vout: number }[], outs: { valueSat: bigint; script: string }[]): string {
+    const parts: Buffer[] = [Buffer.from('01000000', 'hex'), Buffer.from([ins.length])];
+    for (const i of ins) { const v = Buffer.alloc(4); v.writeUInt32LE(i.vout, 0);
+      parts.push(Buffer.from(i.txid, 'hex').reverse(), v, Buffer.from([0]), Buffer.alloc(4, 0xff)); }
+    parts.push(Buffer.from([outs.length]));
+    for (const o of outs) { const a = Buffer.alloc(8); a.writeBigUInt64LE(o.valueSat, 0); const sc = Buffer.from(o.script, 'hex');
+      parts.push(a, Buffer.from([sc.length]), sc); }
+    parts.push(Buffer.alloc(4));
+    return Buffer.concat(parts).toString('hex');
+  }
+  const P2PKH = (b: string) => '76a914' + b.repeat(20) + '88ac';
+  /** Order W with a refused payout t1 spending `coin`; returns what a scenario needs. */
+  async function refusedEarlier() {
     const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
-    const { orderId: other } = await order(OutboundState.COMPLETED, 300_000n);
     const coin = rnd(32);
-    const spend = (extra: number) => {
-      const v = Buffer.alloc(4); const pad = Buffer.alloc(4); pad.writeUInt32LE(extra, 0);
-      return Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(coin, 'hex').reverse(), v,
-        Buffer.from([0]), Buffer.alloc(4, 0xff), Buffer.from([0]), pad]).toString('hex');
-    };
-    const t1 = spend(1), t2 = spend(2);                                  // two different txs spending the same coin
+    const t1 = txHex([{ txid: coin, vout: 0 }], [{ valueSat: 200_000n, script: P2PKH('aa') }, { valueSat: 9_000_000n, script: P2PKH('bb') }]);
     await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
               VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(t1), signedHex: t1 })})`;
-    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-              VALUES (${other}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(t2), signedHex: t2 })})`;
+    return { orderId, coin, t1 };
+  }
+  const verbose = (hex: string, confirmations: number) => ({
+    txid: txidFromRawHex(hex), confirmations,
+    vin: txInputsFromRawHex(hex).map((i) => ({ txid: i.txid, vout: i.vout })),
+    vout: [] as unknown[],
+  });
+  function nodeWith(txs: Map<string, { hex: string; confs: number; outs: { valueSat: bigint; script: string }[] }>) {
+    return async (id: string) => {
+      const x = txs.get(id);
+      if (!x) throw new RpcCallError('getrawtransaction', -5, 'No such mempool or blockchain transaction');
+      return { ...verbose(x.hex, x.confs), vout: x.outs.map((o, n) => ({ value: Number(o.valueSat) / 1e8, n, scriptPubKey: { hex: o.script, type: 'pubkeyhash' } })) };
+    };
+  }
+  async function run(orderId: string, node: (id: string) => Promise<unknown>, coin: string, confs: (t: string) => number) {
     const seen: string[] = [];
     await executor(async () => { throw new Error('must not broadcast'); }, {
-      getConfirmations: async (t) => (t === txidFromRawHex(t2) ? 4 : -1),  // t1 refused, t2 (the other withdrawal) confirmed
-      isUnspent: async (t) => t !== coin,
+      getConfirmations: async (t) => confs(t), isUnspent: async (t) => t !== coin, getRawTransactionVerbose: node,
       burn: { verify: async () => { seen.push('burn'); return { ok: false, defer: true, reason: 'stop here' }; } },
     }).processQueued();
-    expect(seen).toEqual(['burn']);                                      // past the already-paid check
+    return seen;
+  }
+
+  it('legit retry: the input was reused by ANOTHER payout we signed, 6+ deep per our node: proceeds', async () => {
+    const { orderId, coin } = await refusedEarlier();
+    const { orderId: other } = await order(OutboundState.COMPLETED, 300_000n);
+    const outs = [{ valueSat: 300_000n, script: P2PKH('cc') }, { valueSat: 8_900_000n, script: P2PKH('dd') }];
+    const u = txHex([{ txid: coin, vout: 0 }], outs);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${other}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(u), signedHex: u })})`;
+    const node = nodeWith(new Map([[txidFromRawHex(u), { hex: u, confs: 7, outs }]]));
+    expect(await run(orderId, node, coin, (t) => (t === txidFromRawHex(u) ? 7 : -1))).toEqual(['burn']);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  it('the reusing tx is only 2 deep: waits (a miner could still swap the old payout in)', async () => {
+    const { orderId, coin } = await refusedEarlier();
+    const { orderId: other } = await order(OutboundState.COMPLETED, 300_000n);
+    const outs = [{ valueSat: 300_000n, script: P2PKH('cc') }];
+    const u = txHex([{ txid: coin, vout: 0 }], outs);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${other}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(u), signedHex: u })})`;
+    const node = nodeWith(new Map([[txidFromRawHex(u), { hex: u, confs: 2, outs }]]));
+    expect(await run(orderId, node, coin, (t) => (t === txidFromRawHex(u) ? 2 : -1))).toEqual([]);
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);
     await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
   });
+
+  it('a FORGED audit row naming a confirmed tx that does not spend the input is ignored: parked', async () => {
+    const { orderId, coin } = await refusedEarlier();
+    const unrelated = rnd(32);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'REFUND_SIGNED', 'queued', 'signed', 'refund-executor', ${sql.json({ txid: unrelated, inputs: [`${coin}:0`] })})`;
+    const otherTx = txHex([{ txid: rnd(32), vout: 1 }], [{ valueSat: 5n, script: P2PKH('ee') }]);
+    const node = async (id: string) => {
+      if (id !== unrelated) throw new RpcCallError('getrawtransaction', -5, 'nope');
+      return { ...verbose(otherTx, 50), txid: unrelated, vout: [] };    // confirmed, but spends something else
+    };
+    expect(await run(orderId, node, coin, (t) => (t === unrelated ? 50 : -1))).toEqual([]);
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+  });
+
+  it('a spender with the SAME outputs as the earlier payout is a malleated copy: parked', async () => {
+    const { orderId, coin, t1 } = await refusedEarlier();
+    const copy = t1.replace('ffffffff', 'feffffff');                       // different txid, same outputs
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'REFUND_SIGNED', 'queued', 'signed', 'refund-executor', ${sql.json({ txid: txidFromRawHex(copy), inputs: [`${coin}:0`] })})`;
+    const outs = [{ valueSat: 200_000n, script: P2PKH('aa') }, { valueSat: 9_000_000n, script: P2PKH('bb') }];
+    const node = nodeWith(new Map([[txidFromRawHex(copy), { hex: copy, confs: 40, outs }]]));
+    expect(await run(orderId, node, coin, (t) => (t === txidFromRawHex(copy) ? 40 : -1))).toEqual([]);
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+    const [a] = await sql<{ error: string }[]>`
+      SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${orderId} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/malleated/);
+  });
+
 });

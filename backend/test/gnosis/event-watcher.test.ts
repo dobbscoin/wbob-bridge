@@ -594,3 +594,29 @@ describe('GnosisEventWatcher round 8: recount self-check, per-chunk alerts, stal
   });
 });
 
+
+// ─── review round 9 #3: a full recount pass again every day ──────────────────
+
+describe('GnosisEventWatcher recount: daily full pass', () => {
+  it('after 24 h the recount re-reads from the start, catching a row deleted after the first pass', async () => {
+    const config = makeConfig({ gnosisStartBlock: 100_000n, gnosisLogScanChunk: 1000 } as Partial<BackendConfig>);
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(200_000n);
+    mock.setLogsForRange(100_000n, 100_999n, [makeLog(100_200n, 95n)]);
+    await setLastBlock(100_999n);
+    const w = makeWatcher(config, mock);
+    const sent: string[] = [];
+    (w as unknown as { alerts: unknown }).alerts = { dispatch: async (a: { message: string }) => { sent.push(a.message); } };
+    await w.recount();                                     // first pass ingests 95
+    await sql.unsafe(`ALTER TABLE audit_events DISABLE TRIGGER trg_audit_no_delete`);
+    await sql`DELETE FROM withdrawal_requests`;            // a DB writer removes the row later
+    await sql.unsafe(`ALTER TABLE audit_events ENABLE TRIGGER trg_audit_no_delete`);
+    sent.length = 0;
+    await w.recount();                                     // same day: incremental, not re-read
+    expect(await countWithdrawals()).toBe(0);
+    (w as unknown as { recountPassStartedAt: number }).recountPassStartedAt = Date.now() - 25 * 3600_000;
+    await w.recount();                                     // a day later: full pass again
+    expect(await countWithdrawals()).toBe(1);
+    expect(sent.some((m) => /missing from the database/.test(m))).toBe(true);
+  });
+});
