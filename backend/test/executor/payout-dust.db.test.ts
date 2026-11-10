@@ -32,6 +32,11 @@ const ROOT = HDKey.fromMasterSeed(randomBytes(32));
 // A minimal legacy tx that parses (one input ee..ee:0, no outputs): round 10 parks on signed data that doesn't.
 const OLD_HEX = '01000000' + '01' + 'ee'.repeat(32) + '00000000' + '00' + 'ffffffff' + '00' + '00000000';
 const DEADBEEF_TXID = txidFromRawHex(OLD_HEX);
+/** A minimal legacy tx spending txid:vout (no outputs): an earlier signed attempt, for the conflict rule. */
+function minimalSpend(txid: string, vout: number): string {
+  const v = Buffer.alloc(4); v.writeUInt32LE(vout, 0);
+  return '01000000' + '01' + Buffer.from(txid, 'hex').reverse().toString('hex') + v.toString('hex') + '00' + 'ffffffff' + '00' + '00000000';
+}
 
 /** A minimal prev tx paying `amountSat` to the bridge's deposit key m/0/0 (so the builder can really sign). */
 function prevTxPayingDepositKey0(amountSat: bigint): string {
@@ -110,7 +115,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   }
 
   /** A payout already signed, inputs reserved, waiting for broadcast. */
-  async function signedPayout(amountSat: bigint) {
+  async function signedPayout(amountSat: bigint, signedHex: string = OLD_HEX) {
     const { orderId, wrId } = await order(OutboundState.PAYOUT_SIGNED, amountSat);
     const [p] = await sql<{ id: string }[]>`
       INSERT INTO payouts (withdrawal_request_id, dobbscoin_address, amount_sat, fee_sat)
@@ -118,7 +123,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await sql`
       INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
       VALUES (${orderId}, 'PAYOUT_SIGNED', ${OutboundState.PAYOUT_QUEUED}, ${OutboundState.PAYOUT_SIGNED}, 'test',
-              ${sql.json({ payoutId: p!.id, signedHex: OLD_HEX, changeSat: '0', changeAddress: null, changeIndex: null })})`;
+              ${sql.json({ payoutId: p!.id, signedHex, changeSat: '0', changeAddress: null, changeIndex: null })})`;
     const big = await utxo(orderId, 5_000_000_000n, 'reserved', p!.id);
     return { orderId, payoutId: p!.id, big };
   }
@@ -301,14 +306,16 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   });
 
   it('operator retry after the coins were released re-signs under the same payout row and sends ONLY the new tx', async () => {
-    const { orderId, payoutId, big } = await signedPayout(200_000n);
+    const prevHex = prevTxPayingDepositKey0(5_000_000_000n);
+    const coin = txidFromRawHex(prevHex);
+    // The first attempt spent `coin` (round 11: a re-sign must spend one of its coins again).
+    const first = minimalSpend(coin, 0);
+    const { orderId, payoutId, big } = await signedPayout(200_000n, first);
     // The node refused it outright on the first attempt: inputs released, order parked.
     await executor(async () => { throw new RpcCallError('sendrawtransaction', -26, '66: min relay fee not met'); }).broadcastSigned();
     expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
     // Make the pool hold exactly one real, signable coin.
     await sql`UPDATE bridge_utxos SET status = 'spent' WHERE status = 'available'`;
-    const prevHex = prevTxPayingDepositKey0(5_000_000_000n);
-    const coin = txidFromRawHex(prevHex);
     await sql`
       INSERT INTO bridge_utxos (order_id, txid, vout, amount_sat, address, hd_index, status)
       VALUES (${orderId}, ${coin}, 0, 5000000000, ${ADDR}, 0, 'available')`;
@@ -323,7 +330,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
     expect(await utxoStatus(coin)).toEqual({ status: 'reserved', spent_payout_id: payoutId });   // same payout row
     await ex.broadcastSigned();
-    expect(sent).not.toContain(OLD_HEX);                              // never the old, released tx
+    expect(sent).not.toContain(first);                                // never the old, released tx
     expect(sent).toHaveLength(1);
     expect(await payoutTxid(payoutId)).toBe(txidFromRawHex(sent[0]!));
     expect(txInputsFromRawHex(sent[0]!)).toEqual([{ txid: coin, vout: 0 }]);   // parser vs a real signed tx
@@ -673,5 +680,47 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
       burn: { verify: async () => { throw new Error('must not be reached'); } },
     }).processQueued();
     expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+  });
+
+  // ── Review round 11: a re-sign must conflict with every earlier attempt still alive ──
+  it('a retry spends a coin of the refused earlier attempt, even when a bigger coin is free', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    const smallHex = prevTxPayingDepositKey0(300_000_000n), bigHex = prevTxPayingDepositKey0(9_000_000_000n);
+    const small = txidFromRawHex(smallHex), bigCoin = txidFromRawHex(bigHex);
+    await sql`UPDATE bridge_utxos SET status = 'spent' WHERE status = 'available'`;
+    for (const [c, amt] of [[small, 300_000_000n], [bigCoin, 9_000_000_000n]] as const) {
+      await sql`INSERT INTO bridge_utxos (order_id, txid, vout, amount_sat, address, hd_index, status)
+                VALUES (${orderId}, ${c}, 0, ${amt.toString()}, ${ADDR}, 0, 'available')`;
+    }
+    const earlier = minimalSpend(small, 0);                   // refused before, still a valid signed tx
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(earlier), signedHex: earlier })})`;
+    const recipient = new DobbscoinTxBuilder(ROOT.privateExtendedKey, 0).deriveChangeAddress(98);
+    await sql`UPDATE bridge_orders SET user_dobbscoin_address = ${recipient} WHERE id = ${orderId}`;
+    await sql`UPDATE withdrawal_requests SET dobbscoin_address = ${recipient} WHERE order_id = ${orderId}`;
+    await executor(async () => 'x', {
+      getRawTransactionHex: async (t) => (t === small ? smallHex : t === bigCoin ? bigHex : (() => { throw new Error('unknown prev'); })()),
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_SIGNED);
+    expect(await utxoStatus(small)).toMatchObject({ status: 'reserved' });   // the earlier attempt's coin is spent again
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  it('a retry waits when the refused attempt\'s coins are all held by another signed tx', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    // isolate from orders earlier tests left queued (they would take the big coin)
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE state = 'PAYOUT_QUEUED' AND id <> ${orderId}`;
+    const heldHex = prevTxPayingDepositKey0(300_000_007n);   // a distinct amount: same amount = same fake txid
+    const held = txidFromRawHex(heldHex);
+    await sql`INSERT INTO bridge_utxos (order_id, txid, vout, amount_sat, address, hd_index, status)
+              VALUES (${orderId}, ${held}, 0, 300000007, ${ADDR}, 0, 'reserved')`;
+    const earlier = minimalSpend(held, 0);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(earlier), signedHex: earlier })})`;
+    const big = await utxo(orderId, 9_000_000_000n);
+    await executor(async () => { throw new Error('must not broadcast'); }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);           // deferred, nothing signed
+    expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
   });
 });
