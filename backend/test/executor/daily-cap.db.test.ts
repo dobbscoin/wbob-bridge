@@ -756,4 +756,44 @@ describe.skipIf(!URL)('daily mint cap: split, regenerate, submit, refund (real P
                         AND r.status IN ('queued', 'signed', 'needs_attention'))`;
     expect(free.map((f) => f.txid)).not.toContain(d.txid);
   });
+
+  // ── review round 11 (V2 #1): refunds consensus doesn't stop from stacking ──
+  async function refundAudit(orderId: string, type: string, meta: Record<string, unknown>) {
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, ${type}, 'queued', 'signed', 'refund-executor', ${sql.json(meta as never)})`;
+  }
+
+  it('an earlier refund of this deposit paid from OTHER coins blocks a new refund', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: rnd(32), inputs: [`${rnd(32)}:0`] });
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/paid from other coins/);
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('a refund settled by hand (audit REFUND_SETTLED_BY_HAND) blocks a new refund', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refundAudit(d.orderId, 'REFUND_SETTLED_BY_HAND', { txid: d.txid, vout: 0, refundTxid: rnd(32) });
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.reason).toMatch(/settled by hand/);
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('an earlier refund that spent the deposit output itself does not block a re-sign (they conflict by consensus)', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'first', txid: rnd(32), inputs: [`${d.txid}:0`] });
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.status).toBe('broadcast');
+  });
 });

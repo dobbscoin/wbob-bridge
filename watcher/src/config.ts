@@ -71,7 +71,9 @@ function optionalEnvInt(key: string, defaultVal: number): number {
 
 function loadPreCutoverAllow(path: string | undefined): { minDepositHeight: number | null; outpoints: Set<string> } {
   if (path === undefined || path === '') return { minDepositHeight: null, outpoints: new Set() };
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { outpoints?: unknown; minDepositHeight?: unknown };
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as { outpoints?: unknown; minDepositHeight?: unknown; final?: unknown };
+  // (review round 11, V2 #2) only a list from a FINAL export
+  if (raw.final !== true) throw new Error(`V2_PRE_CUTOVER_ALLOW ${path}: not stamped final (written by a non-final export?)`);
   if (!Array.isArray(raw.outpoints)) throw new Error(`V2_PRE_CUTOVER_ALLOW ${path}: expected {"outpoints": ["txid:vout", ...]}`);
   const h = raw.minDepositHeight;
   if (h !== undefined && (typeof h !== 'number' || !Number.isInteger(h) || h <= 0)) {

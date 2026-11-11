@@ -410,7 +410,57 @@ export class RefundExecutor {
     }
   }
 
+  /**
+   * (review round 11, V2 #1) Has this deposit OUTPOINT been refunded before, in a
+   * way consensus doesn't stop from happening twice? A refund that spends the
+   * deposit output conflicts with any later one by itself. One paid from other
+   * coins (old code before the cutover) or by hand leaves the output unspent,
+   * and a DB writer could flip its row back to 'queued'. The append-only trail
+   * decides: every order the watcher rows tie to this outpoint, plus this one.
+   * Returns a reason to refuse, or null.
+   */
+  private async _earlierRefundReason(r: RefundRow): Promise<string | null> {
+    const op = `${r.deposit_txid.toLowerCase()}:${r.deposit_vout}`;
+    const rows = await this.sql<{ event_type: string; refund_id: string | null; inputs: string[] | null; txid: string | null }[]>`
+      SELECT a.event_type, a.metadata->>'refundId' AS refund_id,
+             CASE WHEN jsonb_typeof(a.metadata->'inputs') = 'array'
+                  THEN ARRAY(SELECT jsonb_array_elements_text(a.metadata->'inputs')) END AS inputs,
+             a.metadata->>'txid' AS txid
+      FROM audit_events a
+      WHERE a.event_type IN ('REFUND_SIGNED', 'REFUND_BROADCAST', 'REFUND_CONFIRMED', 'REFUND_SETTLED_BY_HAND')
+        AND a.order_id IN (
+          SELECT o.order_id FROM audit_events o
+          WHERE o.metadata ? 'txid' AND o.metadata ? 'vout'
+            AND o.event_type IN ('ORDER_CREATED', 'STATE_TRANSITION')
+            AND lower(o.metadata->>'txid') = ${r.deposit_txid.toLowerCase()} AND (o.metadata->>'vout') = ${String(r.deposit_vout)}
+          UNION SELECT ${r.order_id}::uuid)
+    `;
+    const selfSpending = new Set<string>();   // txids of earlier refunds that spent the deposit output itself
+    for (const e of rows) {
+      if (e.event_type === 'REFUND_SETTLED_BY_HAND') return `the audit trail records a refund of ${op} settled by hand`;
+      if (e.event_type === 'REFUND_SIGNED') {
+        if (!e.inputs) return `an earlier REFUND_SIGNED for ${op} has no input list: cannot prove it conflicts with a new refund`;
+        if (!e.inputs.map((x) => x.toLowerCase()).includes(op)) {
+          return `an earlier refund for ${op} (${e.txid ?? '?'}) was paid from other coins: a new one would not conflict with it`;
+        }
+        if (e.txid) selfSpending.add(e.txid.toLowerCase());
+      }
+    }
+    for (const e of rows) {
+      if ((e.event_type === 'REFUND_BROADCAST' || e.event_type === 'REFUND_CONFIRMED') && e.txid && !selfSpending.has(e.txid.toLowerCase())) {
+        return `an earlier refund ${e.txid} for ${op} was ${e.event_type === 'REFUND_CONFIRMED' ? 'confirmed' : 'broadcast'} without a matching signed record`;
+      }
+    }
+    return null;
+  }
+
   private async _signOne(r: RefundRow): Promise<void> {
+    // 0. Never a refund that could stack on an earlier one consensus doesn't stop.
+    const earlier = await this._earlierRefundReason(r);
+    if (earlier !== null) {
+      await this._park(r, 'queued', 'needs_attention', `refund refused: ${earlier}`, 'critical');
+      return;
+    }
     // 1. The chain must back it (also re-checked at broadcast on V2).
     const [sd] = await this.sql<{ hd_index: number | null }[]>`
       SELECT hd_index FROM source_deposits WHERE order_id = ${r.order_id}`;

@@ -387,13 +387,37 @@ async function main(): Promise<void> {
     if (floorHeight < dobTip - window) {
       throw new Error(`--floor-height ${floorHeight} is more than ${window} blocks below the tip ${dobTip}: typo? (--floor-window to widen)`);
     }
-    writeFileSync(allowOut, JSON.stringify({ toBlock: to.toString(), minDepositHeight: floorHeight,
-                                             outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
+  }
+
+  // (review round 11, V2 #1) Every deposit the watchers recorded in the
+  // append-only trail must still have its source_deposits row; a deleted or
+  // blanked row would drop a refunded deposit from both lists above.
+  {
+    const sqlA = postgres(config.databaseUrl, { max: 1, onnotice: () => {} });
+    const missing = await sqlA.begin('read only', async (tx) => tx<{ txid: string; vout: string }[]>`
+      SELECT DISTINCT lower(a.metadata->>'txid') AS txid, a.metadata->>'vout' AS vout
+      FROM audit_events a
+      WHERE a.event_type IN ('ORDER_CREATED', 'STATE_TRANSITION') AND a.metadata ? 'txid' AND a.metadata ? 'vout'
+        AND NOT EXISTS (SELECT 1 FROM source_deposits sd
+                        WHERE lower(sd.txid) = lower(a.metadata->>'txid') AND sd.vout::text = a.metadata->>'vout')
+    `);
+    await sqlA.end();
+    for (const m of missing) problem(`${m.txid}:${m.vout}`, `${m.txid}:${m.vout}: the audit trail records this deposit but source_deposits has no row for it`);
   }
 
   const batches: Hex[][] = [];
   for (let i = 0; i < keys.length; i += BATCH) batches.push(keys.slice(i, i + BATCH));
   const final = problems.length === 0;
+  // (review round 11, V2 #2) The watchers' allow list is written only from a
+  // FINAL export, stamped final (a V2 watcher refuses an unstamped file).
+  if (allowOut) {
+    if (final) {
+      writeFileSync(allowOut, JSON.stringify({ final: true, toBlock: to.toString(), minDepositHeight: floorHeight,
+                                               outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
+    } else {
+      notes.push(`allow file NOT written (${allowOut}): this export is not final`);
+    }
+  }
   writeFileSync(out, JSON.stringify({
     v1, wbob, rpcUrl, sourceChainId: config.dobbscoinChainId.toString(), gnosisChainId: await client.getChainId(),
     fromBlock: from.toString(), toBlock: to.toString(), finalizedBlock: finalized.toString(),

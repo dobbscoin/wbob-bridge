@@ -38,7 +38,10 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
    refund sent in between would not be in the import, and V2 could later mint those coins too.
    Refunds decided in the window wait in `queued` and are recorded on V2, then sent, after the
    flip. A refund paid **by hand** at any time must get a `deposit_refunds` row (status
-   `confirmed`) so the backend records it on V2.
+   `confirmed`) so the backend records it on V2, **and** an audit row
+   `REFUND_SETTLED_BY_HAND` on its order (metadata: deposit txid, vout, refund txid): the
+   refund signer refuses any later refund of that deposit, since a hand refund does not
+   spend the deposit output and nothing else would stop a second one.
 6. **Safe tx 1** — stop V1 for good:
    `V1.pause()` · `V1.incrementMintNonce()` · `wBOB.revokeRole(BRIDGE_EXECUTOR_ROLE, V1)`.
    Note the block number **B1**.
