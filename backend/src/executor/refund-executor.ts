@@ -30,6 +30,8 @@ import {
   DobbscoinTxBuilder,
   RefundTooSmallError,
   txInputsFromRawHex,
+  txOutputsFromRawHex,
+  txidFromRawHex,
   type UtxoInput,
 } from '../dobbscoin/tx-builder.js';
 import { detectDepositSender } from '../dobbscoin/sender.js';
@@ -411,21 +413,21 @@ export class RefundExecutor {
   }
 
   /**
-   * (review round 11, V2 #1) Has this deposit OUTPOINT been refunded before, in a
-   * way consensus doesn't stop from happening twice? A refund that spends the
-   * deposit output conflicts with any later one by itself. One paid from other
-   * coins (old code before the cutover) or by hand leaves the output unspent,
-   * and a DB writer could flip its row back to 'queued'. The append-only trail
-   * decides: every order the watcher rows tie to this outpoint, plus this one.
-   * Returns a reason to refuse, or null.
+   * (review rounds 11-12, V2) Has this deposit OUTPOINT been refunded before, in
+   * a way consensus doesn't stop from happening twice? A refund that spends the
+   * deposit output conflicts with any later one by itself; one paid from other
+   * coins (old code before the cutover) or by hand leaves the output unspent.
+   * Which orders: every order the watcher audit rows tie to this outpoint, plus
+   * this one. What an earlier refund SPENT is never taken from an audit row (the
+   * DB role can INSERT those): only from our node, or from its signed bytes
+   * whose hash equals its txid. An other-coins refund blocks unless it provably
+   * can never confirm (unknown to our node, and one of its coins spent 6+ deep
+   * by another tx with different outputs). Returns a reason to refuse, or null.
    */
   private async _earlierRefundReason(r: RefundRow): Promise<string | null> {
     const op = `${r.deposit_txid.toLowerCase()}:${r.deposit_vout}`;
-    const rows = await this.sql<{ event_type: string; refund_id: string | null; inputs: string[] | null; txid: string | null }[]>`
-      SELECT a.event_type, a.metadata->>'refundId' AS refund_id,
-             CASE WHEN jsonb_typeof(a.metadata->'inputs') = 'array'
-                  THEN ARRAY(SELECT jsonb_array_elements_text(a.metadata->'inputs')) END AS inputs,
-             a.metadata->>'txid' AS txid
+    const rows = await this.sql<{ event_type: string; txid: string | null }[]>`
+      SELECT a.event_type, lower(a.metadata->>'txid') AS txid
       FROM audit_events a
       WHERE a.event_type IN ('REFUND_SIGNED', 'REFUND_BROADCAST', 'REFUND_CONFIRMED', 'REFUND_SETTLED_BY_HAND')
         AND a.order_id IN (
@@ -435,23 +437,74 @@ export class RefundExecutor {
             AND lower(o.metadata->>'txid') = ${r.deposit_txid.toLowerCase()} AND (o.metadata->>'vout') = ${String(r.deposit_vout)}
           UNION SELECT ${r.order_id}::uuid)
     `;
-    const selfSpending = new Set<string>();   // txids of earlier refunds that spent the deposit output itself
+    if (rows.some((e) => e.event_type === 'REFUND_SETTLED_BY_HAND')) return `the audit trail records a refund of ${op} settled by hand`;
+    const txids = new Set<string>();
     for (const e of rows) {
-      if (e.event_type === 'REFUND_SETTLED_BY_HAND') return `the audit trail records a refund of ${op} settled by hand`;
-      if (e.event_type === 'REFUND_SIGNED') {
-        if (!e.inputs) return `an earlier REFUND_SIGNED for ${op} has no input list: cannot prove it conflicts with a new refund`;
-        if (!e.inputs.map((x) => x.toLowerCase()).includes(op)) {
-          return `an earlier refund for ${op} (${e.txid ?? '?'}) was paid from other coins: a new one would not conflict with it`;
-        }
-        if (e.txid) selfSpending.add(e.txid.toLowerCase());
-      }
+      if (!e.txid || !/^[0-9a-f]{64}$/.test(e.txid)) return `an earlier ${e.event_type} for ${op} has no usable txid`;
+      txids.add(e.txid);
     }
-    for (const e of rows) {
-      if ((e.event_type === 'REFUND_BROADCAST' || e.event_type === 'REFUND_CONFIRMED') && e.txid && !selfSpending.has(e.txid.toLowerCase())) {
-        return `an earlier refund ${e.txid} for ${op} was ${e.event_type === 'REFUND_CONFIRMED' ? 'confirmed' : 'broadcast'} without a matching signed record`;
+    if (txids.size === 0) return null;
+    // Authentic signed bytes we hold for those txids (any deposit_refunds row; the hash proves them).
+    const bytes = new Map<string, string>();
+    const hexRows = await this.sql<{ signed_hex: string | null }[]>`SELECT signed_hex FROM deposit_refunds WHERE signed_hex IS NOT NULL`;
+    for (const h of hexRows) { try { const t = txidFromRawHex(h.signed_hex!); if (txids.has(t)) bytes.set(t, h.signed_hex!); } catch { /* skip */ } }
+    for (const t of txids) {
+      let ins: { txid: string; vout: number }[] | null = null;
+      let known: { confirmations: number } | null = null;
+      try {
+        const v = await this.rpc.getRawTransactionVerbose(t);
+        ins = v.vin.filter((x) => x.txid !== undefined).map((x) => ({ txid: x.txid!.toLowerCase(), vout: x.vout ?? -1 }));
+        known = { confirmations: v.confirmations ?? 0 };
+      } catch (err) {
+        if (!(err instanceof RpcCallError && err.code === -5)) return `node unreachable while checking earlier refund ${t}`;
+      }
+      if (ins === null && bytes.has(t)) { try { ins = txInputsFromRawHex(bytes.get(t)!).map((x) => ({ txid: x.txid.toLowerCase(), vout: x.vout })); } catch { ins = null; } }
+      if (ins === null) return `earlier refund ${t} for ${op}: neither our node nor its signed bytes show what it spent`;
+      if (ins.some((x) => `${x.txid}:${x.vout}` === op)) continue;          // spent the deposit output: consensus conflict
+      if (known && known.confirmations >= 1) return `an earlier refund for ${op} (${t}) was paid from other coins and is confirmed`;
+      if (known) return `an earlier refund for ${op} (${t}) was paid from other coins and is in the mempool`;
+      // Unknown to our node: dead only if one of its coins is spent 6+ deep by another tx with different outputs.
+      if (!bytes.has(t)) return `earlier refund ${t} for ${op} paid from other coins; its bytes aren't on record to prove it can never confirm`;
+      if (!(await this._provablyDead(t, bytes.get(t)!))) {
+        return `an earlier refund for ${op} (${t}) was paid from other coins and could still confirm`;
       }
     }
     return null;
+  }
+
+  /** A tx unknown to our node is dead if one of its inputs is spent 6+ deep by another tx with different outputs. */
+  private async _provablyDead(txid: string, hex: string): Promise<boolean> {
+    let ins: { txid: string; vout: number }[]; let outs: { valueSat: bigint; script: string }[];
+    try { ins = txInputsFromRawHex(hex); outs = txOutputsFromRawHex(hex); } catch { return false; }
+    const key = (o: { valueSat: bigint; script: string }[]) => o.map((x) => `${x.valueSat}:${x.script.toLowerCase()}`).sort().join('|');
+    const mine = key(outs);
+    for (const i of ins) {
+      let unspent: boolean;
+      try { unspent = await this.rpc.isUnspent(i.txid, i.vout); } catch { return false; }
+      if (unspent) continue;
+      // candidates that spend it: other txs the bridge signed (audit hints only), verified on our node
+      const le = Buffer.alloc(4); le.writeUInt32LE(i.vout, 0);
+      const needle = Buffer.from(i.txid, 'hex').reverse().toString('hex') + le.toString('hex');
+      const cands = await this.sql<{ hex: string | null; txid: string | null }[]>`
+        SELECT metadata->>'signedHex' AS hex, metadata->>'txid' AS txid FROM audit_events
+        WHERE (event_type = 'PAYOUT_SIGNED' AND position(${needle} IN lower(metadata->>'signedHex')) > 0)
+           OR (event_type = 'REFUND_SIGNED' AND metadata->'inputs' ? ${`${i.txid}:${i.vout}`})
+      `;
+      for (const c of cands) {
+        const ids = [c.txid, c.hex ? txidFromRawHex(c.hex) : null].filter((x): x is string => !!x && x.toLowerCase() !== txid);
+        for (const ct of ids) {
+          try {
+            const v = await this.rpc.getRawTransactionVerbose(ct);
+            if (!v.vin.some((x) => x.txid?.toLowerCase() === i.txid.toLowerCase() && x.vout === i.vout)) continue;
+            if ((v.confirmations ?? 0) < 6) continue;
+            const vo = v.vout.map((o) => ({ valueSat: BigInt(Math.round(o.value * 1e8)), script: o.scriptPubKey.hex }));
+            if (key(vo) === mine) continue;                   // a malleated copy of it: that refund was PAID
+            return true;
+          } catch { /* not on our node */ }
+        }
+      }
+    }
+    return false;
   }
 
   private async _signOne(r: RefundRow): Promise<void> {

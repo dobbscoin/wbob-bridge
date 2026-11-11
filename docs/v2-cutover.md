@@ -76,7 +76,8 @@ Addresses (live): wBOB `0x13550ae65f22A36f60A50d625B70b58666488263` · V1
     `NEXT_PUBLIC_BRIDGE_CONTROLLER_VERSION=2` (rebuild). Restart; the backend must log
     `controller … verified as V2` and no `BridgeGuard NOT READY`.
 13. **Verify** (read-only): `--stage pre-unpause --relayer <relayer> --module <new module> --old-module <V1 module>
-    --signers <the 5 watcher addresses> --mint-limit <mintLimitPerWindow as deployed, sat>` → `OK (pre-unpause)`.
+    --signers <the 5 watcher addresses> --mint-limit <mintLimitPerWindow as deployed, sat> --allow v2-pre-cutover-allow.json`
+    → `OK (pre-unpause)`. Verify checks the allow file is this export's (digest) and lists exactly its leftToV2.
     Both verify stages also check the RPC is Gnosis (chain 100) and V2's `SOURCE_CHAIN_ID` matches the export.
     pre-unpause also requires V2 to already record every refund on a left-to-V2 deposit (the
     backend records them in its first polls after the flip, while V2 is still paused).

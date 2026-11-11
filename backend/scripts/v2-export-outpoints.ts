@@ -34,7 +34,7 @@
  * import, run scripts/v2-verify-import.ts against the same file BEFORE sealImport
  * and again before the final unpause.
  */
-import { writeFileSync, readFileSync } from 'node:fs';
+import { writeFileSync, readFileSync, unlinkSync } from 'node:fs';
 import postgres from 'postgres';
 import { createPublicClient, http, parseAbi, parseAbiItem, keccak256, toBytes, zeroAddress, type Hex } from 'viem';
 import { gnosis } from 'viem/chains';
@@ -403,6 +403,23 @@ async function main(): Promise<void> {
     `);
     await sqlA.end();
     for (const m of missing) problem(`${m.txid}:${m.vout}`, `${m.txid}:${m.vout}: the audit trail records this deposit but source_deposits has no row for it`);
+    // (review round 12, V2 #3) ...and every audit-recorded deposit must be in the
+    // set this export classified (inbound order, txid/vout set): a row re-pointed
+    // at an outbound order, or blanked, would otherwise drop out of both lists.
+    const sqlB = postgres(config.databaseUrl, { max: 1, onnotice: () => {} });
+    const named = await sqlB.begin('read only', async (tx) => tx<{ txid: string; vout: string }[]>`
+      SELECT DISTINCT lower(a.metadata->>'txid') AS txid, a.metadata->>'vout' AS vout
+      FROM audit_events a
+      WHERE a.event_type IN ('ORDER_CREATED', 'STATE_TRANSITION') AND a.metadata ? 'txid' AND a.metadata ? 'vout'`);
+    await sqlB.end();
+    const classified = new Set(deposits.map((d) => opOf(d.txid, d.vout)));
+    const missingRow = new Set(missing.map((m) => `${m.txid}:${m.vout}`));
+    for (const n of named) {
+      const op = `${n.txid}:${n.vout}`;
+      if (!classified.has(op) && !missingRow.has(op)) {
+        problem(op, `${op}: the audit trail records this deposit but it is not an inbound deposit row here (re-pointed or blanked?)`);
+      }
+    }
   }
 
   const batches: Hex[][] = [];
@@ -410,12 +427,19 @@ async function main(): Promise<void> {
   const final = problems.length === 0;
   // (review round 11, V2 #2) The watchers' allow list is written only from a
   // FINAL export, stamped final (a V2 watcher refuses an unstamped file).
+  // (review round 12, V2 #2) The allow file is tied to THIS export by a digest
+  // of its keys + leftToV2 + toBlock (also written into the out file, and
+  // compared by verify --stage pre-unpause). A non-final run REMOVES any allow
+  // file at that path, so an older final one can't be deployed by mistake.
+  const exportDigest = keccak256(toBytes(JSON.stringify({ toBlock: to.toString(), keys: [...keys].sort(),
+                                                          leftToV2: leftToV2.map((x) => x.outpoint).sort() })));
   if (allowOut) {
     if (final) {
-      writeFileSync(allowOut, JSON.stringify({ final: true, toBlock: to.toString(), minDepositHeight: floorHeight,
+      writeFileSync(allowOut, JSON.stringify({ final: true, exportDigest, toBlock: to.toString(), minDepositHeight: floorHeight,
                                                outpoints: leftToV2.map((x) => x.outpoint) }, null, 2));
     } else {
-      notes.push(`allow file NOT written (${allowOut}): this export is not final`);
+      try { unlinkSync(allowOut); notes.push(`allow file REMOVED (${allowOut}): this export is not final`); }
+      catch { notes.push(`allow file NOT written (${allowOut}): this export is not final`); }
     }
   }
   writeFileSync(out, JSON.stringify({
@@ -425,7 +449,7 @@ async function main(): Promise<void> {
     count: keys.length, v1MintCount: logs.length, settledDepositsAdded: settledAdded,
     dbMintCount: dbRows.length, dbRowsChecked: allRows.length,
     tokenMinted: tokenMinted.toString(), logMinted: logMinted.toString(),
-    problems, allowed, notes, leftToV2,
+    problems, allowed, notes, leftToV2, exportDigest,
     // Never hand out import batches from a list that is not final.
     keys: final ? keys : [], batches: final ? batches : [],
   }, null, 2));

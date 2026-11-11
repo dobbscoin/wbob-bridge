@@ -37,6 +37,7 @@ import { RefundExecutor } from '../../src/executor/refund-executor.js';
 import type { MintCapChainState, MintCapReader } from '../../src/executor/mint-capacity.js';
 import { RpcCallError, type RpcVerboseTx } from '../../src/dobbscoin/rpc.js';
 import { pubkeyToP2PKH } from '../../src/wallet/hd-wallet.js';
+import { txidFromRawHex } from '../../src/dobbscoin/tx-builder.js';
 import { ordersRoute } from '../../src/api/routes/orders.js';
 import { mintCapRoute } from '../../src/api/routes/mint-cap.js';
 import { SolvencyMonitor } from '../../src/monitor/solvency-monitor.js';
@@ -772,7 +773,7 @@ describe.skipIf(!URL)('daily mint cap: split, regenerate, submit, refund (real P
     await refunder(node).poll();
     const r = (await refundOf(d.orderId))!;
     expect(r.status).toBe('needs_attention');
-    expect(r.reason).toMatch(/paid from other coins/);
+    expect(r.reason).toMatch(/other coins|show what it spent/);   // round 12: unproven = refused
     expect(node.broadcasts).toHaveLength(0);
   });
 
@@ -787,12 +788,57 @@ describe.skipIf(!URL)('daily mint cap: split, regenerate, submit, refund (real P
     expect(node.broadcasts).toHaveLength(0);
   });
 
-  it('an earlier refund that spent the deposit output itself does not block a re-sign (they conflict by consensus)', async () => {
+  /** A minimal legacy tx spending txid:vout, with one output of `sat` to a fixed script. */
+  function spendHex(txid: string, vout: number, sat = 0n): string {
+    const v = Buffer.alloc(4); v.writeUInt32LE(vout, 0);
+    const outs = sat > 0n ? (() => { const a = Buffer.alloc(8); a.writeBigUInt64LE(sat, 0); return Buffer.concat([Buffer.from([1]), a, Buffer.from([2]), Buffer.from('6a00', 'hex')]); })() : Buffer.from([0]);
+    return Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(txid, 'hex').reverse(), v, Buffer.from([0]),
+      Buffer.alloc(4, 0xff), outs, Buffer.alloc(4)]).toString('hex');
+  }
+
+  it('an earlier refund that spent the deposit output itself (proved by its signed bytes) does not block a re-sign', async () => {
     const node = new FakeNode();
     cap.state.currentDayMinted = LIMIT - 40n * BOB;
     const d = await depositFromSender(node, 50n * BOB);
     await executor().createPendingAuths();
-    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'first', txid: rnd(32), inputs: [`${d.txid}:0`] });
+    const first = spendHex(d.txid, 0);
+    await sql`UPDATE deposit_refunds SET signed_hex = ${first} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'first', txid: txidFromRawHex(first), inputs: [`${d.txid}:0`] });
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.status).toBe('broadcast');
+  });
+
+  it('a forged REFUND_SIGNED claiming it spent the deposit output is not trusted (its bytes say other coins)', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const other = spendHex(rnd(32), 0);
+    await sql`UPDATE deposit_refunds SET signed_hex = ${other} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: txidFromRawHex(other), inputs: [`${d.txid}:0`] });   // the lie
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/other coins/);
+  });
+
+  it('an other-coins earlier refund that provably can never confirm (its coin spent 6+ deep elsewhere) does not block', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const coin = rnd(32);
+    const old = spendHex(coin, 0);                                        // the old refund, never confirmed
+    const spender = spendHex(coin, 0, 12345n);                            // a payout that took that coin instead
+    await sql`UPDATE deposit_refunds SET signed_hex = ${old} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: txidFromRawHex(old), inputs: [`${coin}:0`] });
+    const [po] = await sql<{ id: string }[]>`INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+      VALUES ('outbound', 'COMPLETED', ${RECIPIENT}, 1) RETURNING id`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${po!.id}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(spender), signedHex: spender })})`;
+    node.spent.add(`${coin}:0`);
+    node.verbose.set(txidFromRawHex(spender), { txid: txidFromRawHex(spender), confirmations: 9, vin: [{ txid: coin, vout: 0 }],
+      vout: [{ value: 0.00012345, n: 0, scriptPubKey: { hex: '6a00', type: 'nulldata' } }] } as never);
     await refunder(node).poll();
     expect((await refundOf(d.orderId))!.status).toBe('broadcast');
   });

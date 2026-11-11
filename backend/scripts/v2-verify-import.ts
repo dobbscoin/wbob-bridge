@@ -6,7 +6,7 @@
  *   node --import=tsx scripts/v2-verify-import.ts --stage pre-seal    --file v1-outpoints.json --v2 <V2> [--rpc <url>]
  *   node --import=tsx scripts/v2-verify-import.ts --stage pre-unpause --file v1-outpoints.json --v2 <V2> \
  *        --relayer <backend relayer address> --module <EmergencyPauseModule> --old-module <V1 module> \
- *        --signers <watcher addr,addr,...> --mint-limit <sat per 24h> [--payout-min <sat>] [--rpc <url>]
+ *        --signers <watcher addr,addr,...> --mint-limit <sat per 24h> --allow <v2-pre-cutover-allow.json> [--payout-min <sat>] [--rpc <url>]
  *
  * Both stages: every key imported; V1 paused and role-less; V2 HOLDS
  * BRIDGE_EXECUTOR_ROLE (else every mint/withdrawal reverts); V2 still PAUSED
@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   const file = JSON.parse(readFileSync(arg('file'), 'utf8')) as
     { final: boolean; keys: Hex[]; v1: Hex; count: number; toBlock: string; wbob: Hex;
       sourceChainId?: string; gnosisChainId?: number;
-      leftToV2?: { outpoint: string; refundTotalSat: string }[] };
+      leftToV2?: { outpoint: string; refundTotalSat: string }[]; exportDigest?: string };
   const v2 = arg('v2') as Hex;
   const stage = arg('stage');
   if (stage !== 'pre-seal' && stage !== 'pre-unpause') throw new Error('--stage must be pre-seal or pre-unpause');
@@ -157,6 +157,19 @@ async function main(): Promise<void> {
     if (limit !== wantLimit) problems.push(`V2 mintLimitPerWindow is ${limit}, expected ${wantLimit} (units are sat per 24h)`);
     const payoutMin = BigInt(arg('payout-min', process.env['PAYOUT_MIN_SAT'] ?? '100000'));
     if (minW < payoutMin) problems.push(`V2 minWithdrawal ${minW} is under the backend payout minimum ${payoutMin}: such burns can't be paid`);
+
+    // (review round 12, V2 #2) The watchers' allow file must be THIS export's.
+    const allowPath = arg('allow');
+    const allow = JSON.parse(readFileSync(allowPath, 'utf8')) as { final?: boolean; exportDigest?: string; outpoints?: string[] };
+    if (allow.final !== true) problems.push(`allow file ${allowPath} is not stamped final`);
+    if (!file.exportDigest || allow.exportDigest !== file.exportDigest) {
+      problems.push(`allow file ${allowPath} belongs to a different export (digest ${allow.exportDigest ?? 'none'} vs ${file.exportDigest ?? 'none'})`);
+    }
+    const want = new Set((file.leftToV2 ?? []).map((x) => x.outpoint));
+    const got = new Set(allow.outpoints ?? []);
+    if (want.size !== got.size || [...want].some((o) => !got.has(o))) {
+      problems.push(`allow file outpoints (${got.size}) differ from the export's leftToV2 (${want.size})`);
+    }
 
     // Deposits left to V2 with refunds: V2 must already hold each refund, or the
     // refunded coins could be minted again (the backend records them at the flip).
