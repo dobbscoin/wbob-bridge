@@ -22,7 +22,13 @@ export type AlertType =
   | 'MINT_SUBMIT_BLOCKED'  // executeMint simulation reverted; mint held, reason recorded
   | 'MINT_AUTH_REGENERATED' // an expired / stale-nonce authorization was reissued
   | 'MANUAL_REVIEW_ORDERS' // orders parked in MANUAL_REVIEW: excluded from every other check, need an operator
-  | 'WATCHER_REFUSED';     // a watcher refused to sign a mint (its own check failed): that mint stalls
+  | 'WATCHER_REFUSED'      // a watcher refused to sign a mint (its own check failed): that mint stalls
+  // ── review round 11 (never silent) ──
+  | 'PAYOUT_DEFERRED'      // a queued payout has waited too long (reason in the message)
+  | 'MINT_REVERTED'        // an executeMint reverted on-chain; the order went to FAILED
+  | 'BURN_UNPAID'          // a withdrawal marked COMPLETED/FAILED has no confirmed payout on our node
+  | 'WATCHER_LAG'          // a watcher's cursor is far behind the Dobbscoin tip (or stale)
+  | 'MONITOR_ERROR';       // the solvency monitor itself keeps failing
 
 export interface Alert {
   level: AlertLevel;
