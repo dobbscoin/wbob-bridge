@@ -10,8 +10,8 @@
 // (~2026-07-16), after which 100 confs is provable finality.
 //
 // The wait applies to *inbound* (BOB → wBOB) only. Withdrawals (wBOB → BOB)
-// settle in roughly one Gnosis block-time on the burn side (~1 min), since
-// Gnosis isn't the vulnerable chain.
+// wait for the burn to be FINALIZED on Gnosis (~3-4 min) before the payout is
+// signed; Gnosis isn't the vulnerable chain, so there's no deep-conf wait.
 
 export function InboundConfirmationBanner() {
   return (
@@ -75,8 +75,8 @@ export function OutboundConfirmationNote() {
       <span className="font-semibold uppercase tracking-wider text-bob-300">
         Note:
       </span>{' '}
-      Withdrawals settle quickly — the bridge waits only a handful of Gnosis
-      blocks (~1 min) before queuing the (BOB) payout. The ~2-hour deep-conf
+      Withdrawals settle quickly: the bridge waits for your burn to be final on
+      Gnosis (about 3–4 min) before sending the (BOB) payout. The ~2-hour deep-conf
       wait is on <span className="italic">inbound</span> deposits only, where
       a low-hash scrypt chain needs to be defended against rented-hash reorgs.
     </p>
