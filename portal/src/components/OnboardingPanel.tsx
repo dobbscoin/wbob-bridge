@@ -4,7 +4,6 @@ import { useState } from 'react';
 import {
   addGnosisChain,
   addWBobToken,
-  addWxdaiToken,
   switchToGnosis,
 } from '@/lib/onboarding';
 
@@ -23,7 +22,6 @@ function statusLabel(s: Status, doneText: string): string {
 export function OnboardingPanel({ className = '' }: { className?: string }) {
   const [chain, setChain] = useState<Status>('idle');
   const [wbob, setWbob] = useState<Status>('idle');
-  const [wxdai, setWxdai] = useState<Status>('idle');
 
   async function onAddChain() {
     setChain('pending');
@@ -43,12 +41,6 @@ export function OnboardingPanel({ className = '' }: { className?: string }) {
     setWbob(r === 'added' ? 'done' : r === 'no-provider' ? 'no-provider' : 'rejected');
   }
 
-  async function onAddWxdai() {
-    setWxdai('pending');
-    const r = await addWxdaiToken();
-    setWxdai(r === 'added' ? 'done' : r === 'no-provider' ? 'no-provider' : 'rejected');
-  }
-
   return (
     <div className={`card space-y-4 ${className}`}>
       <div>
@@ -56,7 +48,7 @@ export function OnboardingPanel({ className = '' }: { className?: string }) {
           One-click setup
         </h2>
         <p className="mt-1 text-xs text-gray-500">
-          Most n00bs trip on the same three steps. Click these in order and
+          Most n00bs trip on the same two steps. Click these in order and
           your wallet is ready.
         </p>
       </div>
@@ -77,14 +69,6 @@ export function OnboardingPanel({ className = '' }: { className?: string }) {
           status={wbob}
           doneText="✓ wBOB visible"
           onClick={onAddWbob}
-        />
-        <SetupRow
-          step="3"
-          title="Add WXDAI token"
-          subtitle="Wrapped X-DAI — what you'll trade a sliver of wBOB for."
-          status={wxdai}
-          doneText="✓ WXDAI visible"
-          onClick={onAddWxdai}
         />
       </ul>
     </div>

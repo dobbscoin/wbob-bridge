@@ -21,7 +21,7 @@ export default function TradePage() {
           Trade wBOB on Gnosis
         </h1>
         <p className="text-sm text-gray-400">
-          Swap wBOB on Gnosis. CoW Swap runs right on this page (wBOB → WXDAI)
+          Swap wBOB on Gnosis. CoW Swap runs right on this page (wBOB → plain xDAI)
           and Oku opens in a new tab (WXDAI → wBOB). Every wBOB pool they trade
           against is ours, and so is the 1% pool fee.
         </p>

@@ -1,34 +1,34 @@
 'use client';
 
 import { WBOB_ADDRESS } from '@/lib/contracts';
-import { WXDAI_ADDRESS } from '@/lib/onboarding';
 
 /**
  * Embeds CoW Swap targeting Gnosis chain (chainId 100) with sell=wBOB,
- * buy=WXDAI. Liquidity routes through whatever AMMs CoW finds; we don't
+ * buy=native xDAI (the coin that pays gas; no unwrap step). Liquidity routes through whatever AMMs CoW finds; we don't
  * run the swap ourselves.
  */
 export function CowSwapWidget() {
   const sell = WBOB_ADDRESS || 'wBOB';
-  const buy = WXDAI_ADDRESS;
+  const buy = 'XDAI';   // native xDAI, not WXDAI: CoW pays it out unwrapped
   const src = `https://swap.cow.fi/#/100/swap/${sell}/${buy}?widget=true`;
 
   return (
     <div className="card space-y-3">
       <div>
         <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
-          Trade wBOB → WXDAI
+          Trade wBOB → xDAI
         </h2>
         <p className="mt-1 text-xs text-gray-500">
-          Sell a little wBOB for WXDAI, then unwrap it to xDAI for gas. Gnosis
-          fees are tiny; a dollar&rsquo;s worth lasts a long time. Trade what feels fair.
+          Sell a little wBOB for plain xDAI, the coin that pays gas (and the one
+          the Codex takes). Gnosis fees are tiny; a dollar&rsquo;s worth lasts a long
+          time. Trade what feels fair.
         </p>
       </div>
 
       <div className="overflow-hidden rounded-xl border border-gray-800 bg-black">
         <iframe
           src={src}
-          title="CoW Swap — wBOB to WXDAI"
+          title="CoW Swap — wBOB to xDAI"
           className="h-[640px] w-full"
           allow="clipboard-read; clipboard-write; web3"
         />
@@ -37,7 +37,7 @@ export function CowSwapWidget() {
       <p className="text-[11px] text-gray-500">
         Swap is routed by{' '}
         <a
-          href="https://swap.cow.fi/#/100/swap/wBOB/WXDAI"
+          href="https://swap.cow.fi/#/100/swap/wBOB/XDAI"
           target="_blank"
           rel="noopener noreferrer"
           className="text-bob-400 hover:underline"

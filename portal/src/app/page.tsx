@@ -101,7 +101,7 @@ export default function TestBedPage() {
             <h1 className="text-3xl font-bold tracking-tight">Bridge &amp; Fuel</h1>
             <p className="text-sm text-gray-400">
               Bridge (BOB) → wBOB on Gnosis, ..and if ya want, trade a sliver
-              for WXDAI in the process; so you can transact without hunting
+              for xDAI in the process; so you can transact without hunting
               for gas, &apos;cos transactions require gas to process.
               <span className="block">Same bridge, lower learning curve.</span>
               <span className="block text-right">—Praise &quot;Bob&quot;.</span>
@@ -232,9 +232,10 @@ export default function TestBedPage() {
             </p>
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
-            <li>• CoW Swap — wBOB → WXDAI</li>
+            <li>• CoW Swap — wBOB → xDAI</li>
             <li>• Oku — WXDAI → wBOB</li>
             <li>• Both need xDAI for gas (see below).</li>
+            <li>• WXDAI is xDAI wrapped for the pools. Gas, the drip and the Codex are all plain xDAI.</li>
           </ul>
           <p className="text-xs text-bob-400 group-hover:underline">
             Trade page →
