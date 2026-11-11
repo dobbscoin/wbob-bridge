@@ -32,6 +32,14 @@ export interface MintCapResponse {
   resetsAt:          string;   // ISO — 00:00 UTC for the contract's aligned window
   gnosisBlock:       string;
   checkedAt:         string;   // ISO
+  /**
+   * V2 only: the controller's rolling 24 h remaining (before reservations). When
+   * present, remainingSat already includes it, and resetsAt/limitSat describe
+   * only the token's UTC day: capacity used by V2 returns 24-25 h after each mint.
+   */
+  controllerRemainingSat?: string;
+  /** V2 only: the controller's rolling 24 h limit (mintLimitPerWindow). */
+  controllerLimitSat?: string;
 }
 
 const CACHE_MS = 15_000;
@@ -57,6 +65,8 @@ export async function mintCapRoute(
       windowStart:    iso(window.windowStartSec),
       resetsAt:       iso(window.resetsAtSec),
       gnosisBlock:    state.blockNumber.toString(),
+      ...(state.controllerRemainingSat === undefined ? {} : { controllerRemainingSat: state.controllerRemainingSat.toString() }),
+      ...(state.controllerLimitSat === undefined ? {} : { controllerLimitSat: state.controllerLimitSat.toString() }),
       checkedAt:      new Date().toISOString(),
     };
   }

@@ -64,4 +64,12 @@ describe('BurnVerifier', () => {
     const bad = 'a\u0000b';
     expect(await v({ logs: [log({ dest: bad })] }, { ...claim, dobbscoinAddress: 'INVALID:610062' })).toEqual({ ok: true });
   });
+
+  it('V2: a burn on a LEGACY controller (LEGACY_BRIDGE_CONTROLLER_ADDRESSES) is accepted; an unknown contract is not', async () => {
+    const V2 = '0x' + '7'.repeat(40);
+    const cfgV2 = { ...config, bridgeControllerAddress: V2, legacyBridgeControllerAddresses: [CTRL] } as unknown as BackendConfig;
+    expect(await new BurnVerifier(cfgV2, reader({ logs: [log({ address: CTRL })] })).verify(claim)).toEqual({ ok: true });
+    expect(await new BurnVerifier(cfgV2, reader({ logs: [log({ address: '0x' + '9'.repeat(40) })] })).verify(claim)).toMatchObject({ ok: false, defer: false });
+  });
 });
+

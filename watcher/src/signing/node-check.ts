@@ -34,6 +34,15 @@ export interface MintCheckRow {
   deposit_id_hex: string;
   /** The bridge's address at this row's hd_index, derived from the watcher's xpub (null = could not derive). */
   expected_deposit_address: string | null;
+  /** source_deposits.amount_sat: the deposit value the bridge recorded (null on legacy rows). */
+  deposit_value_sat?: bigint | string | number | null;
+  /** V2: the recorded deposit value is required and must equal the node's (it is signed as sourceValue). */
+  require_deposit_value?: boolean;
+  /**
+   * V2 cutover floor (review round 6 #2): the deposit's block height on our node
+   * must be >= minHeight, unless "txid:vout" is in allowed.
+   */
+  cutover_floor?: { minHeight: number; allowed: Set<string>; depositHeight: number | null } | null;
 }
 
 export function checkMintAgainstNode(
@@ -45,6 +54,13 @@ export function checkMintAgainstNode(
   if (st.confirmations < finalConfirmations) {
     return `node shows ${st.confirmations} confirmations (< ${finalConfirmations})`;
   }
+  if (row.cutover_floor) {
+    const f = row.cutover_floor;
+    if (f.depositHeight === null) return 'cannot read the deposit block height (needed for the V2 cutover floor)';
+    if (f.depositHeight < f.minHeight && !f.allowed.has(`${row.txid.replace(/^0x/, '').toLowerCase()}:${row.vout}`)) {
+      return `deposit confirmed at height ${f.depositHeight}, before the V2 cutover (${f.minHeight}), and not on the reviewed pre-cutover list`;
+    }
+  }
   if (row.expected_deposit_address === null) return 'cannot derive the bridge address for this row (no hd_index?)';
   if (row.deposit_address !== row.expected_deposit_address) {
     return `recorded deposit address ${row.deposit_address} is not the bridge's address ${row.expected_deposit_address} at this hd_index`;
@@ -53,6 +69,11 @@ export function checkMintAgainstNode(
   if (out === undefined) return `tx has no output ${row.vout}`;
   if (out.address !== row.deposit_address) {
     return `output ${row.vout} pays ${out.address}, not ${row.deposit_address}`;
+  }
+  if (row.deposit_value_sat === null || row.deposit_value_sat === undefined) {
+    if (row.require_deposit_value) return 'no recorded deposit value for this row (needed to sign sourceValue)';
+  } else if (BigInt(row.deposit_value_sat) !== out.valueSat) {
+    return `recorded deposit value ${row.deposit_value_sat} != the node's output value ${out.valueSat}`;
   }
   const amount = BigInt(row.amount_sat);
   if (amount <= 0n) return `non-positive amount ${amount}`;

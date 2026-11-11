@@ -55,6 +55,7 @@ interface PendingMintRow {
   source_chain_name: string;
   deposit_address:  string;
   hd_index:         number | null;
+  deposit_value_sat: bigint | null;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -70,6 +71,7 @@ async function main(): Promise<void> {
   const authorizer = new MintAuthorizer({
     privateKey: config.watcherPrivateKey,
     bridgeControllerAddress: config.bridgeControllerAddress,
+    bridgeControllerVersion: config.bridgeControllerVersion,
   });
   const submitter = new SignatureSubmitter(sql);
   // The bridge's deposit addresses, derived from the xpub in OUR env: a DB
@@ -80,7 +82,8 @@ async function main(): Promise<void> {
     try { return bridgeAddresses.depositAddress(hdIndex); } catch { return null; }
   };
 
-  console.log(`[watcher] started. signer=${authorizer.address}`);
+  console.log(`[watcher] started. signer=${authorizer.address}` +
+    (config.bridgeControllerVersion === 2 ? ` · V2 cutover floor: height ${config.v2MinDepositHeight}, ${config.v2PreCutoverAllowed.size} pre-cutover outpoint(s) allowed` : ""));
 
   const confirmationConfig: ConfirmationConfig = {
     minConfirmations: config.minConfirmations,
@@ -127,6 +130,35 @@ async function main(): Promise<void> {
   // Polls for MINT_AUTH_CREATED orders that the backend executor created.
   // Signs any that this watcher hasn't signed yet.
 
+  // A refusal stalls that mint: record it so the backend monitor can alert
+  // (WATCHER_REFUSED), instead of console-only. Only once it has PERSISTED
+  // (review round 6 #8): a node a block behind, or a tx it hasn't seen yet,
+  // clears on its own; a confirmations shortfall gets longer. Keyed by order AND
+  // kind of reason, so a later, different refusal of the same order still counts.
+  const REFUSAL_PERSIST_MS = 5 * 60_000;
+  const SHORTFALL_PERSIST_MS = 30 * 60_000;
+  const refusing = new Map<string, number>();    // order|kind -> first seen (ms)
+  const refusedOnce = new Set<string>();         // order|kind already recorded
+  const refusalKind = (r: string) => r.replace(/[0-9a-f]{16,}/gi, '#').replace(/\d+/g, 'N').slice(0, 80);
+  async function recordRefusal(orderId: string, reason: string): Promise<void> {
+    const key = `${orderId}|${refusalKind(reason)}`;
+    if (refusedOnce.has(key)) return;
+    const first = refusing.get(key) ?? Date.now();
+    refusing.set(key, first);
+    const transient = /confirmations \(<|node does not know the tx/.test(reason);
+    if (Date.now() - first < (transient ? SHORTFALL_PERSIST_MS : REFUSAL_PERSIST_MS)) return;
+    refusedOnce.add(key);
+    try {
+      await sql`
+        INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+        VALUES (${orderId}, 'WATCHER_REFUSED', ${InboundState.MINT_AUTH_CREATED}, ${InboundState.MINT_AUTH_CREATED},
+                ${'watcher:' + authorizer.address.toLowerCase()}, ${sql.json({ reason: reason.slice(0, 300) })})
+      `;
+    } catch (err) {
+      console.error(`[watcher] could not record refusal orderId=${orderId}:`, err);
+    }
+  }
+
   async function pollForSigningOpportunities(): Promise<void> {
     const pending = await sql<PendingMintRow[]>`
       SELECT
@@ -141,7 +173,8 @@ async function main(): Promise<void> {
         sd.vout,
         sd.source_chain_name,
         sd.deposit_address,
-        sd.hd_index
+        sd.hd_index,
+        sd.amount_sat AS deposit_value_sat
       FROM mint_requests mr
       JOIN bridge_orders bo  ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
@@ -161,15 +194,29 @@ async function main(): Promise<void> {
 
         // Independent check, per signer, at the moment of signing, against a FRESH
         // node answer (never the cache). See signing/node-check.ts.
+        const st = await txStatusFresh(row.txid);
+        let cutoverFloor = null;
+        if (config.bridgeControllerVersion === 2 && config.v2MinDepositHeight !== null) {
+          let depositHeight: number | null = null;
+          if (st?.blockHash) {
+            try { depositHeight = (await rpc.getBlockHeader(st.blockHash)).height; } catch { depositHeight = null; }
+          }
+          cutoverFloor = { minHeight: config.v2MinDepositHeight, allowed: config.v2PreCutoverAllowed, depositHeight };
+        }
         const why = checkMintAgainstNode(
-          { ...row, deposit_id_hex: depositIdHex, expected_deposit_address: expectedDepositAddress(row.hd_index) },
-          await txStatusFresh(row.txid),
+          { ...row, deposit_id_hex: depositIdHex, expected_deposit_address: expectedDepositAddress(row.hd_index),
+            require_deposit_value: config.bridgeControllerVersion === 2, cutover_floor: cutoverFloor },
+          st,
           config.finalConfirmations,
         );
         if (why !== null) {
           console.error(`[watcher] REFUSING TO SIGN orderId=${row.order_id} txid=${row.txid}: ${why}`);
+          await recordRefusal(row.order_id, why);
           continue;
         }
+        for (const k of refusing.keys()) if (k.startsWith(`${row.order_id}|`)) refusing.delete(k);
+        // The value we sign as sourceValue is OUR node's, already checked equal to the DB's.
+        const sourceValue = st!.outputs!.find((o) => o.n === row.vout)!.valueSat;
 
         // Dobbscoin txids are stored in the DB as raw 64-char hex (no 0x prefix —
         // native Bitcoin display form). EIP-712 bytes32 encoding needs a 0x-prefix
@@ -182,6 +229,7 @@ async function main(): Promise<void> {
           sourceChainId: config.dobbscoinChainId,
           sourceTxHash,
           sourceVout:    row.vout,
+          sourceValue,
           deadline:      row.deadline,
           nonce:         row.mint_nonce,
         };

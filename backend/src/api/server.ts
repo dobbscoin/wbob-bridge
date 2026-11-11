@@ -46,6 +46,7 @@ export async function buildServer(opts: {
     }) as unknown as PublicClient,
     opts.config.wBobAddress,
     opts.config.bridgeControllerAddress,
+    opts.config.bridgeControllerVersion,
   );
   await fastify.register(mintCapRoute, { sql: opts.sql, capReader });
   await fastify.register(withdrawLimitsRoute, { config: opts.config });

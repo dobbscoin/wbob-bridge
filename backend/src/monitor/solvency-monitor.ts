@@ -42,6 +42,10 @@ export class SolvencyMonitor {
   /** Epoch-ms of the last dispatch per alert type (for cooldown). */
   /** Keyed by type AND level, so a warning never mutes its escalation to critical. */
   private readonly alertCooldowns = new Map<string, number>();
+  /** Start of the last successful WATCHER_REFUSED scan (null = not yet: look back an hour). */
+  private lastRefusalScan: Date | null = null;
+  /** WATCHER_REFUSED audit ids already alerted. */
+  private readonly alertedRefusals = new Set<string>();
   /** MANUAL_REVIEW count at the last successful read (null = not read yet). */
   private lastManualReviewCount: number | null = null;
 
@@ -271,6 +275,36 @@ export class SolvencyMonitor {
       }
     }
 
+    // ── Watcher refusals (watchers have no alert channel; they write audit rows) ──
+    // By time window, not id: BIGSERIAL ids are not in commit order. The first
+    // poll after a restart looks back an hour so refusals made just before are
+    // not lost; ids already alerted are remembered.
+    try {
+      const since = this.lastRefusalScan ?? new Date(Date.now() - 3_600_000);
+      const scanStart = new Date();
+      const refused = await this.sql<{ id: string; order_id: string; actor: string; reason: string | null }[]>`
+        SELECT id::text, order_id::text, actor, metadata->>'reason' AS reason
+        FROM audit_events
+        WHERE event_type = 'WATCHER_REFUSED' AND created_at > ${new Date(since.getTime() - 120_000)}
+        ORDER BY id DESC LIMIT 50
+      `;
+      const fresh = refused.filter((r) => !this.alertedRefusals.has(r.id));
+      if (fresh.length > 0) {
+        for (const r of fresh) this.alertedRefusals.add(r.id);
+        if (this.alertedRefusals.size > 5_000) this.alertedRefusals.clear();
+        const top = fresh[0]!;
+        alerts.push({
+          level: 'critical', type: 'WATCHER_REFUSED', timestamp: checkedAt,
+          message: `${fresh.length} new watcher refusal(s); those mints stall until resolved. Latest: ` +
+            `${top.actor} on order ${top.order_id}: ${top.reason ?? '?'}`,
+          data: { count: fresh.length, sample: fresh.slice(0, 5) },
+        });
+      }
+      this.lastRefusalScan = scanStart;
+    } catch (err) {
+      console.error('[solvency-monitor] watcher-refusal read failed:', err);
+    }
+
     // ── MANUAL_REVIEW (independent of the supply read) ───────────────────────
     let manualReviewRose = false;
     if (manualReviewCount !== null) {
@@ -343,7 +377,7 @@ export class SolvencyMonitor {
     for (const alert of alerts) {
       const lastFired = this.alertCooldowns.get(`${alert.type}:${alert.level}`) ?? 0;
       // A NEW order entering MANUAL_REVIEW is news; don't sit on it for a cooldown.
-      const bypass = alert.type === 'MANUAL_REVIEW_ORDERS' && manualReviewRose;
+      const bypass = (alert.type === 'MANUAL_REVIEW_ORDERS' && manualReviewRose) || alert.type === 'WATCHER_REFUSED';
       if (bypass || now - lastFired >= this.config.alertCooldownMs) {
         this.alertCooldowns.set(`${alert.type}:${alert.level}`, now);
         await this.dispatcher.dispatch(alert);

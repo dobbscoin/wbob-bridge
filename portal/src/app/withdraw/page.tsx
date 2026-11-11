@@ -13,7 +13,10 @@ import { parseEventLogs } from 'viem';
 import { getOrder, getOrderByWithdrawal, getWithdrawLimits, type OrderResponse } from '@/lib/api';
 import { satsToBob, bobToSats, gnosisExplorerTx, dobbscoinExplorerTx, shortHash } from '@/lib/utils';
 import { OutboundConfirmationNote } from '@/components/ConfirmationNotice';
-import { WBOB_ABI, BRIDGE_CONTROLLER_ABI, WBOB_ADDRESS, BRIDGE_CONTROLLER_ADDRESS } from '@/lib/contracts';
+import {
+  WBOB_ABI, BRIDGE_CONTROLLER_ABI, WBOB_ADDRESS, BRIDGE_CONTROLLER_ADDRESS, BRIDGE_CONTROLLER_VERSION,
+  withdrawErrorMessage,
+} from '@/lib/contracts';
 import { OrderProgress } from '@/components/OrderProgress';
 
 type Phase =
@@ -30,9 +33,11 @@ const TERMINAL = new Set(['COMPLETED', 'FAILED', 'MANUAL_REVIEW']);
 // unreachable, so the form still refuses amounts the bridge would never pay.
 const FALLBACK_PAYOUT_MIN_SAT = 100_000n;
 
-// Validate Dobbscoin P2PKH address (starts with 1 or m/n, 25-34 chars)
+// Dobbscoin MAINNET P2PKH shape: '1' then 25-34 base58 chars (26-35 total).
+// The same check BridgeControllerV2 enforces on-chain, and the only address
+// type the bridge pays out to (testnet m/n addresses were never payable here).
 function isValidDobbscoinAddress(addr: string): boolean {
-  return /^[1mn][1-9A-HJ-NP-Za-km-z]{24,33}$/.test(addr);
+  return /^1[1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr);
 }
 
 export default function WithdrawPage() {
@@ -58,7 +63,23 @@ export default function WithdrawPage() {
     staleTime: 5 * 60_000,
     retry: 2,
   });
-  const payoutMinSat = limits ? BigInt(limits.payoutMinSat) : FALLBACK_PAYOUT_MIN_SAT;
+  // V2 also enforces a minimum on-chain; use the stricter of the two.
+  const { data: chainMinSat } = useReadContract({
+    address: BRIDGE_CONTROLLER_ADDRESS || undefined,
+    abi: BRIDGE_CONTROLLER_ABI,
+    functionName: 'minWithdrawal',
+    query: { enabled: BRIDGE_CONTROLLER_VERSION === 2 && !!BRIDGE_CONTROLLER_ADDRESS },
+  });
+  const backendMinSat = limits ? BigInt(limits.payoutMinSat) : FALLBACK_PAYOUT_MIN_SAT;
+  const payoutMinSat = typeof chainMinSat === 'bigint' && chainMinSat > backendMinSat ? chainMinSat : backendMinSat;
+
+  // Paused (V2 is deployed paused; the emergency module can pause it): say so, don't let users sign.
+  const { data: bridgePaused } = useReadContract({
+    address: BRIDGE_CONTROLLER_ADDRESS || undefined,
+    abi: BRIDGE_CONTROLLER_ABI,
+    functionName: 'paused',
+    query: { enabled: !!BRIDGE_CONTROLLER_ADDRESS, refetchInterval: 30_000 },
+  });
 
   // ── Write: requestWithdrawal ───────────────────────────────────────────────
   const { writeContractAsync, isPending: isSigning } = useWriteContract();
@@ -153,7 +174,12 @@ export default function WithdrawPage() {
     }
 
     if (!isValidDobbscoinAddress(dobbscoinAddress)) {
-      setFormError('Enter a valid Dobbscoin address (starts with 1, m, or n)');
+      setFormError('Enter a valid Dobbscoin address (starts with 1)');
+      return;
+    }
+
+    if (bridgePaused === true) {
+      setFormError('The bridge is paused right now. Nothing was burned; try again later.');
       return;
     }
 
@@ -167,11 +193,10 @@ export default function WithdrawPage() {
       });
       setPhase({ tag: 'submitted', txHash: hash });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Transaction failed';
-      setFormError(msg.length > 120 ? msg.slice(0, 120) + '…' : msg);
+      setFormError(withdrawErrorMessage(err));
       setPhase({ tag: 'form' });
     }
-  }, [amountBob, dobbscoinAddress, balanceSat, payoutMinSat, writeContractAsync]);
+  }, [amountBob, dobbscoinAddress, balanceSat, payoutMinSat, bridgePaused, writeContractAsync]);
 
   // ── Completed ───────────────────────────────────────────────────────────────
   if (phase.tag === 'completed') {
@@ -338,6 +363,13 @@ export default function WithdrawPage() {
           <ConnectButton />
         </div>
       ) : (
+        <>
+        {bridgePaused === true && (
+          <div className="rounded-lg border border-red-700/60 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+            <span className="font-semibold text-red-300">The bridge is paused.</span>{' '}
+            Withdrawals are off for now; your wBOB stays in your wallet. Check back later.
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="card space-y-5">
           {/* Balance display */}
           {balanceSat !== undefined && (
@@ -394,7 +426,7 @@ export default function WithdrawPage() {
 
           <button
             type="submit"
-            disabled={isSigning || phase.tag === 'signing'}
+            disabled={isSigning || phase.tag === 'signing' || bridgePaused === true}
             className="btn-primary w-full"
           >
             {isSigning || phase.tag === 'signing' ? 'Confirm in wallet…' : 'Withdraw BOB'}
@@ -404,6 +436,7 @@ export default function WithdrawPage() {
             Your wBOB will be burned. BOB is paid out by the bridge on Dobbscoin.
           </p>
         </form>
+        </>
       )}
     </div>
   );

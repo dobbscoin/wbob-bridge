@@ -37,6 +37,7 @@ import { RefundExecutor } from '../../src/executor/refund-executor.js';
 import type { MintCapChainState, MintCapReader } from '../../src/executor/mint-capacity.js';
 import { RpcCallError, type RpcVerboseTx } from '../../src/dobbscoin/rpc.js';
 import { pubkeyToP2PKH } from '../../src/wallet/hd-wallet.js';
+import { txidFromRawHex } from '../../src/dobbscoin/tx-builder.js';
 import { ordersRoute } from '../../src/api/routes/orders.js';
 import { mintCapRoute } from '../../src/api/routes/mint-cap.js';
 import { SolvencyMonitor } from '../../src/monitor/solvency-monitor.js';
@@ -71,6 +72,9 @@ function makeConfig(over: Partial<BackendConfig> = {}): BackendConfig {
     dobbscoinFeeRateSatPerVbyte: 10,
     dobbscoinAddressVersion: 0,
     hdWalletXpriv: XPRIV,
+    hdWalletXpub: ROOT.publicExtendedKey,
+    hdDerivationPath: 'm/0',
+    depositFinalConfirmations: 60,
     refundsAutoSend: true,
     alertWebhookUrl: null,
     alertEmailTo: null,
@@ -149,12 +153,17 @@ class FakeNode {
   confs = new Map<string, number>();
   broadcastError: Error | null = null;
 
-  addDeposit(depositHex: string, firstInput: RpcVerboseTx['vin'][number]): string {
+  spent = new Set<string>();
+  addDeposit(depositHex: string, firstInput: RpcVerboseTx['vin'][number],
+             out?: { valueSat: bigint; scriptHex: string }): string {
     const txid = txidOf(depositHex);
     this.raw.set(txid, depositHex);
-    this.verbose.set(txid, { txid, vin: [firstInput], vout: [] });
+    this.verbose.set(txid, { txid, vin: [firstInput],
+      vout: out ? [{ value: Number(out.valueSat) / 1e8, n: 0, scriptPubKey: { hex: out.scriptHex, type: 'pubkeyhash' } }] : [] });
+    this.confs.set(txid, 60);           // final, as when the watchers sign
     return txid;
   }
+  async isUnspent(txid: string, vout: number) { return !this.spent.has(`${txid}:${vout}`); }
   addFunding(address: string, hash160: string): string {
     const txid = rnd(32);
     this.verbose.set(txid, {
@@ -511,7 +520,8 @@ describe.skipIf(!URL)('daily mint cap: split, regenerate, submit, refund (real P
     const hex = p2pkhPrevHex(key.publicKey!, amountSat);
     const senderHash = Buffer.from(ripemd160(sha256(ROOT.derive('m/9/9').publicKey!))).toString('hex');
     const funding = node.addFunding(SENDER, senderHash);
-    const txid = node.addDeposit(hex, firstInput ?? { txid: funding, vout: 0 });
+    const scriptHex = `76a914${Buffer.from(ripemd160(sha256(key.publicKey!))).toString('hex')}88ac`;
+    const txid = node.addDeposit(hex, firstInput ?? { txid: funding, vout: 0 }, { valueSat: amountSat, scriptHex });
     const address = pubkeyToP2PKH(key.publicKey!, 0);
     await sql`INSERT INTO deposit_addresses (recipient_gnosis_address, source_chain_name, dobbscoin_address, hd_index)
               VALUES (${RECIPIENT}, 'dobbscoin-mainnet', ${address}, ${idx})`;
@@ -666,5 +676,170 @@ describe.skipIf(!URL)('daily mint cap: split, regenerate, submit, refund (real P
       resetsAt: new Date(Number(T0 - 3_600n + DAY) * 1000).toISOString(),
     });
     await app.close();
+  });
+
+  // ── review round 5: one refund per deposit output ────────────────────────
+
+  it('every refund spends its own deposit output, and only it', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const other = await depositFromSender(node, 900n * BOB);       // a bigger coin a planner would grab first
+    await sql`UPDATE bridge_orders SET state = 'COMPLETED' WHERE id = ${other.orderId}`;
+    await sql`INSERT INTO bridge_utxos (order_id, txid, vout, amount_sat, address, hd_index)
+              VALUES (${other.orderId}, ${other.txid}, 0, ${(900n * BOB).toString()}, ${other.address}, ${other.hdIndex})`;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('broadcast');
+    const { txInputsFromRawHex } = await import('../../src/dobbscoin/tx-builder.js');
+    expect(txInputsFromRawHex(node.broadcasts[0]!)).toEqual([{ txid: d.txid, vout: 0 }]);
+  });
+
+  it('a second refund row for an already-refunded output can not be created', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const [o2] = await sql<{ id: string }[]>`
+      INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+      VALUES ('inbound', 'REFUNDED', ${RECIPIENT}, 1) RETURNING id`;
+    await expect(sql`
+      INSERT INTO deposit_refunds (order_id, deposit_txid, deposit_vout, deposit_amount_sat, mint_amount_sat, excess_sat, status)
+      VALUES (${o2!.id}, ${d.txid}, 0, ${(50n * BOB).toString()}, 0, ${(50n * BOB).toString()}, 'queued')`).rejects.toThrow(/uq_deposit_refunds_outpoint/);
+  });
+
+  it('a deposit output already spent (e.g. by an earlier refund) is never refunded again', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    node.spent.add(`${d.txid}:0`);
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/already spent/);
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('a refund_address that is not the node-derived sender is refused', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await sql`UPDATE deposit_refunds SET refund_address = '1BoatSLRHtKNngkdXEeobR76b53LETtpyT' WHERE order_id = ${d.orderId}`;
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/not the deposit's sender/);
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('a deposit not yet FINAL on our node waits, it is not refunded', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    node.confs.set(d.txid, 5);
+    await executor().createPendingAuths();
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.status).toBe('queued');
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('a payout never spends a deposit output that still owes a refund', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const free = await sql<{ txid: string }[]>`
+      SELECT txid FROM bridge_utxos u WHERE status = 'available'
+        AND NOT EXISTS (SELECT 1 FROM deposit_refunds r WHERE r.deposit_txid = u.txid AND r.deposit_vout = u.vout
+                        AND r.status IN ('queued', 'signed', 'needs_attention'))`;
+    expect(free.map((f) => f.txid)).not.toContain(d.txid);
+  });
+
+  // ── review round 11 (V2 #1): refunds consensus doesn't stop from stacking ──
+  async function refundAudit(orderId: string, type: string, meta: Record<string, unknown>) {
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, ${type}, 'queued', 'signed', 'refund-executor', ${sql.json(meta as never)})`;
+  }
+
+  it('an earlier refund of this deposit paid from OTHER coins blocks a new refund', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: rnd(32), inputs: [`${rnd(32)}:0`] });
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/other coins|show what it spent/);   // round 12: unproven = refused
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  it('a refund settled by hand (audit REFUND_SETTLED_BY_HAND) blocks a new refund', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    await refundAudit(d.orderId, 'REFUND_SETTLED_BY_HAND', { txid: d.txid, vout: 0, refundTxid: rnd(32) });
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.reason).toMatch(/settled by hand/);
+    expect(node.broadcasts).toHaveLength(0);
+  });
+
+  /** A minimal legacy tx spending txid:vout, with one output of `sat` to a fixed script. */
+  function spendHex(txid: string, vout: number, sat = 0n): string {
+    const v = Buffer.alloc(4); v.writeUInt32LE(vout, 0);
+    const outs = sat > 0n ? (() => { const a = Buffer.alloc(8); a.writeBigUInt64LE(sat, 0); return Buffer.concat([Buffer.from([1]), a, Buffer.from([2]), Buffer.from('6a00', 'hex')]); })() : Buffer.from([0]);
+    return Buffer.concat([Buffer.from('01000000', 'hex'), Buffer.from([1]), Buffer.from(txid, 'hex').reverse(), v, Buffer.from([0]),
+      Buffer.alloc(4, 0xff), outs, Buffer.alloc(4)]).toString('hex');
+  }
+
+  it('an earlier refund that spent the deposit output itself (proved by its signed bytes) does not block a re-sign', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const first = spendHex(d.txid, 0);
+    await sql`UPDATE deposit_refunds SET signed_hex = ${first} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'first', txid: txidFromRawHex(first), inputs: [`${d.txid}:0`] });
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.status).toBe('broadcast');
+  });
+
+  it('a forged REFUND_SIGNED claiming it spent the deposit output is not trusted (its bytes say other coins)', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const other = spendHex(rnd(32), 0);
+    await sql`UPDATE deposit_refunds SET signed_hex = ${other} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: txidFromRawHex(other), inputs: [`${d.txid}:0`] });   // the lie
+    await refunder(node).poll();
+    const r = (await refundOf(d.orderId))!;
+    expect(r.status).toBe('needs_attention');
+    expect(r.reason).toMatch(/other coins/);
+  });
+
+  it('an other-coins earlier refund that provably can never confirm (its coin spent 6+ deep elsewhere) does not block', async () => {
+    const node = new FakeNode();
+    cap.state.currentDayMinted = LIMIT - 40n * BOB;
+    const d = await depositFromSender(node, 50n * BOB);
+    await executor().createPendingAuths();
+    const coin = rnd(32);
+    const old = spendHex(coin, 0);                                        // the old refund, never confirmed
+    const spender = spendHex(coin, 0, 12345n);                            // a payout that took that coin instead
+    await sql`UPDATE deposit_refunds SET signed_hex = ${old} WHERE order_id = ${d.orderId}`;
+    await refundAudit(d.orderId, 'REFUND_SIGNED', { refundId: 'old', txid: txidFromRawHex(old), inputs: [`${coin}:0`] });
+    const [po] = await sql<{ id: string }[]>`INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+      VALUES ('outbound', 'COMPLETED', ${RECIPIENT}, 1) RETURNING id`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${po!.id}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(spender), signedHex: spender })})`;
+    node.spent.add(`${coin}:0`);
+    node.verbose.set(txidFromRawHex(spender), { txid: txidFromRawHex(spender), confirmations: 9, vin: [{ txid: coin, vout: 0 }],
+      vout: [{ value: 0.00012345, n: 0, scriptPubKey: { hex: '6a00', type: 'nulldata' } }] } as never);
+    await refunder(node).poll();
+    expect((await refundOf(d.orderId))!.status).toBe('broadcast');
   });
 });

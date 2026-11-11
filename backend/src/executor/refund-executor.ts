@@ -29,15 +29,24 @@ import { RpcCallError, RpcNetworkError } from '../dobbscoin/rpc.js';
 import {
   DobbscoinTxBuilder,
   RefundTooSmallError,
+  txInputsFromRawHex,
+  txOutputsFromRawHex,
+  txidFromRawHex,
   type UtxoInput,
 } from '../dobbscoin/tx-builder.js';
 import { detectDepositSender } from '../dobbscoin/sender.js';
 import type { BackendConfig } from '../config.js';
 import { AlertDispatcher } from '../monitor/webhook.js';
+import type { RefundRecorder } from '../gnosis/refund-recorder.js';
+import { HDKey } from '@scure/bip32';
+import { sha256 } from '@noble/hashes/sha256';
+import { ripemd160 } from '@noble/hashes/ripemd160';
 import type { Alert } from '../monitor/types.js';
 import { fmtBob } from './mint-capacity.js';
 
 export const REFUND_MIN_CONFIRMATIONS = 3;
+/** A refund that cannot be built for this long gets one critical alert. */
+const STUCK_ALERT_MS = 60 * 60_000;
 const EXPLORER = 'https://explorer.dobbscoin.info';
 
 export type RefundStatus =
@@ -45,7 +54,7 @@ export type RefundStatus =
 
 type RefundRpc = Pick<
   DobbscoinBackendRpc,
-  'getRawTransactionVerbose' | 'getRawTransactionHex' | 'sendRawTransaction' | 'getConfirmations'
+  'getRawTransactionVerbose' | 'getRawTransactionHex' | 'sendRawTransaction' | 'getConfirmations' | 'isUnspent'
 >;
 
 interface RefundRow {
@@ -91,6 +100,12 @@ export async function nextChangeIndex(sql: Sql): Promise<number> {
 export interface RefundExecutorOptions {
   dispatcher?: Pick<AlertDispatcher, 'dispatch'>;
   txBuilder?: Pick<DobbscoinTxBuilder, 'buildRefundTx' | 'deriveChangeAddress'>;
+  /**
+   * BridgeControllerV2 only: records each refund on-chain (recordRefund) so the
+   * contract enforces minted + refunded <= value per output. When set, a refund
+   * is NEVER broadcast until V2 shows it recorded. Null/absent = V1 behavior.
+   */
+  recorder?: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded' | 'mintedAmount' | 'isImported'> | null;
 }
 
 export class RefundExecutor {
@@ -111,10 +126,140 @@ export class RefundExecutor {
       webhookUrl: config.alertWebhookUrl,
       emailTo:    config.alertEmailTo,
     });
+    this.recorder = opts.recorder ?? null;
+  }
+
+  private readonly recorder: Pick<RefundRecorder, 'ensureRecorded' | 'isRecorded' | 'mintedAmount' | 'isImported'> | null;
+  private depositScripts: HDKey | null = null;
+  /** Refund ids whose on-chain record we already confirmed (or alerted on) this process. */
+  private readonly recordedIds = new Set<string>();
+  private readonly recordAlerted = new Set<string>();
+  /** Refund ids whose node check passed this process (V2 broadcast gate). */
+  private readonly backedIds = new Set<string>();
+
+  // ── 0. Record refunds on V2 (BridgeControllerV2 only) ─────────────────────
+  //
+  // As soon as the bridge has decided part of a deposit will NOT be minted (a
+  // deposit_refunds row exists, in any state), V2 must know: otherwise a DB
+  // writer could later mint against those coins. Recording can only block.
+  async recordRefundsOnChain(): Promise<void> {
+    if (!this.recorder) return;
+    // EVERY refund row, sent ones too: a refund paid before V2 existed (or by
+    // hand, recorded as a row) must still be known to V2, or its coins could be
+    // minted on V2 as well. Only outputs V2 imported from V1 are skipped: V2
+    // can never mint those, and it refuses refunds against them.
+    const rows = await this.sql<(RefundRow & { hd_index: number | null })[]>`
+      SELECT r.*, NULL::text AS user_gnosis_address, sd.hd_index
+      FROM deposit_refunds r
+      LEFT JOIN source_deposits sd ON sd.order_id = r.order_id
+      WHERE r.status <> 'too_small'
+    `;
+    for (const r of rows) {
+      if (this.recordedIds.has(r.id)) continue;
+      const rec = this._rec(r);
+      const sent = r.status === 'broadcast' || r.status === 'confirmed';
+      try {
+        if (await this.recorder.isImported(rec)) {
+          if (sent) { this.recordedIds.add(r.id); continue; }       // settled before the cutover
+          // Unsent refund on an imported output: V2 will never let it be recorded.
+          if (r.status === 'queued' || r.status === 'signed') {
+            await this._park(r, r.status, 'needs_attention',
+              'refund refused: output was imported from V1 (settle it by hand: V2 cannot record it)', 'critical');
+          }
+          continue;
+        }
+        // Never record (so never send) a refund the chain does not back. The
+        // row's numbers come from the DB; check them against our own node,
+        // every time, even when V2 already shows a record.
+        const why = await this._refundNotBackedReason(r, r.hd_index, { requireUnspent: false });
+        if (why !== null) {
+          if (why.defer) continue;
+          if (r.status === 'queued' || r.status === 'signed') {
+            await this._park(r, r.status, 'needs_attention', `refund refused: ${why.reason}`, 'critical');
+          } else if (!this.recordAlerted.has(r.id)) {
+            this.recordAlerted.add(r.id);
+            await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+              message: `Refund ${r.id} (order ${r.order_id}, status ${r.status}) is not backed on-chain: ${why.reason}`,
+              data: { refundId: r.id, orderId: r.order_id, reason: why.reason } });
+          }
+          continue;
+        }
+        if (await this.recorder.ensureRecorded(rec)) { this.recordedIds.add(r.id); this.backedIds.add(r.id); }
+      } catch (err) {
+        console.error(`[refund-executor] recordRefund failed refundId=${r.id}:`, err);
+        if (!this.recordAlerted.has(r.id)) {
+          this.recordAlerted.add(r.id);
+          await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+            message: `Could not record refund ${r.id} (order ${r.order_id}) on BridgeControllerV2: ${String(err).slice(0, 200)}. ` +
+              `The refund will NOT be sent until it is recorded (check REFUND_MARKER_ROLE and relayer gas).`,
+            data: { refundId: r.id, orderId: r.order_id } });
+        }
+      }
+    }
+  }
+
+  private _rec(r: RefundRow) {
+    return { depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
+             depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat };
+  }
+
+  /**
+   * Does the chain back this refund? Our node must show the deposit output as
+   * the bridge's exact P2PKH script at hd_index (derived from HD_WALLET_XPUB),
+   * worth exactly deposit_amount_sat, with at least FINAL_CONFIRMATIONS; with
+   * requireUnspent, still unspent (the refund spends it). On V2 also: not
+   * imported from V1, and refund + already-minted <= value.
+   * Returns null if backed; defer = could not tell (node down, not deep yet).
+   */
+  private async _refundNotBackedReason(
+    r: RefundRow, hdIndex: number | null, opts: { requireUnspent: boolean },
+  ): Promise<{ defer: boolean; reason: string } | null> {
+    const no = (reason: string) => ({ defer: false, reason });
+    if (hdIndex === null) return no('no hd_index for the deposit (cannot derive the bridge address)');
+    let t;
+    let confs: number;
+    try {
+      [t, confs] = await Promise.all([
+        this.rpc.getRawTransactionVerbose(r.deposit_txid),
+        this.rpc.getConfirmations(r.deposit_txid),
+      ]);
+    } catch (err) {
+      if (err instanceof RpcCallError && err.code === -5) return no(`deposit tx ${r.deposit_txid} is not on our node`);
+      return { defer: true, reason: `node unreachable: ${String(err).slice(0, 120)}` };
+    }
+    const out = t.vout.find((v) => v.n === r.deposit_vout);
+    if (!out) return no(`deposit tx has no output ${r.deposit_vout}`);
+    if (!this.depositScripts) this.depositScripts = HDKey.fromExtendedKey(this.config.hdWalletXpub);
+    const pub = this.depositScripts.derive(`${this.config.hdDerivationPath}/${hdIndex}`).publicKey;
+    if (!pub) return no(`cannot derive the bridge key at hd_index ${hdIndex}`);
+    const expected = `76a914${Buffer.from(ripemd160(sha256(pub))).toString('hex')}88ac`;
+    if (out.scriptPubKey.hex.toLowerCase() !== expected) {
+      return no(`output ${r.deposit_vout} is not the bridge's P2PKH at hd_index ${hdIndex}`);
+    }
+    const value = BigInt(Math.round(out.value * 1e8));
+    if (value !== r.deposit_amount_sat) return no(`output value ${value} != recorded deposit ${r.deposit_amount_sat}`);
+    if (r.excess_sat <= 0n || r.excess_sat > value) return no(`refund ${r.excess_sat} is not within the output's ${value}`);
+    if (confs < this.config.depositFinalConfirmations) {
+      return { defer: true, reason: `deposit has ${confs} confirmation(s), needs ${this.config.depositFinalConfirmations}` };
+    }
+    if (opts.requireUnspent) {
+      let unspent: boolean;
+      try { unspent = await this.rpc.isUnspent(r.deposit_txid, r.deposit_vout); }
+      catch (err) { return { defer: true, reason: `gettxout failed: ${String(err).slice(0, 120)}` }; }
+      if (!unspent) return no(`deposit output ${r.deposit_txid}:${r.deposit_vout} is already spent (a refund always spends it; check for an earlier refund)`);
+    }
+    if (this.recorder) {
+      const rec = this._rec(r);
+      if (await this.recorder.isImported(rec)) return no('output was minted on V1 (imported); no refund can be owed on it');
+      const minted = await this.recorder.mintedAmount(rec);
+      if (r.excess_sat + minted > value) return no(`refund ${r.excess_sat} + minted ${minted} exceeds the output's ${value}`);
+    }
+    return null;
   }
 
   async poll(): Promise<void> {
     const jobs: Array<[string, () => Promise<void>]> = [
+      ['recordOnChain',    () => this.recordRefundsOnChain()],
       ['resolveSenders',   () => this.resolveSenders()],
       ['announceSplits',   () => this.announceSplits()],
       ['signQueued',       () => this.signQueued()],
@@ -252,9 +397,10 @@ export class RefundExecutor {
           err instanceof RpcNetworkError ||
           (err instanceof Error && /^Insufficient UTXOs|is no longer available$/.test(err.message))
         ) {
-          // Node unreachable, or coins reserved by an in-flight payout (they come
-          // back as change). Transient: retry next poll.
+          // Node unreachable, or the deposit output held by another tx. Usually
+          // transient: retry next poll. But never silently forever (round 6 #7).
           console.warn(`[refund-executor] refundId=${r.id} not built yet, will retry: ${err.message}`);
+          await this._alertIfStuck(r, err.message);
           continue;
         }
         if (err instanceof RefundTooSmallError) {
@@ -266,15 +412,149 @@ export class RefundExecutor {
     }
   }
 
-  private async _signOne(r: RefundRow): Promise<void> {
-    const utxoRows = await this.sql<{
-      txid: string; vout: number; amount_sat: bigint; hd_index: number; derivation_path: 'deposit' | 'change';
-    }[]>`
-      SELECT txid, vout, amount_sat, hd_index, derivation_path
-      FROM bridge_utxos
-      WHERE status = 'available'
+  /**
+   * (review rounds 11-12, V2) Has this deposit OUTPOINT been refunded before, in
+   * a way consensus doesn't stop from happening twice? A refund that spends the
+   * deposit output conflicts with any later one by itself; one paid from other
+   * coins (old code before the cutover) or by hand leaves the output unspent.
+   * Which orders: every order the watcher audit rows tie to this outpoint, plus
+   * this one. What an earlier refund SPENT is never taken from an audit row (the
+   * DB role can INSERT those): only from our node, or from its signed bytes
+   * whose hash equals its txid. An other-coins refund blocks unless it provably
+   * can never confirm (unknown to our node, and one of its coins spent 6+ deep
+   * by another tx with different outputs). Returns a reason to refuse, or null.
+   */
+  private async _earlierRefundReason(r: RefundRow): Promise<string | null> {
+    const op = `${r.deposit_txid.toLowerCase()}:${r.deposit_vout}`;
+    const rows = await this.sql<{ event_type: string; txid: string | null }[]>`
+      SELECT a.event_type, lower(a.metadata->>'txid') AS txid
+      FROM audit_events a
+      WHERE a.event_type IN ('REFUND_SIGNED', 'REFUND_BROADCAST', 'REFUND_CONFIRMED', 'REFUND_SETTLED_BY_HAND')
+        AND a.order_id IN (
+          SELECT o.order_id FROM audit_events o
+          WHERE o.metadata ? 'txid' AND o.metadata ? 'vout'
+            AND o.event_type IN ('ORDER_CREATED', 'STATE_TRANSITION')
+            AND lower(o.metadata->>'txid') = ${r.deposit_txid.toLowerCase()} AND (o.metadata->>'vout') = ${String(r.deposit_vout)}
+          UNION SELECT ${r.order_id}::uuid)
     `;
-    const utxos: UtxoInput[] = utxoRows.map((u) => ({
+    if (rows.some((e) => e.event_type === 'REFUND_SETTLED_BY_HAND')) return `the audit trail records a refund of ${op} settled by hand`;
+    const txids = new Set<string>();
+    for (const e of rows) {
+      if (!e.txid || !/^[0-9a-f]{64}$/.test(e.txid)) return `an earlier ${e.event_type} for ${op} has no usable txid`;
+      txids.add(e.txid);
+    }
+    if (txids.size === 0) return null;
+    // Authentic signed bytes we hold for those txids (any deposit_refunds row; the hash proves them).
+    const bytes = new Map<string, string>();
+    const hexRows = await this.sql<{ signed_hex: string | null }[]>`SELECT signed_hex FROM deposit_refunds WHERE signed_hex IS NOT NULL`;
+    for (const h of hexRows) { try { const t = txidFromRawHex(h.signed_hex!); if (txids.has(t)) bytes.set(t, h.signed_hex!); } catch { /* skip */ } }
+    for (const t of txids) {
+      let ins: { txid: string; vout: number }[] | null = null;
+      let known: { confirmations: number } | null = null;
+      try {
+        const v = await this.rpc.getRawTransactionVerbose(t);
+        ins = v.vin.filter((x) => x.txid !== undefined).map((x) => ({ txid: x.txid!.toLowerCase(), vout: x.vout ?? -1 }));
+        known = { confirmations: v.confirmations ?? 0 };
+      } catch (err) {
+        if (!(err instanceof RpcCallError && err.code === -5)) return `node unreachable while checking earlier refund ${t}`;
+      }
+      if (ins === null && bytes.has(t)) { try { ins = txInputsFromRawHex(bytes.get(t)!).map((x) => ({ txid: x.txid.toLowerCase(), vout: x.vout })); } catch { ins = null; } }
+      if (ins === null) return `earlier refund ${t} for ${op}: neither our node nor its signed bytes show what it spent`;
+      if (ins.some((x) => `${x.txid}:${x.vout}` === op)) continue;          // spent the deposit output: consensus conflict
+      if (known && known.confirmations >= 1) return `an earlier refund for ${op} (${t}) was paid from other coins and is confirmed`;
+      if (known) return `an earlier refund for ${op} (${t}) was paid from other coins and is in the mempool`;
+      // Unknown to our node: dead only if one of its coins is spent 6+ deep by another tx with different outputs.
+      if (!bytes.has(t)) return `earlier refund ${t} for ${op} paid from other coins; its bytes aren't on record to prove it can never confirm`;
+      if (!(await this._provablyDead(t, bytes.get(t)!))) {
+        return `an earlier refund for ${op} (${t}) was paid from other coins and could still confirm`;
+      }
+    }
+    return null;
+  }
+
+  /** A tx unknown to our node is dead if one of its inputs is spent 6+ deep by another tx with different outputs. */
+  private async _provablyDead(txid: string, hex: string): Promise<boolean> {
+    let ins: { txid: string; vout: number }[]; let outs: { valueSat: bigint; script: string }[];
+    try { ins = txInputsFromRawHex(hex); outs = txOutputsFromRawHex(hex); } catch { return false; }
+    const key = (o: { valueSat: bigint; script: string }[]) => o.map((x) => `${x.valueSat}:${x.script.toLowerCase()}`).sort().join('|');
+    const mine = key(outs);
+    for (const i of ins) {
+      let unspent: boolean;
+      try { unspent = await this.rpc.isUnspent(i.txid, i.vout); } catch { return false; }
+      if (unspent) continue;
+      // candidates that spend it: other txs the bridge signed (audit hints only), verified on our node
+      const le = Buffer.alloc(4); le.writeUInt32LE(i.vout, 0);
+      const needle = Buffer.from(i.txid, 'hex').reverse().toString('hex') + le.toString('hex');
+      const cands = await this.sql<{ hex: string | null; txid: string | null }[]>`
+        SELECT metadata->>'signedHex' AS hex, metadata->>'txid' AS txid FROM audit_events
+        WHERE (event_type = 'PAYOUT_SIGNED' AND position(${needle} IN lower(metadata->>'signedHex')) > 0)
+           OR (event_type = 'REFUND_SIGNED' AND metadata->'inputs' ? ${`${i.txid}:${i.vout}`})
+      `;
+      for (const c of cands) {
+        const ids = [c.txid, c.hex ? txidFromRawHex(c.hex) : null].filter((x): x is string => !!x && x.toLowerCase() !== txid);
+        for (const ct of ids) {
+          try {
+            const v = await this.rpc.getRawTransactionVerbose(ct);
+            if (!v.vin.some((x) => x.txid?.toLowerCase() === i.txid.toLowerCase() && x.vout === i.vout)) continue;
+            if ((v.confirmations ?? 0) < 6) continue;
+            const vo = v.vout.map((o) => ({ valueSat: BigInt(Math.round(o.value * 1e8)), script: o.scriptPubKey.hex }));
+            if (key(vo) === mine) continue;                   // a malleated copy of it: that refund was PAID
+            return true;
+          } catch { /* not on our node */ }
+        }
+      }
+    }
+    return false;
+  }
+
+  private async _signOne(r: RefundRow): Promise<void> {
+    // 0. Never a refund that could stack on an earlier one consensus doesn't stop.
+    const earlier = await this._earlierRefundReason(r);
+    if (earlier !== null) {
+      await this._park(r, 'queued', 'needs_attention', `refund refused: ${earlier}`, 'critical');
+      return;
+    }
+    // 1. The chain must back it (also re-checked at broadcast on V2).
+    const [sd] = await this.sql<{ hd_index: number | null }[]>`
+      SELECT hd_index FROM source_deposits WHERE order_id = ${r.order_id}`;
+    const why = await this._refundNotBackedReason(r, sd?.hd_index ?? null, { requireUnspent: true });
+    if (why !== null) {
+      if (why.defer) { console.warn(`[refund-executor] refundId=${r.id} not signed yet: ${why.reason}`); return; }
+      await this._park(r, 'queued', 'needs_attention', `refund refused: ${why.reason}`, 'critical');
+      return;
+    }
+    // 2. The address comes from the node again, not from the row.
+    const bridgeAddrRows = await this.sql<{ address: string }[]>`
+      SELECT dobbscoin_address AS address FROM deposit_addresses UNION SELECT address FROM bridge_utxos`;
+    const sender = await detectDepositSender(
+      this.rpc, r.deposit_txid, this.config.dobbscoinAddressVersion, new Set(bridgeAddrRows.map((x) => x.address)));
+    if (!sender.ok || sender.address !== r.refund_address) {
+      await this._park(r, 'queued', 'needs_attention',
+        `refund refused: refund_address ${r.refund_address} is not the deposit's sender per our node ` +
+        `(${sender.ok ? sender.address : sender.reason})`, 'critical');
+      return;
+    }
+    // 3. Spend the deposit output ITSELF (and only it): one output can then fund
+    //    at most one refund, by consensus, whatever the DB says.
+    const utxoRows = await this.sql<{
+      txid: string; vout: number; amount_sat: bigint; hd_index: number; derivation_path: 'deposit' | 'change'; status: string;
+    }[]>`
+      SELECT txid, vout, amount_sat, hd_index, derivation_path, status
+      FROM bridge_utxos
+      WHERE txid = ${r.deposit_txid} AND vout = ${r.deposit_vout}
+    `;
+    const dep = utxoRows[0];
+    if (!dep || dep.status !== 'available') {
+      if (dep?.status === 'reserved') throw new Error(`deposit output ${r.deposit_txid}:${r.deposit_vout} is no longer available`);
+      await this._park(r, 'queued', 'needs_attention',
+        `refund refused: the deposit output is ${dep ? dep.status : 'not in bridge_utxos'} (a refund must spend it)`, 'critical');
+      return;
+    }
+    if (dep.amount_sat !== r.deposit_amount_sat) {
+      await this._park(r, 'queued', 'needs_attention', 'refund refused: bridge_utxos value of the deposit output disagrees', 'critical');
+      return;
+    }
+    const utxos: UtxoInput[] = [dep].map((u) => ({
       txid: u.txid, vout: u.vout, amountSat: u.amount_sat, hdIndex: u.hd_index,
       isChange: u.derivation_path === 'change',
     }));
@@ -290,6 +570,10 @@ export class RefundExecutor {
       this.rpc as DobbscoinBackendRpc,
       { txid: r.deposit_txid, vout: r.deposit_vout },
     );
+
+    if (built.inputs.length !== 1 || built.inputs[0]!.txid !== r.deposit_txid || built.inputs[0]!.vout !== r.deposit_vout) {
+      throw new Error('refund tx does not spend exactly the deposit output');
+    }
 
     await this.sql.begin(async (tx) => {
       const cur = await tx<{ status: string; refund_address: string | null }[]>`
@@ -339,6 +623,7 @@ export class RefundExecutor {
         )
       `;
     });
+    this.stuckSince.delete(r.id);
     console.log(
       `[refund-executor] signed refund refundId=${r.id} txid=${built.txid} ` +
       `to=${r.refund_address} amount=${built.recipientSat} fee=${built.feeSat}`,
@@ -355,6 +640,31 @@ export class RefundExecutor {
       ORDER BY r.signed_at
     `;
     for (const r of rows) {
+      // Every refund spends its own deposit output; never send a tx that doesn't.
+      let ins: { txid: string; vout: number }[];
+      try { ins = txInputsFromRawHex(r.signed_hex!); } catch { ins = []; }
+      if (!ins.some((i) => i.txid === r.deposit_txid && i.vout === r.deposit_vout)) {
+        await this._park(r, 'signed', 'needs_attention',
+          `signed refund ${r.txid} does not spend its deposit output; not sent`, 'critical');
+        continue;
+      }
+      // V2: never send coins back before the contract knows (else the same
+      // coins could still be minted by a DB writer), and only after this
+      // process's node check passed for this row.
+      if (this.recorder && !this.backedIds.has(r.id)) {
+        console.warn(`[refund-executor] refund ${r.id} not node-checked + recorded in this process yet; holding the broadcast`);
+        continue;
+      }
+      if (this.recorder) {
+        const recorded = await this.recorder.isRecorded({
+          depositTxid: r.deposit_txid, depositVout: r.deposit_vout,
+          depositValueSat: r.deposit_amount_sat, refundedTotalSat: r.excess_sat,
+        }, true).catch(() => false);
+        if (!recorded) {
+          console.warn(`[refund-executor] refund ${r.id} not recorded on V2 yet; holding the broadcast`);
+          continue;
+        }
+      }
       let txid: string;
       try {
         txid = await this.rpc.sendRawTransaction(r.signed_hex!);
@@ -461,6 +771,20 @@ export class RefundExecutor {
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────
+
+  /** Refund id -> first time it could not be built. One critical alert after STUCK_ALERT_MS. */
+  private readonly stuckSince = new Map<string, number>();
+  private readonly stuckAlerted = new Set<string>();
+  private async _alertIfStuck(r: RefundRow, why: string): Promise<void> {
+    const first = this.stuckSince.get(r.id) ?? Date.now();
+    this.stuckSince.set(r.id, first);
+    if (Date.now() - first < STUCK_ALERT_MS || this.stuckAlerted.has(r.id)) return;
+    this.stuckAlerted.add(r.id);
+    await this._alert({ level: 'critical', type: 'REFUND_NEEDS_ATTENTION',
+      message: `Refund ${r.id} (order ${r.order_id}) has not been sendable for ${Math.round((Date.now() - first) / 60_000)} min: ${why}. ` +
+        `If its deposit output is held by a stuck payout, settle that payout first.`,
+      data: { refundId: r.id, orderId: r.order_id, reason: why } });
+  }
 
   private async _park(
     r: RefundRow,

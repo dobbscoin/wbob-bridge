@@ -21,6 +21,9 @@ import { PayoutExecutor } from './executor/payout-executor.js';
 import { RefundExecutor } from './executor/refund-executor.js';
 import { DobbscoinBackendRpc } from './dobbscoin/rpc.js';
 import { BridgeGuard } from './gnosis/bridge-guard.js';
+import { assertControllerVersion } from './gnosis/controller-version.js';
+import { RefundRecorder } from './gnosis/refund-recorder.js';
+import { AlertDispatcher } from './monitor/webhook.js';
 import { SolvencyMonitor } from './monitor/solvency-monitor.js';
 
 async function main(): Promise<void> {
@@ -38,11 +41,26 @@ async function main(): Promise<void> {
 
   const rpc = new DobbscoinBackendRpc(config.dobbscoinRpc);
 
+  await assertControllerVersion(config);
+
   if (BridgeGuard.isEnabled(config)) {
     const guard = new BridgeGuard(config);
-    console.log('[backend] BridgeGuard enabled — emergency pause/unpause available');
+    // Nothing in the backend calls emergencyPause() automatically: it is for
+    // ops scripts / a human. Say so, rather than imply automatic protection.
+    console.log(config.bridgeControllerVersion === 2
+      ? '[backend] BridgeGuard configured — pauseAll (controller + token) available to ops (NOT automatic); unpause is a Safe tx'
+      : '[backend] BridgeGuard configured — emergency pause/unpause available to ops (NOT automatic)');
     const guardOperator = await guard.getOperator().catch(() => 'unknown');
     console.log(`[backend] BridgeGuard operator: ${guardOperator}`);
+    const notReady = await guard.readiness();
+    for (const p of notReady) console.error(`[backend] BridgeGuard NOT READY: ${p}`);
+    if (notReady.length > 0) {
+      await new AlertDispatcher({ webhookUrl: config.alertWebhookUrl, emailTo: config.alertEmailTo }).dispatch({
+        level: 'critical', type: 'MINT_SUBMIT_BLOCKED', timestamp: new Date().toISOString(),
+        message: `Emergency pause is NOT ready: ${notReady.join(' | ')}`,
+        data: { problems: notReady },
+      }).catch((err) => console.error('[backend] could not send the BridgeGuard alert:', err));
+    }
   } else {
     console.warn('[backend] BridgeGuard DISABLED — set BRIDGE_EXECUTOR_MODULE_ADDRESS to enable emergency pause');
   }
@@ -65,7 +83,20 @@ async function main(): Promise<void> {
   const mintExecutor   = new MintExecutor(sql, config, dripSender);
   const gnosisWatcher  = new GnosisEventWatcher(sql, config);
   // Refunds of over-cap deposit excess ride the payout loop (no concurrent UTXO selection).
-  const refundExecutor = new RefundExecutor(sql, rpc, config);
+  // V2: refunds are recorded on-chain before they are sent (minted + refunded <= value).
+  const refundRecorder = config.bridgeControllerVersion === 2 ? new RefundRecorder(config) : null;
+  if (refundRecorder) {
+    const stuckAlerts = new AlertDispatcher({ webhookUrl: config.alertWebhookUrl, emailTo: config.alertEmailTo });
+    refundRecorder.onStuck = (key, hash, ageMs) => {
+      void stuckAlerts.dispatch({
+        level: 'critical', type: 'REFUND_NEEDS_ATTENTION', timestamp: new Date().toISOString(),
+        message: `recordRefund tx ${hash} (output ${key}) has been pending ${Math.round(ageMs / 60_000)} min; ` +
+          `refunds for that output wait, and later relayer txs (mints) may queue behind it. Check relayer gas / speed it up.`,
+        data: { key, hash },
+      }).catch(() => undefined);
+    };
+  }
+  const refundExecutor = new RefundExecutor(sql, rpc, config, { recorder: refundRecorder });
   const payoutExecutor = new PayoutExecutor(sql, rpc, config, refundExecutor);
   console.log(`[backend] RefundExecutor: auto-send ${config.refundsAutoSend ? 'ON' : 'OFF (REFUNDS_AUTO_SEND=false)'}`);
 

@@ -15,8 +15,9 @@ import { signTypedData } from 'viem/actions';
 import { createWalletClient, http } from 'viem';
 import { gnosis } from 'viem/chains';
 import {
-  BRIDGE_CONTROLLER_DOMAIN,
-  MINT_AUTHORIZATION_TYPES,
+  bridgeControllerDomain,
+  type BridgeControllerVersion,
+  mintAuthorizationTypes,
   type MintAuthorization,
   type Address,
   type Hex,
@@ -29,6 +30,8 @@ export interface AuthorizerConfig {
   privateKey: Hex;
   /** Address of the deployed BridgeController contract (required for EIP-712 verifyingContract). */
   bridgeControllerAddress: Address;
+  /** Which controller that address is; picks the EIP-712 domain version. Default 1. */
+  bridgeControllerVersion?: BridgeControllerVersion;
 }
 
 // ─── Authorizer ───────────────────────────────────────────────────────────────
@@ -36,10 +39,12 @@ export interface AuthorizerConfig {
 export class MintAuthorizer {
   private readonly account: ReturnType<typeof privateKeyToAccount>;
   private readonly bridgeControllerAddress: Address;
+  private readonly bridgeControllerVersion: BridgeControllerVersion;
 
   constructor(config: AuthorizerConfig) {
     this.account = privateKeyToAccount(config.privateKey);
     this.bridgeControllerAddress = config.bridgeControllerAddress;
+    this.bridgeControllerVersion = config.bridgeControllerVersion ?? 1;
   }
 
   /** The EOA address corresponding to this watcher's private key. */
@@ -54,7 +59,7 @@ export class MintAuthorizer {
    */
   async sign(auth: MintAuthorization): Promise<Hex> {
     const domain = {
-      ...BRIDGE_CONTROLLER_DOMAIN,
+      ...bridgeControllerDomain(this.bridgeControllerVersion),
       verifyingContract: this.bridgeControllerAddress,
     } as const;
 
@@ -65,13 +70,14 @@ export class MintAuthorizer {
       sourceChainId: auth.sourceChainId,
       sourceTxHash: auth.sourceTxHash as `0x${string}`,
       sourceVout: auth.sourceVout,
+      ...(this.bridgeControllerVersion === 2 ? { sourceValue: requireSourceValue(auth) } : {}),
       deadline: auth.deadline,
       nonce: auth.nonce,
     };
 
     const signature = await this.account.signTypedData({
       domain,
-      types: MINT_AUTHORIZATION_TYPES,
+      types: mintAuthorizationTypes(this.bridgeControllerVersion),
       primaryType: 'MintAuthorization',
       message,
     });
@@ -84,4 +90,12 @@ export class MintAuthorizer {
 
 export function createAuthorizer(config: AuthorizerConfig): MintAuthorizer {
   return new MintAuthorizer(config);
+}
+
+/** V2 signs the deposit's full value; signing without it would be a bug, never a default. */
+function requireSourceValue(auth: MintAuthorization): bigint {
+  if (auth.sourceValue === undefined || auth.sourceValue <= 0n) {
+    throw new Error('V2 MintAuthorization needs sourceValue (the deposit output value from our node)');
+  }
+  return auth.sourceValue;
 }

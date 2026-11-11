@@ -94,6 +94,7 @@ function makeLog(
 class MockPublicClient {
   blockNumber = 0n;
   getLogsCalls: Array<{ fromBlock: bigint; toBlock: bigint }> = [];
+  getLogsAddresses: unknown[] = [];
   logsByRange = new Map<string, FakeLog[]>();
 
   setBlockNumber(n: bigint): void { this.blockNumber = n; }
@@ -107,8 +108,9 @@ class MockPublicClient {
   async getBlock(_a?: unknown): Promise<{ number: bigint; timestamp: bigint }> {
     return { number: this.finalized ?? this.blockNumber, timestamp: BigInt(Math.floor(Date.now() / 1000)) };
   }
-  async getLogs(params: { fromBlock: bigint; toBlock: bigint }): Promise<FakeLog[]> {
+  async getLogs(params: { fromBlock: bigint; toBlock: bigint; address?: unknown }): Promise<FakeLog[]> {
     this.getLogsCalls.push({ fromBlock: params.fromBlock, toBlock: params.toBlock });
+    this.getLogsAddresses.push(params.address);
     return this.logsByRange.get(`${params.fromBlock}-${params.toBlock}`) ?? [];
   }
 }
@@ -499,6 +501,31 @@ describe('GnosisEventWatcher.processNewWithdrawals', () => {
     await setLastBlock(299_997n);
     await run();
     expect(await countWithdrawals()).toBe(3);
+  });
+
+  // ── 11 — V1→V2 cutover: both controllers are scanned (2026-11-06) ─────────
+  it('test 11 — legacy controllers are scanned too (deduplicated), and each order records its controller', async () => {
+    const V2 = '0x' + '3'.repeat(40);
+    const config = makeConfig({
+      bridgeControllerAddress: V2 as `0x${string}`,
+      legacyBridgeControllerAddresses: [BRIDGE_ADDR as `0x${string}`, V2.toUpperCase().replace('0X', '0x') as `0x${string}`],
+    } as never);
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(400_012n);
+    await setLastBlock(399_998n);                        // window [399_999, 400_000]
+    const v1Log = { ...makeLog(399_999n, 21n), address: BRIDGE_ADDR };
+    const v2Log = { ...makeLog(400_000n, 22n), address: V2 };
+    mock.setLogsForRange(399_999n, 400_000n, [v1Log, v2Log] as never);
+
+    const watcher = makeWatcher(config, mock);
+    await (watcher as unknown as { processNewWithdrawals: () => Promise<void> }).processNewWithdrawals();
+
+    expect(mock.getLogsAddresses[0]).toEqual([V2, BRIDGE_ADDR]);   // current first, duplicates dropped
+    expect(await countWithdrawals()).toBe(2);
+    const rows = await sql<{ wid: string; controller: string }[]>`
+      SELECT metadata->>'withdrawalId' AS wid, metadata->>'controller' AS controller
+      FROM audit_events WHERE event_type = 'ORDER_CREATED' ORDER BY 1`;
+    expect(rows).toEqual([{ wid: '21', controller: BRIDGE_ADDR }, { wid: '22', controller: V2 }]);
   });
 });
 

@@ -45,6 +45,13 @@ export interface MintCapChainState {
   blockNumber:      bigint;
   /** That block's timestamp — the clock the contract will judge "today" by. */
   blockTimestamp:   bigint;
+  /**
+   * BridgeControllerV2.remainingMintCapacity() at the same block (its rolling
+   * 24 h cap). Undefined against V1, which has no cap of its own.
+   */
+  controllerRemainingSat?: bigint;
+  /** BridgeControllerV2.mintLimitPerWindow() at the same block (display). */
+  controllerLimitSat?: bigint;
 }
 
 export interface MintCapWindow {
@@ -81,6 +88,12 @@ export function computeCapWindow(
   if (state.maxSupply > 0n) {
     const room = state.maxSupply > state.totalSupply ? state.maxSupply - state.totalSupply : 0n;
     if (room < remainingTodaySat) remainingTodaySat = room;
+  }
+
+  // V2 enforces its own rolling 24 h cap on top of the token's fixed UTC day.
+  // A mint must fit BOTH, or it reverts ExceedsWindowLimit after we authorized it.
+  if (state.controllerRemainingSat !== undefined && state.controllerRemainingSat < remainingTodaySat) {
+    remainingTodaySat = state.controllerRemainingSat;
   }
 
   return {
@@ -169,6 +182,10 @@ export async function outstandingReservedSat(
     FROM mint_requests mr
     JOIN bridge_orders bo ON bo.id = mr.order_id
     WHERE bo.state IN ('MINT_AUTH_CREATED', 'MINT_SUBMITTED')
+      -- Rows flagged as already minted on-chain (duplicate/forged, or a V1 leftover)
+      -- will never mint again; they must not keep shrinking everyone's capacity.
+      AND (mr.last_submit_error IS NULL OR (mr.last_submit_error NOT LIKE 'AlreadyProcessed%'
+                                            AND mr.last_submit_error NOT LIKE 'OutpointAlreadyMinted%'))
   `;
   const reservations = rows
     .filter((r) => r.order_id !== excludeOrderId)
@@ -199,7 +216,11 @@ export const WBOB_CAP_ABI = parseAbi([
   'function totalSupply() view returns (uint256)',
 ]);
 
-const CONTROLLER_WBOB_ABI = parseAbi(['function wBOB() view returns (address)']);
+const CONTROLLER_WBOB_ABI = parseAbi([
+  'function wBOB() view returns (address)',
+  'function remainingMintCapacity() view returns (uint256)',
+  'function mintLimitPerWindow() view returns (uint256)',
+]);
 
 /**
  * Reads the cap from the wBOB contract, all values pinned to one block so they
@@ -213,6 +234,8 @@ export class ViemMintCapReader implements MintCapReader {
     private readonly client: PublicClient,
     wBobAddress: string | null,
     private readonly bridgeControllerAddress: string,
+    /** 2 = also read BridgeControllerV2.remainingMintCapacity(). */
+    private readonly controllerVersion: 1 | 2 = 1,
   ) {
     this.wBobAddress = (wBobAddress as Hex | null) ?? null;
   }
@@ -235,16 +258,25 @@ export class ViemMintCapReader implements MintCapReader {
     if (blockNumber === null) throw new Error('latest block has no number');
     const read = (functionName: 'dailyMintLimit' | 'currentDayMinted' | 'currentDayStart' | 'MAX_SUPPLY' | 'totalSupply') =>
       this.client.readContract({ address, abi: WBOB_CAP_ABI, functionName, blockNumber }) as Promise<bigint>;
-    const [dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply] = await Promise.all([
+    const v2read = (functionName: 'remainingMintCapacity' | 'mintLimitPerWindow') => this.controllerVersion === 2
+      ? this.client.readContract({
+          address: this.bridgeControllerAddress as Hex, abi: CONTROLLER_WBOB_ABI, functionName, blockNumber,
+        }) as Promise<bigint>
+      : Promise.resolve(undefined);
+    const [dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply, controllerRemaining, controllerLimit] = await Promise.all([
       read('dailyMintLimit'),
       read('currentDayMinted'),
       read('currentDayStart'),
       read('MAX_SUPPLY'),
       read('totalSupply'),
+      v2read('remainingMintCapacity'),
+      v2read('mintLimitPerWindow'),
     ]);
     return {
       dailyMintLimit, currentDayMinted, currentDayStart, maxSupply, totalSupply,
       blockNumber, blockTimestamp: block.timestamp,
+      ...(controllerRemaining === undefined ? {} : { controllerRemainingSat: controllerRemaining }),
+      ...(controllerLimit === undefined ? {} : { controllerLimitSat: controllerLimit }),
     };
   }
 

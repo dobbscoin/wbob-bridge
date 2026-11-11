@@ -132,6 +132,9 @@ export interface MintCapResponse {
   resetsAt:       string;   // ISO, 00:00 UTC
   gnosisBlock:    string;
   checkedAt:      string;
+  /** Present only against BridgeControllerV2: its rolling 24 h cap. */
+  controllerRemainingSat?: string;
+  controllerLimitSat?:     string;
 }
 
 export function getMintCap(): Promise<MintCapResponse> {

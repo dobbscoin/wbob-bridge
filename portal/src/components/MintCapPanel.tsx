@@ -15,7 +15,7 @@
 
 import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { getMintCap } from '@/lib/api';
+import { getMintCap, type MintCapResponse } from '@/lib/api';
 import { fmtBob, fmtCountdown } from '@/lib/utils';
 
 function useNow(intervalMs = 1000): number {
@@ -56,6 +56,12 @@ export function MintCapPanel({ className = '' }: { className?: string }) {
 
   if (!data) {
     return <p className={`text-xs text-gray-500 animate-pulse ${className}`}>Reading today&apos;s mint cap…</p>;
+  }
+
+  // BridgeControllerV2 enforces a ROLLING 24 h cap (no midnight reset); the
+  // backend's remainingSat already takes the smaller of it and the token's day.
+  if (data.controllerLimitSat !== undefined) {
+    return <RollingCapPanel data={data} className={className} />;
   }
 
   const limit = BigInt(data.limitSat);
@@ -112,6 +118,57 @@ export function MintCapPanel({ className = '' }: { className?: string }) {
             today. Anything over that is{' '}
             <span className="font-semibold text-amber-100">refunded to the sending address</span>,
             minus the Dobbscoin network fee.
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
+
+// ─── V2: rolling 24 h window ─────────────────────────────────────────────────
+
+function RollingCapPanel({ data, className }: { data: MintCapResponse; className: string }) {
+  const limit = BigInt(data.controllerLimitSat!);
+  const left = BigInt(data.remainingSat);
+  const used = limit > left ? limit - left : 0n;
+  const usedPct = limit > 0n ? Math.min(100, Number((used * 10_000n) / limit) / 100) : 100;
+  const spent = left === 0n;
+  return (
+    <div className={`space-y-2 ${className}`}>
+      <div className="flex items-baseline justify-between gap-2">
+        <p className="text-[11px] font-bold uppercase tracking-[0.2em] text-gray-400">
+          Mint cap · last 24 hours
+        </p>
+        <p className="text-[11px] text-gray-500">rolling, no midnight reset</p>
+      </div>
+
+      <p className={`text-2xl font-bold tabular-nums ${spent ? 'text-red-400' : 'text-bob-300'}`}>
+        {fmtBob(left)}
+        <span className="ml-1.5 text-sm font-semibold text-gray-400">wBOB can mint now</span>
+      </p>
+
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-800" aria-hidden>
+        <div className={`h-full rounded-full ${spent ? 'bg-red-500' : 'bg-bob-500'}`} style={{ width: `${usedPct}%` }} />
+      </div>
+
+      <p className="text-[11px] text-gray-500 tabular-nums">
+        {fmtBob(used)} of {fmtBob(limit)} used in the last 24 hours
+        {BigInt(data.reservedSat) > 0n && <> · {fmtBob(BigInt(data.reservedSat))} minting now</>}
+      </p>
+
+      <p className={`text-xs leading-relaxed ${spent ? 'text-red-200' : 'text-amber-200/90'}`}>
+        {spent ? (
+          <>
+            <span className="font-semibold text-red-300">Nothing more mints right now.</span>{' '}
+            Capacity frees up 24 to 25 hours after each mint. A deposit sent before then is
+            refunded to the address it came from, minus the Dobbscoin network fee.
+          </>
+        ) : (
+          <>
+            Up to <span className="font-semibold text-amber-100">{fmtBob(left)} (BOB)</span> mints
+            now. Anything over that is{' '}
+            <span className="font-semibold text-amber-100">refunded to the sending address</span>,
+            minus the Dobbscoin network fee. Used capacity frees up 24 to 25 hours after each mint.
           </>
         )}
       </p>

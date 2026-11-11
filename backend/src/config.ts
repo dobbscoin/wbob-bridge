@@ -3,8 +3,8 @@
  * Throws at startup if any required variable is missing.
  */
 
-import type { Hex, Address } from '@wbob/shared';
-import { DOBBSCOIN_CHAIN_IDS } from '@wbob/shared';
+import type { Hex, Address, BridgeControllerVersion } from '@wbob/shared';
+import { DOBBSCOIN_CHAIN_IDS, parseBridgeControllerVersion } from '@wbob/shared';
 
 export interface BackendConfig {
   // ── Solvency monitor (Phase 8) ────────────────────────────────────────────
@@ -87,14 +87,38 @@ export interface BackendConfig {
    * If unset, emergency pause is disabled.
    */
   bridgeExecutorModuleAddress: Address | null;
-  /** Deployed BridgeController address on Gnosis. */
+  /** Deployed BridgeController address on Gnosis (the one minting now). */
   bridgeControllerAddress: Address;
+  /**
+   * 1 = BridgeController, 2 = BridgeControllerV2 (env BRIDGE_CONTROLLER_VERSION,
+   * default 1). Picks the EIP-712 domain version, V2's rolling-cap read, and
+   * V2's outpoint replay check.
+   */
+  bridgeControllerVersion: BridgeControllerVersion;
+  /**
+   * Older controllers whose WithdrawalRequested events must still be ingested
+   * (env LEGACY_BRIDGE_CONTROLLER_ADDRESSES, comma-separated; default none).
+   * Across the V1→V2 cutover set this to V1, so a V1 burn still inside the
+   * confirmation buffer is not dropped when BRIDGE_CONTROLLER_ADDRESS moves.
+   */
+  legacyBridgeControllerAddresses: Address[];
+  /**
+   * Key that operates the emergency pause module (env EMERGENCY_OPERATOR_PRIVATE_KEY).
+   * Falls back to EXECUTOR_PRIVATE_KEY. The V2 module can freeze the TOKEN, so
+   * it should not be the relayer hot key.
+   */
+  emergencyOperatorPrivateKey: Hex | null;
   /** How long mint authorizations are valid from creation (seconds). */
   mintDeadlineSeconds: number;
   /** How often executors poll for new work (ms). */
   executorPollIntervalMs: number;
   /** Gnosis blocks required before a burn is considered confirmed. */
   gnosisConfirmationDepth: number;
+  /**
+   * Dobbscoin confirmations a deposit needs before the backend refunds any of
+   * it (env FINAL_CONFIRMATIONS, the same value the watchers use; default 60).
+   */
+  depositFinalConfirmations: number;
   /**
    * Max blocks per `eth_getLogs` window when scanning Gnosis history.
    * Bounds the watcher's catch-up batch size to whatever the upstream RPC
@@ -208,6 +232,14 @@ function payoutMinSat(): bigint {
   return v;
 }
 
+function parseAddressList(raw: string | undefined): Address[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  return raw.split(',').map((s) => s.trim()).filter(Boolean).map((a) => {
+    if (!/^0x[0-9a-fA-F]{40}$/.test(a)) throw new Error(`LEGACY_BRIDGE_CONTROLLER_ADDRESSES: not an address: ${a}`);
+    return a as Address;
+  });
+}
+
 function optionalEnvBigInt(key: string, def: bigint): bigint {
   const val = process.env[key];
   if (!val) return def;
@@ -237,7 +269,9 @@ export function loadConfig(): BackendConfig {
     hdWalletXpub:               requireEnv('HD_WALLET_XPUB'),
     hdWalletXpriv:              requireEnv('HD_WALLET_XPRIV'),
     dobbscoinAddressVersion:    optionalEnvInt('DOBBSCOIN_ADDRESS_VERSION', 0x00),
-    hdDerivationPath:           process.env['HD_DERIVATION_PATH'] ?? 'm/0',
+    // `||`, like the watcher: an EMPTY value must mean the default, never "" (the
+    // two would otherwise derive different addresses).
+    hdDerivationPath:           process.env['HD_DERIVATION_PATH'] || 'm/0',
     hdChangePath:               process.env['HD_CHANGE_PATH'] ?? 'm/1',
     dobbscoinRpc: {
       url:      requireEnv('DOBBSCOIN_RPC_URL'),
@@ -250,6 +284,9 @@ export function loadConfig(): BackendConfig {
     gnosisRpcUrls,
     executorPrivateKey:         requireEnv('EXECUTOR_PRIVATE_KEY') as Hex,
     bridgeControllerAddress:    requireEnv('BRIDGE_CONTROLLER_ADDRESS') as Address,
+    bridgeControllerVersion:    parseBridgeControllerVersion(process.env['BRIDGE_CONTROLLER_VERSION']),
+    legacyBridgeControllerAddresses: parseAddressList(process.env['LEGACY_BRIDGE_CONTROLLER_ADDRESSES']),
+    emergencyOperatorPrivateKey: (process.env['EMERGENCY_OPERATOR_PRIVATE_KEY'] || null) as Hex | null,
     bridgeExecutorModuleAddress: (process.env['BRIDGE_EXECUTOR_MODULE_ADDRESS'] ?? null) as Address | null,
     wBobAddress:                (process.env['WBOB_ADDRESS'] ?? null) as Address | null,
     monitorIntervalMs:          optionalEnvInt('MONITOR_INTERVAL_MS', 300_000),
@@ -261,6 +298,7 @@ export function loadConfig(): BackendConfig {
     mintDeadlineSeconds:        optionalEnvInt('MINT_DEADLINE_SECONDS', 3600),
     executorPollIntervalMs:     optionalEnvInt('EXECUTOR_POLL_INTERVAL_MS', 15_000),
     gnosisConfirmationDepth:    optionalEnvInt('GNOSIS_CONFIRMATION_DEPTH', 12),
+    depositFinalConfirmations:  optionalEnvInt('FINAL_CONFIRMATIONS', 60),
     gnosisLogScanChunk:         optionalEnvInt('GNOSIS_LOG_SCAN_CHUNK', 1000),
     gnosisStartBlock:           BigInt(optionalEnvInt('GNOSIS_START_BLOCK', 45_811_925)),
     gnosisScanHaltAlertThreshold: optionalEnvInt('GNOSIS_SCAN_HALT_ALERT_THRESHOLD', 10),
