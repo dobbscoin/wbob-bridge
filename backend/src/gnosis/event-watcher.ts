@@ -93,7 +93,7 @@ export class GnosisEventWatcher {
    */
   async recount(): Promise<void> {
     const watermark = BigInt(await this._getState('gnosis_last_block'));
-    const tip = (await this.publicClient.getBlockNumber()) - BigInt(this.config.gnosisConfirmationDepth);
+    const tip = await this._safeHead();
     const end = watermark < tip ? watermark : tip;
     // (review round 9 #3) Re-read everything once a day: a row deleted after a
     // pass is otherwise only caught after a restart.
@@ -173,6 +173,23 @@ export class GnosisEventWatcher {
       `Withdrawals are not being picked up and payouts wait. Check erigon.`, { ageSeconds: age });
   }
 
+  /**
+   * (review round 11) Gnosis finalizes ~2 epochs (~40 blocks) behind the tip;
+   * 12 blocks is not final. Everything that leads to a payout reads at most the
+   * finalized block (and still at least gnosisConfirmationDepth deep).
+   * Throws if the node can't say: then nothing advances and the stall alert fires.
+   */
+  private async _finalized(): Promise<bigint> {
+    const b = await this.publicClient.getBlock({ blockTag: 'finalized' });
+    if (b.number === null || b.number === undefined) throw new Error('our Gnosis node returned no finalized block');
+    return b.number;
+  }
+  private async _safeHead(): Promise<bigint> {
+    const [tip, fin] = await Promise.all([this.publicClient.getBlockNumber(), this._finalized()]);
+    const byDepth = tip - BigInt(this.config.gnosisConfirmationDepth);
+    return fin < byDepth ? fin : byDepth;
+  }
+
   /** One critical alert when no scan has completed for 30 min; re-armed by the next success. */
   private async _checkStall(): Promise<void> {
     const since = this.lastScanOk ?? this.startedAt;
@@ -230,8 +247,7 @@ export class GnosisEventWatcher {
     const lastBlockStr = await this._getState('gnosis_last_block');
     const fromBlock = BigInt(lastBlockStr) + 1n;
 
-    const currentBlock = await this.publicClient.getBlockNumber();
-    const safeTip = currentBlock - BigInt(this.config.gnosisConfirmationDepth);
+    const safeTip = await this._safeHead();
     // Reorg buffer: nothing finality-stable to scan yet.
     if (fromBlock > safeTip) return;
 
@@ -424,10 +440,12 @@ export class GnosisEventWatcher {
     if (pendingBurns.length === 0) return;
 
     const currentBlock = await this.publicClient.getBlockNumber();
+    const finalized = await this._finalized();
 
     for (const row of pendingBurns) {
       const depth = currentBlock - row.burn_block_number;
       if (depth < BigInt(this.config.gnosisConfirmationDepth)) continue;
+      if (BigInt(row.burn_block_number) > finalized) continue;      // (review round 11) only finalized burns are paid
 
       try {
         // BURN_TX_SEEN → BURN_CONFIRMED → PAYOUT_QUEUED
