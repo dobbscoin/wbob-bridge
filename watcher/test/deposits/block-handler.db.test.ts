@@ -267,4 +267,37 @@ describe.skipIf(!URL)('handleBlock replay safety (real Postgres)', () => {
     for (let h = 9_401; h <= 9_410; h++) await handleBlock(block(h));
     expect((await snapshot(txid)).deposits[0]!.state).toBe(InboundState.DEPOSIT_SEEN_MEMPOOL);
   });
+
+  // ── review round 11 (split): legacy quote orders vs persistent addresses ──
+  it('a legacy quote order on a PERSISTENT address never claims its deposit: the address recipient gets it', async () => {
+    const { handleBlock } = createBlockHandlers(sql, CONF, IN_CHAIN);
+    const address = await trackedAddress();                         // belongs to RECIPIENT
+    const thief = '0x6666666666666666666666666666666666666666';
+    const [quote] = await sql<{ id: string }[]>`
+      INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+      VALUES ('inbound', ${InboundState.DEPOSIT_ADDRESS_ASSIGNED}, ${thief}, 500000000) RETURNING id`;
+    await sql`INSERT INTO source_deposits (order_id, deposit_address, source_chain_name, hd_index)
+              VALUES (${quote!.id}, ${address}, 'dobbscoin-regtest', ${hdIndex++})`;
+    const txid = rnd(32);
+    expect(await handleBlock(block(7_000, [payment(txid, address, 5)]))).toBe(true);
+    const snap = await snapshot(txid);
+    expect(snap.deposits).toHaveLength(1);
+    expect(snap.deposits[0]!.order_id).not.toBe(quote!.id);          // not the quote order
+    const [owner] = await sql<{ user_gnosis_address: string }[]>`SELECT user_gnosis_address FROM bridge_orders WHERE id = ${snap.deposits[0]!.order_id}`;
+    expect(owner!.user_gnosis_address).toBe(RECIPIENT);
+  });
+
+  it('one output can be recorded as a deposit only once (migration 015)', async () => {
+    const txid = rnd(32);
+    const mk = async () => {
+      const [o] = await sql<{ id: string }[]>`
+        INSERT INTO bridge_orders (order_type, state, user_gnosis_address, amount_sat)
+        VALUES ('inbound', ${InboundState.DEPOSIT_SEEN_MEMPOOL}, ${RECIPIENT}, 1) RETURNING id`;
+      await sql`INSERT INTO source_deposits (order_id, deposit_address, source_chain_name, hd_index, txid, vout, amount_sat)
+                VALUES (${o!.id}, ${'x-' + rnd(4)}, 'dobbscoin-regtest', ${hdIndex++}, ${txid}, 0, 1)`;
+    };
+    await mk();
+    await expect(mk()).rejects.toThrow(/uq_source_deposits_outpoint/);
+  });
 });
+

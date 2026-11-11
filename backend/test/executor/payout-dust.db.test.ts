@@ -521,7 +521,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
               VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'test', ${sql.json({ txid: txidFromRawHex(oldHex), signedHex: oldHex })})`;
     await executor(async () => { throw new Error('must not broadcast'); }, {
-      getConfirmations: async () => -1,                                  // the original txid never confirmed...
+      getConfirmations: async (t) => (t === spentCoin ? 30 : -1),       // the original txid never confirmed (its input's parent did)...
       isUnspent: async (t) => t !== spentCoin,                           // ...but its input was spent
       burn: { verify: async () => { throw new Error('must not be reached'); } },
     }).processQueued();
@@ -568,7 +568,7 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   async function run(orderId: string, node: (id: string) => Promise<unknown>, coin: string, confs: (t: string) => number) {
     const seen: string[] = [];
     await executor(async () => { throw new Error('must not broadcast'); }, {
-      getConfirmations: async (t) => confs(t), isUnspent: async (t) => t !== coin, getRawTransactionVerbose: node,
+      getConfirmations: async (t) => (t === coin ? 30 : confs(t)), isUnspent: async (t) => t !== coin, getRawTransactionVerbose: node,
       burn: { verify: async () => { seen.push('burn'); return { ok: false, defer: true, reason: 'stop here' }; } },
     }).processQueued();
     return seen;
@@ -721,6 +721,38 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     await executor(async () => { throw new Error('must not broadcast'); }).processQueued();
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);           // deferred, nothing signed
     expect(await utxoStatus(big)).toEqual({ status: 'available', spent_payout_id: null });
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
+  });
+
+  // ── Review round 11 (split): pairwise conflict, missing parent, dead attempt's free coin ──
+  it('two earlier attempts both still valid that share no coin: parked (both could confirm)', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE state = 'PAYOUT_QUEUED' AND id <> ${orderId}`;
+    const e1 = minimalSpend(rnd(32), 0), e2 = minimalSpend(rnd(32), 1);
+    for (const h of [e1, e2]) {
+      await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+                VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(h), signedHex: h })})`;
+    }
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.MANUAL_REVIEW);
+    const [a] = await sql<{ error: string }[]>`SELECT metadata->>'error' AS error FROM audit_events WHERE order_id = ${orderId} AND to_state = 'MANUAL_REVIEW'`;
+    expect(a!.error).toMatch(/share no coin/);
+  });
+
+  it('an earlier attempt whose input has an unknown parent waits, not "possibly paid"', async () => {
+    const { orderId } = await order(OutboundState.PAYOUT_QUEUED, 200_000n);
+    await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE state = 'PAYOUT_QUEUED' AND id <> ${orderId}`;
+    const ghost = rnd(32);
+    const e = minimalSpend(ghost, 1);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${orderId}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(e), signedHex: e })})`;
+    await executor(async () => { throw new Error('must not broadcast'); }, {
+      getConfirmations: async () => -1, isUnspent: async (t) => t !== ghost,
+      burn: { verify: async () => { throw new Error('must not be reached'); } },
+    }).processQueued();
+    expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);   // waits; the stuck-payout alert covers it
     await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
   });
 });

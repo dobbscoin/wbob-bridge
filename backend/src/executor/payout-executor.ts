@@ -266,8 +266,9 @@ export class PayoutExecutor {
       // Payout rows and UTXO links are ordinary rows a DB writer can erase; the
       // append-only audit trail and our node cannot be. Every payout ever signed
       // for this withdrawalId (on ANY order) must be unknown to the node.
-      const alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [];
-      const paid = await this._alreadyPaidReason(row, alive);
+      const alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [];
+      const seen = { maxAuditId: 0n };
+      const paid = await this._alreadyPaidReason(row, alive, seen);
       if (paid !== null) {
         if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); continue; }
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, paid.reason);
@@ -290,7 +291,7 @@ export class PayoutExecutor {
       }
 
       try {
-        await this._buildAndSignPayout(row, alive);
+        await this._buildAndSignPayout(row, alive, seen.maxAuditId);
       } catch (err) {
         if (err instanceof EarlierPayoutBusyError) {
           console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${err.message}`);
@@ -314,7 +315,8 @@ export class PayoutExecutor {
    */
   private async _alreadyPaidReason(
     row: QueuedPayoutRow,
-    alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [],
+    alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [],
+    seen: { maxAuditId: bigint } = { maxAuditId: 0n },
   ): Promise<{ defer: boolean; reason: string } | null> {
     if (row.withdrawal_id === null) return { defer: false, reason: 'no withdrawal_requests row for this order' };
     const W = row.withdrawal_id;
@@ -332,8 +334,8 @@ export class PayoutExecutor {
     }
     // Every payout ever signed for W: on any order the trail created for W, or
     // stamped with W (PAYOUT_SIGNED.withdrawalId, review round 10 #1).
-    const signed = await this.sql<{ order_id: string; event_type: string; txid: string | null; hex: string | null }[]>`
-      SELECT a.order_id::text, a.event_type, a.metadata->>'txid' AS txid, a.metadata->>'signedHex' AS hex
+    const signed = await this.sql<{ id: string; order_id: string; event_type: string; txid: string | null; hex: string | null }[]>`
+      SELECT a.id::text, a.order_id::text, a.event_type, a.metadata->>'txid' AS txid, a.metadata->>'signedHex' AS hex
       FROM audit_events a
       WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
         AND (a.metadata->>'withdrawalId' = ${W}
@@ -345,6 +347,7 @@ export class PayoutExecutor {
     // (review round 10 #2) A payout is identified ONLY by the hash of its own
     // signed bytes; the `txid` field of a row is a claim (the bridge role can
     // INSERT rows) and must agree with the bytes, or the row is a forgery.
+    for (const e of signed) if (BigInt(e.id) > seen.maxAuditId) seen.maxAuditId = BigInt(e.id);
     const hexOf = new Map<string, string>();
     const ids = new Set<string>();
     for (const e of signed) {
@@ -381,6 +384,15 @@ export class PayoutExecutor {
         try { unspent = await this.rpc.isUnspent(i.txid, i.vout); }
         catch { return { defer: true, reason: `node unreachable while checking inputs of earlier payout ${t}` }; }
         if (!unspent) {
+          // (review round 11) gettxout is null both for a spent output and for one
+          // whose parent tx our node doesn't have. A missing parent is no evidence
+          // of a payment: wait (the stuck-payout alert reports it), never claim
+          // "possibly paid".
+          const parentConfs = await this.rpc.getConfirmations(i.txid).catch(() => null);
+          if (parentConfs === null) return { defer: true, reason: `node unreachable while checking the parent of ${i.txid}:${i.vout}` };
+          if (parentConfs < 0) {
+            return { defer: true, reason: `input ${i.txid}:${i.vout} of earlier payout ${t}: its parent tx is unknown to our node; waiting` };
+          }
           const spender = await this._knownSpender(i.txid, i.vout, [...hexOf.values()]);
           if (spender.kind === 'ok') { dead = true; continue; }
           if (spender.kind === 'wait') return { defer: true, reason: spender.why };
@@ -392,7 +404,31 @@ export class PayoutExecutor {
       // it was refused or never sent, but it is STILL a valid signed tx that
       // anyone holding its bytes could get mined. The new payout must spend
       // one of its coins, so the two conflict and at most one ever confirms.
-      if (!dead) alive.push({ txid: t, inputs: ins });
+      if (!dead) {
+        alive.push({ txid: t, inputs: ins });
+      } else {
+        // (review round 11) "Dead" rests on a 6-deep spend of ONE input. If
+        // another of its coins is still unspent, spend it anyway when free: no
+        // reliance on reorg depth for this attempt.
+        const free: { txid: string; vout: number }[] = [];
+        for (const i of ins) {
+          try { if (await this.rpc.isUnspent(i.txid, i.vout)) free.push(i); } catch { /* best effort */ }
+        }
+        if (free.length > 0) alive.push({ txid: t, inputs: free, optional: true });
+      }
+    }
+    // (review round 11) Earlier attempts that are still valid must also conflict
+    // with EACH OTHER: two that share no coin could both be mined (paying twice)
+    // whatever the new payout does. That needs a human.
+    const live = alive.filter((a) => !a.optional);
+    for (let x = 0; x < live.length; x++) {
+      for (let y = x + 1; y < live.length; y++) {
+        const share = live[x]!.inputs.some((i) => live[y]!.inputs.some((j) => j.txid === i.txid && j.vout === i.vout));
+        if (!share) {
+          return { defer: false, reason: `earlier payouts ${live[x]!.txid} and ${live[y]!.txid} of withdrawalId ${W} are both still valid ` +
+            `and share no coin: both could confirm. Spend a coin of one of them first; check by hand` };
+        }
+      }
     }
     return null;
   }
@@ -479,7 +515,8 @@ export class PayoutExecutor {
 
   private async _buildAndSignPayout(
     row: QueuedPayoutRow,
-    alive: { txid: string; inputs: { txid: string; vout: number }[] }[] = [],
+    alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [],
+    seenMaxAuditId: bigint = 0n,
   ): Promise<void> {
     // Fetch available UTXOs
     const utxoRows = await this.sql<BridgeUtxoRow[]>`
@@ -513,7 +550,10 @@ export class PayoutExecutor {
     const required: UtxoInput[] = [];
     for (const e of alive) {
       const mine = utxos.filter((u) => e.inputs.some((i) => i.txid === u.txid && i.vout === u.vout));
-      if (mine.length === 0) throw new EarlierPayoutBusyError(e.txid);
+      if (mine.length === 0) {
+        if (e.optional) continue;          // a dead attempt: only spent when a coin happens to be free
+        throw new EarlierPayoutBusyError(e.txid);
+      }
       if (!mine.some((m) => required.some((r) => r.txid === m.txid && r.vout === m.vout))) {
         required.push(mine.reduce((a, b) => (b.amountSat > a.amountSat ? b : a)));
       }
@@ -532,6 +572,7 @@ export class PayoutExecutor {
       required,
     );
     for (const e of alive) {
+      if (e.optional) continue;
       if (!result.inputs.some((u) => e.inputs.some((i) => i.txid === u.txid && i.vout === u.vout))) {
         throw new Error(`refusing to sign: the new payout does not conflict with earlier payout ${e.txid}`);
       }
@@ -539,6 +580,19 @@ export class PayoutExecutor {
 
     // Atomically: reserve UTXOs, create payout row, advance FSM
     await this.sql.begin(async (tx) => {
+      // (review round 11) One signer per withdrawal at a time, and nobody signed
+      // for it since our already-paid check: else start over next poll.
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${'wbob-withdrawal:' + row.withdrawal_id}))`;
+      const [newer] = await tx<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM audit_events a
+        WHERE a.id > ${seenMaxAuditId.toString()}
+          AND a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
+          AND (a.metadata->>'withdrawalId' = ${row.withdrawal_id}
+               OR a.order_id IN (SELECT o.order_id FROM audit_events o
+                                 WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${row.withdrawal_id}
+                                 UNION SELECT ${row.order_id}::uuid))
+      `;
+      if (newer && newer.n > 0) throw new UtxoRaceError(`a payout for withdrawalId ${row.withdrawal_id} was signed meanwhile`);
       const rows = await tx<{ state: string }[]>`
         SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
       `;

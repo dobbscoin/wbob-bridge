@@ -6,7 +6,6 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import type { Sql } from 'postgres';
 import type { HdWallet } from '../wallet/hd-wallet.js';
-import { quotesRoute } from './routes/quotes.js';
 import { depositAddressRoute } from './routes/deposit-address.js';
 import { ordersRoute } from './routes/orders.js';
 import { healthRoute } from './routes/health.js';
@@ -31,7 +30,9 @@ export async function buildServer(opts: {
   await fastify.register(cors, { origin: true });
 
   // Routes
-  await fastify.register(quotesRoute, opts);             // legacy: fixed-amount quote flow
+  // /v1/quotes REMOVED (review round 11): its HD-index allocator ignored
+  // deposit_addresses, so a quote could take over another user's deposit
+  // address. nginx already returned 410 for it since 2026-11-05.
   await fastify.register(depositAddressRoute, opts);     // modern: persistent address per recipient
   await fastify.register(ordersRoute, { sql: opts.sql });
   await fastify.register(healthRoute, { monitor: opts.monitor });

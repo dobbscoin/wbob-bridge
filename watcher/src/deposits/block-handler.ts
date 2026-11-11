@@ -116,7 +116,17 @@ export function createBlockHandlers(
     `;
 
     if (pendingFirst.length > 0) {
-      const watchedSet = new Set(pendingFirst.map((d) => d.deposit_address));
+      // (review round 11) A legacy quote order never claims an address that is
+      // a persistent deposit address (it belongs to that address's recipient),
+      // nor an output already recorded by anyone.
+      const persistent = new Set((await sql<{ dobbscoin_address: string }[]>`
+        SELECT dobbscoin_address FROM deposit_addresses
+      `).map((r) => r.dobbscoin_address));
+      const watchedSet = new Set(pendingFirst.map((d) => d.deposit_address).filter((a) => {
+        if (!persistent.has(a)) return true;
+        console.error(`[watcher] legacy quote order on persistent address ${a} ignored (address belongs to its deposit_addresses recipient)`);
+        return false;
+      }));
       const matches = payingMatches(block, watchedSet);
       const depositsByAddress = new Map<string, ActiveDepositRow>();
       for (const d of pendingFirst) depositsByAddress.set(d.deposit_address, d);
@@ -136,6 +146,10 @@ export function createBlockHandlers(
 
         try {
           await sql.begin(async (tx) => {
+            const recorded = await tx<{ id: string }[]>`
+              SELECT id FROM source_deposits WHERE txid = ${match.txid} AND vout = ${match.vout} LIMIT 1
+            `;
+            if (recorded.length > 0) return;     // already someone's deposit (and UNIQUE since migration 015)
             const rows = await tx<{ state: InboundState }[]>`
               SELECT state FROM bridge_orders WHERE id = ${deposit.order_id} FOR UPDATE
             `;
