@@ -274,6 +274,8 @@ export class SolvencyMonitor {
     let manualReviewRose = false;
     if (manualReviewCount !== null) {
       alerts.push(...checkManualReview(manualReviewCount, manualReviewNewest, checkedAt));
+      try { alerts.push(...await this.watcherLagAlerts(checkedAt)); }
+      catch (err) { console.error('[solvency-monitor] watcher-lag check failed:', err); }
       manualReviewRose = this.lastManualReviewCount !== null && manualReviewCount > this.lastManualReviewCount;
       this.lastManualReviewCount = manualReviewCount;
     }
@@ -348,13 +350,51 @@ export class SolvencyMonitor {
     }
   }
 
+  /** (review round 11) consecutive failed polls; one alert at 3, re-armed by a success. */
+  private pollFailures = 0;
+
   async start(): Promise<void> {
     console.log('[solvency-monitor] started');
     while (true) {
-      try { await this.poll(); }
-      catch (err) { console.error('[solvency-monitor] poll error:', err); }
+      try {
+        await this.poll();
+        this.pollFailures = 0;
+      } catch (err) {
+        console.error('[solvency-monitor] poll error:', err);
+        if (++this.pollFailures === 3) {
+          try {
+            await this.dispatcher.dispatch({ level: 'critical', type: 'MONITOR_ERROR', timestamp: new Date().toISOString(),
+              message: `The bridge monitor has failed 3 polls in a row: ${String(err).slice(0, 200)}. Solvency, stuck-order, ` +
+                `scan-halt and manual-review alerts are NOT being checked until it works again.`, data: {} });
+          } catch { /* nothing more to do */ }
+        }
+      }
       await new Promise<void>((r) => setTimeout(r, this.config.monitorIntervalMs));
     }
+  }
+
+  /**
+   * (review round 11) The watchers have no alert channel of their own; a stuck
+   * one (CURSOR HELD, crash loop, dead node) only stopped advancing its cursor.
+   * Alert when a cursor is an hour behind our Dobbscoin tip or not updated for
+   * an hour; critical when fewer than 3 are current (mints need 3 signatures).
+   */
+  async watcherLagAlerts(checkedAt: string): Promise<Alert[]> {
+    if (!this.rpc) return [];
+    const tip = await this.rpc.call<number>('getblockcount');
+    const rows = await this.sql<{ watcher_id: string; block_height: number; updated_at: Date }[]>`
+      SELECT watcher_id, block_height, updated_at FROM watcher_cursors`;
+    const LAG_BLOCKS = 30, STALE_MS = 3600_000;
+    const behind = rows.filter((r) => tip - r.block_height > LAG_BLOCKS || Date.now() - r.updated_at.getTime() > STALE_MS);
+    const current = rows.length - behind.length;
+    if (behind.length === 0 && current >= 3) return [];
+    return [{
+      level: current < 3 ? 'critical' : 'warning', type: 'WATCHER_LAG', timestamp: checkedAt,
+      message: `${behind.length} watcher(s) behind or stale (tip ${tip}): ` +
+        behind.map((r) => `${r.watcher_id.slice(0, 10)}… at ${r.block_height}, updated ${Math.round((Date.now() - r.updated_at.getTime()) / 60000)} min ago`).join('; ') +
+        `. ${current} current${current < 3 ? ' — fewer than 3: deposits will NOT mint' : ''}.`,
+      data: { tip, current, behind: behind.map((r) => r.watcher_id) },
+    }];
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

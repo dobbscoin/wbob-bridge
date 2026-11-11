@@ -755,4 +755,34 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
     expect(await state(orderId)).toBe(OutboundState.PAYOUT_QUEUED);   // waits; the stuck-payout alert covers it
     await sql`UPDATE bridge_orders SET state = 'FAILED' WHERE id = ${orderId}`;
   });
+
+  // ── Review round 11 (split, deploy 2): never silent ──────────────────────
+  it('a withdrawal marked COMPLETED with no confirmed payout raises BURN_UNPAID; a paid one does not', async () => {
+    const { orderId: unpaid } = await order(OutboundState.COMPLETED, 200_000n);
+    const { orderId: paidOrder } = await order(OutboundState.COMPLETED, 300_000n);
+    const hex = minimalSpend(rnd(32), 0);
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${paidOrder}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(hex), signedHex: hex })})`;
+    const ex = executor(async () => 'x', { getConfirmations: async (t) => (t === txidFromRawHex(hex) ? 12 : -1) }) as unknown as
+      { checkTerminalWithdrawalsPaid(): Promise<void>; _alertCritical: (m: string, d: Record<string, unknown>, ty?: string) => Promise<void> };
+    const got: { type: string | undefined; data: Record<string, unknown> }[] = [];
+    ex._alertCritical = async (_m, d, ty) => { got.push({ type: ty, data: d }); };
+    await ex.checkTerminalWithdrawalsPaid();
+    const ids = got.filter((g) => g.type === 'BURN_UNPAID').map((g) => g.data['orderId']);
+    expect(ids).toContain(unpaid);
+    expect(ids).not.toContain(paidOrder);
+  });
+
+  it('a payout waiting over an hour raises one PAYOUT_DEFERRED alert', async () => {
+    const ex = executor(async () => 'x') as unknown as
+      { _noteDefer(o: string, r: string): Promise<void>; deferSince: Map<string, number>; _alertCritical: (m: string, d: Record<string, unknown>, ty?: string) => Promise<void> };
+    const got: string[] = [];
+    ex._alertCritical = async (_m, _d, ty) => { got.push(ty ?? ''); };
+    await ex._noteDefer('o-1', 'waiting');
+    expect(got).toEqual([]);
+    ex.deferSince.set('o-1', Date.now() - 61 * 60_000);
+    await ex._noteDefer('o-1', 'waiting');
+    await ex._noteDefer('o-1', 'waiting');
+    expect(got).toEqual(['PAYOUT_DEFERRED']);
+  });
 });

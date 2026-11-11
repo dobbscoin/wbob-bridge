@@ -22,6 +22,7 @@ import { nextChangeIndex, type RefundExecutor } from './refund-executor.js';
 import { unpayableDestinationReason } from '../gnosis/destination.js';
 import { BurnVerifier, type BurnVerifierLike } from '../gnosis/burn-verifier.js';
 import { AlertDispatcher } from '../monitor/webhook.js';
+import type { Alert } from '../monitor/types.js';
 
 /** A selected UTXO was reserved by someone else before we could reserve it. */
 /** An earlier signed payout for this withdrawal is still alive and none of its coins is free to conflict with: wait. */
@@ -173,6 +174,7 @@ export class PayoutExecutor {
       await this.processQueued();
       await this.broadcastSigned();
       await this.confirmBroadcast();
+      await this.checkTerminalWithdrawalsPaid().catch((err) => console.error('[payout-executor] paid-check failed:', err));
     } finally {
       // Refunds run even when a payout step throws; same loop, never concurrent.
       if (this.refunds) await this.refunds.poll();
@@ -270,7 +272,7 @@ export class PayoutExecutor {
       const seen = { maxAuditId: 0n };
       const paid = await this._alreadyPaidReason(row, alive, seen);
       if (paid !== null) {
-        if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); continue; }
+        if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); await this._noteDefer(row.order_id, paid.reason); continue; }
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, paid.reason);
         await this._alertCritical(`Payout REFUSED for order ${row.order_id}: ${paid.reason}. ` +
           `Paying again would pay one burn twice: possible DB tampering. Do not pay by hand.`,
@@ -282,7 +284,7 @@ export class PayoutExecutor {
       // (only here: this is the one place a NEW payout signature is created).
       const bad = await this._burnNotBackedReason(row);
       if (bad !== null) {
-        if (bad.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${bad.reason}`); continue; }
+        if (bad.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${bad.reason}`); await this._noteDefer(row.order_id, bad.reason); continue; }
         await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, bad.reason);
         await this._alertCritical(`Payout REFUSED for order ${row.order_id}: ${bad.reason}. ` +
           `The DB does not match the chain: possible tampering. Do not pay by hand without checking the burn tx.`,
@@ -292,9 +294,11 @@ export class PayoutExecutor {
 
       try {
         await this._buildAndSignPayout(row, alive, seen.maxAuditId);
+        this._clearDefer(row.order_id);
       } catch (err) {
         if (err instanceof EarlierPayoutBusyError) {
           console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${err.message}`);
+          await this._noteDefer(row.order_id, err.message);
           continue;
         }
         if (err instanceof UtxoRaceError) {
@@ -503,10 +507,64 @@ export class PayoutExecutor {
     return v.ok ? null : { defer: v.defer, reason: v.reason };
   }
 
-  private async _alertCritical(message: string, data: Record<string, unknown>): Promise<void> {
+  // (review round 11) A payout that keeps waiting must not wait silently.
+  private readonly deferSince = new Map<string, number>();
+  private readonly deferAlerted = new Set<string>();
+  private async _noteDefer(orderId: string, reason: string): Promise<void> {
+    const first = this.deferSince.get(orderId) ?? Date.now();
+    this.deferSince.set(orderId, first);
+    if (Date.now() - first < 60 * 60_000 || this.deferAlerted.has(orderId)) return;
+    this.deferAlerted.add(orderId);
+    await this._alertCritical(`Payout for order ${orderId} has been waiting ${Math.round((Date.now() - first) / 60_000)} min: ${reason}`,
+      { orderId, reason }, 'PAYOUT_DEFERRED');
+  }
+  private _clearDefer(orderId: string): void { this.deferSince.delete(orderId); this.deferAlerted.delete(orderId); }
+
+  // (review round 11) Every withdrawal the DB calls done must have a payout our
+  // node has confirmed; a DB writer marking an unpaid burn COMPLETED/FAILED
+  // would otherwise hide it for good (terminal states are excluded from every
+  // other check). Every 6 h; one alert per withdrawal per process.
+  private lastPaidCheck = 0;
+  private readonly unpaidAlerted = new Set<string>();
+  async checkTerminalWithdrawalsPaid(): Promise<void> {
+    if (Date.now() - this.lastPaidCheck < 6 * 3600_000) return;
+    this.lastPaidCheck = Date.now();
+    const rows = await this.sql<{ order_id: string; state: string; withdrawal_id: string }[]>`
+      SELECT bo.id::text AS order_id, bo.state, wr.withdrawal_id::text AS withdrawal_id
+      FROM bridge_orders bo JOIN withdrawal_requests wr ON wr.order_id = bo.id
+      WHERE bo.order_type = 'outbound' AND bo.state IN ('COMPLETED', 'FAILED')
+    `;
+    for (const r of rows) {
+      if (this.unpaidAlerted.has(r.withdrawal_id)) continue;
+      const signed = await this.sql<{ hex: string | null; txid: string | null }[]>`
+        SELECT metadata->>'signedHex' AS hex, metadata->>'txid' AS txid FROM audit_events a
+        WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_BROADCAST', 'PAYOUT_SENT_OUT_OF_STATE')
+          AND (a.metadata->>'withdrawalId' = ${r.withdrawal_id}
+               OR a.order_id IN (SELECT o.order_id FROM audit_events o
+                                 WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${r.withdrawal_id}
+                                 UNION SELECT ${r.order_id}::uuid))
+      `;
+      const ids = new Set<string>();
+      for (const e of signed) { try { if (e.hex) ids.add(txidFromRawHex(e.hex)); else if (e.txid) ids.add(e.txid.toLowerCase()); } catch { /* skip */ } }
+      let paid = false;
+      for (const t of ids) {
+        const c = await this.rpc.getConfirmations(t).catch(() => null);
+        if (c === null) return;                     // node trouble: try again next round, no false alarm
+        if (c >= 1) { paid = true; break; }
+      }
+      if (!paid) {
+        this.unpaidAlerted.add(r.withdrawal_id);
+        await this._alertCritical(`Withdrawal ${r.withdrawal_id} (order ${r.order_id}) is ${r.state} but no payout for it is confirmed on our ` +
+          `Dobbscoin node: a burned withdrawal may be unpaid (or the DB was edited). Check it by hand.`,
+          { orderId: r.order_id, withdrawalId: r.withdrawal_id }, 'BURN_UNPAID');
+      }
+    }
+  }
+
+  private async _alertCritical(message: string, data: Record<string, unknown>, type: Alert['type'] = 'MANUAL_REVIEW_ORDERS'): Promise<void> {
     try {
       await new AlertDispatcher({ webhookUrl: this.config.alertWebhookUrl, emailTo: this.config.alertEmailTo }).dispatch({
-        level: 'critical', type: 'MANUAL_REVIEW_ORDERS', timestamp: new Date().toISOString(), message, data,
+        level: 'critical', type, timestamp: new Date().toISOString(), message, data,
       });
     } catch (err) {
       console.error('[payout-executor] alert dispatch failed:', err);

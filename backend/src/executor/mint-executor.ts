@@ -810,6 +810,12 @@ export class MintExecutor {
             { gnosisTxHash: row.gnosis_tx_hash, reason: 'tx reverted' },
           );
           console.warn(`[executor] executeMint reverted orderId=${row.order_id}`);
+          // (review round 11) FAILED is terminal and excluded from STUCK_ORDERS:
+          // without this the depositor is simply never paid, silently.
+          await this._alert({ level: 'critical', type: 'MINT_REVERTED',
+            message: `executeMint for order ${row.order_id} REVERTED on Gnosis (${row.gnosis_tx_hash}); the order is FAILED and ` +
+              `the deposit is unminted. Find out why (deadline, pause, nonce bump, cap) and re-queue or refund it by hand.`,
+            data: { orderId: row.order_id, gnosisTxHash: row.gnosis_tx_hash } });
           continue;
         }
 
