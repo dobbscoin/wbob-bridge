@@ -44,6 +44,8 @@ export type BurnVerdict =
 
 export interface BurnVerifierLike {
   verify(c: BurnClaim): Promise<BurnVerdict>;
+  /** What a finalized burn asked for; null = node can't say now; string = no such burn. */
+  readBurn?(withdrawalId: string, burnTxHash: string): Promise<{ amount: bigint; dest: string } | null | string>;
 }
 
 type Receipt = {
@@ -68,6 +70,35 @@ export class BurnVerifier implements BurnVerifierLike {
   constructor(private readonly config: BackendConfig, client?: BurnChainReader) {
     this.client = client ?? (createPublicClient({ chain: gnosis, transport: http(config.gnosisRpcUrl) }) as unknown as BurnChainReader);
     this.controllers = new Set([config.bridgeControllerAddress.toLowerCase()]);
+  }
+
+  /**
+   * (review round 12) What a burn actually asked for, read from our node:
+   * the one WithdrawalRequested log of the bridge for this withdrawalId in this
+   * tx, finalized. null = the node can't say right now; a string = it doesn't exist.
+   */
+  async readBurn(withdrawalId: string, burnTxHash: string): Promise<{ amount: bigint; dest: string } | null | string> {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(burnTxHash)) return 'not a tx hash';
+    let rc: Receipt;
+    let fin: bigint | null;
+    try {
+      rc = await this.client.getTransactionReceipt({ hash: burnTxHash as Hex });
+      fin = (await this.client.getBlock({ blockTag: 'finalized' })).number;
+    } catch (err) {
+      return (err as Error)?.name === 'TransactionReceiptNotFoundError' ? 'no such receipt on our node' : null;
+    }
+    if (fin === null || rc.blockNumber > fin) return null;
+    if (rc.status !== 'success') return 'burn tx reverted';
+    const found: { amount: bigint; dest: string }[] = [];
+    for (const log of rc.logs) {
+      if (!this.controllers.has(log.address.toLowerCase())) continue;
+      try {
+        const ev = decodeEventLog({ abi: [WITHDRAWAL_EVENT], topics: log.topics as [Hex, ...Hex[]], data: log.data });
+        const a = ev.args as { withdrawalId: bigint; amount: bigint; dobbscoinAddress: string };
+        if (a.withdrawalId.toString() === withdrawalId) found.push({ amount: a.amount, dest: a.dobbscoinAddress });
+      } catch { /* not ours */ }
+    }
+    return found.length === 1 ? found[0]! : `${found.length} matching WithdrawalRequested logs`;
   }
 
   async verify(c: BurnClaim): Promise<BurnVerdict> {

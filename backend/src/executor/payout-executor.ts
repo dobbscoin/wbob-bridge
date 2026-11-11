@@ -260,7 +260,7 @@ export class PayoutExecutor {
           if (has !== 'no') { blocked = `older tx ${t} for this payout: node says ${has ?? 'unreachable'}`; break; }
         }
         if (blocked !== null) {
-          if (blocked.endsWith('unreachable')) { console.warn(`[payout-executor] re-sign deferred orderId=${row.order_id}: ${blocked}`); continue; }
+          if (blocked.endsWith('unreachable')) { console.warn(`[payout-executor] re-sign deferred orderId=${row.order_id}: ${blocked}`); await this._noteDefer(row.order_id, blocked); continue; }
           await this._park(row.order_id, OutboundState.PAYOUT_QUEUED, `re-sign refused: ${blocked}`);
           continue;
         }
@@ -271,7 +271,7 @@ export class PayoutExecutor {
       // append-only audit trail and our node cannot be. Every payout ever signed
       // for this withdrawalId (on ANY order) must be unknown to the node.
       const alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [];
-      const seen = { maxAuditId: 0n };
+      const seen: { maxAuditId: bigint; ids?: Set<string> } = { maxAuditId: 0n };
       const paid = await this._alreadyPaidReason(row, alive, seen);
       if (paid !== null) {
         if (paid.defer) { console.warn(`[payout-executor] payout deferred orderId=${row.order_id}: ${paid.reason}`); await this._noteDefer(row.order_id, paid.reason); continue; }
@@ -295,7 +295,7 @@ export class PayoutExecutor {
       }
 
       try {
-        await this._buildAndSignPayout(row, alive, seen.maxAuditId);
+        await this._buildAndSignPayout(row, alive, seen.ids ?? new Set());
         this._clearDefer(row.order_id);
       } catch (err) {
         if (err instanceof EarlierPayoutBusyError) {
@@ -322,7 +322,7 @@ export class PayoutExecutor {
   private async _alreadyPaidReason(
     row: QueuedPayoutRow,
     alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [],
-    seen: { maxAuditId: bigint } = { maxAuditId: 0n },
+    seen: { maxAuditId: bigint; ids?: Set<string> } = { maxAuditId: 0n },
   ): Promise<{ defer: boolean; reason: string } | null> {
     if (row.withdrawal_id === null) return { defer: false, reason: 'no withdrawal_requests row for this order' };
     const W = row.withdrawal_id;
@@ -353,6 +353,7 @@ export class PayoutExecutor {
     // (review round 10 #2) A payout is identified ONLY by the hash of its own
     // signed bytes; the `txid` field of a row is a claim (the bridge role can
     // INSERT rows) and must agree with the bytes, or the row is a forgery.
+    seen.ids = new Set(signed.map((e) => e.id));
     for (const e of signed) if (BigInt(e.id) > seen.maxAuditId) seen.maxAuditId = BigInt(e.id);
     const hexOf = new Map<string, string>();
     const ids = new Set<string>();
@@ -398,6 +399,10 @@ export class PayoutExecutor {
           if (parentConfs === null) return { defer: true, reason: `node unreachable while checking the parent of ${i.txid}:${i.vout}` };
           if (parentConfs < 0) {
             return { defer: true, reason: `input ${i.txid}:${i.vout} of earlier payout ${t}: its parent tx is unknown to our node; waiting` };
+          }
+          if (parentConfs === 0 && !(await this.rpc.isInMempool(i.txid).catch(() => true))) {
+            // (review round 12) a parent left in a reorged-out block: its outputs don't exist right now
+            return { defer: true, reason: `input ${i.txid}:${i.vout} of earlier payout ${t}: its parent tx is not in the active chain; waiting` };
           }
           const spender = await this._knownSpender(i.txid, i.vout, [...hexOf.values()]);
           if (spender.kind === 'ok') { dead = true; continue; }
@@ -523,45 +528,105 @@ export class PayoutExecutor {
   }
   private _clearDefer(orderId: string): void { this.deferSince.delete(orderId); this.deferAlerted.delete(orderId); }
 
-  // (review round 11) Every withdrawal the DB calls done must have a payout our
-  // node has confirmed; a DB writer marking an unpaid burn COMPLETED/FAILED
-  // would otherwise hide it for good (terminal states are excluded from every
-  // other check). Every 6 h; one alert per withdrawal per process.
-  private lastPaidCheck = 0;
-  private readonly unpaidAlerted = new Set<string>();
+  /**
+   * (review rounds 11-12) Every burn the append-only trail recorded must be
+   * paid on-chain. Driven from ORDER_CREATED.withdrawalId audit rows (not the
+   * editable order state), it reads each burn's amount and destination from
+   * Gnosis (our node, finalized), and requires a confirmed Dobbscoin tx that pays
+   * exactly that amount to exactly that address, among the txs signed for that
+   * withdrawal (PAYOUT_SIGNED bytes, BROADCAST txids) or recorded as paid by
+   * hand (PAYOUT_SETTLED_BY_HAND {withdrawalId, txid}); one tx can't count for
+   * two withdrawals. Skipped: burns recorded < 24 h ago, orders in MANUAL_REVIEW
+   * (already alerted), and WITHDRAWAL_WAIVED {withdrawalId, reason} rows, each
+   * of which raises its own alert once so a forged waiver is still seen.
+   * Every 6 h; node trouble aborts the round silently and retries in 30 min;
+   * already-alerted withdrawals are remembered in bridge_state across restarts;
+   * more than 5 new at once become one summary alert.
+   */
+  private lastPaidCheck = Date.now() - 6 * 3600_000 + 10 * 60_000;   // first run 10 min after start
   async checkTerminalWithdrawalsPaid(): Promise<void> {
     if (Date.now() - this.lastPaidCheck < 6 * 3600_000) return;
     this.lastPaidCheck = Date.now();
-    const rows = await this.sql<{ order_id: string; state: string; withdrawal_id: string }[]>`
-      SELECT bo.id::text AS order_id, bo.state, wr.withdrawal_id::text AS withdrawal_id
-      FROM bridge_orders bo JOIN withdrawal_requests wr ON wr.order_id = bo.id
-      WHERE bo.order_type = 'outbound' AND bo.state IN ('COMPLETED', 'FAILED')
+    const retrySoon = () => { this.lastPaidCheck = Date.now() - 6 * 3600_000 + 30 * 60_000; };
+    const [st] = await this.sql<{ value: string }[]>`SELECT value FROM bridge_state WHERE key = 'burn_unpaid_alerted'`;
+    let alerted: Set<string>;
+    try { alerted = new Set(st ? (JSON.parse(st.value) as string[]) : []); } catch { alerted = new Set(); }
+    const created = await this.sql<{ withdrawal_id: string; burn_tx: string | null; order_id: string }[]>`
+      SELECT DISTINCT ON (a.metadata->>'withdrawalId') a.metadata->>'withdrawalId' AS withdrawal_id,
+             a.metadata->>'burnTxHash' AS burn_tx, a.order_id::text AS order_id
+      FROM audit_events a
+      WHERE a.event_type = 'ORDER_CREATED' AND a.metadata ? 'withdrawalId' AND a.created_at < now() - interval '24 hours'
+      ORDER BY a.metadata->>'withdrawalId', a.id
     `;
-    for (const r of rows) {
-      if (this.unpaidAlerted.has(r.withdrawal_id)) continue;
-      const signed = await this.sql<{ hex: string | null; txid: string | null }[]>`
+    const waivers = await this.sql<{ withdrawal_id: string; reason: string | null }[]>`
+      SELECT metadata->>'withdrawalId' AS withdrawal_id, metadata->>'reason' AS reason FROM audit_events WHERE event_type = 'WITHDRAWAL_WAIVED'`;
+    const waived = new Map(waivers.map((w) => [w.withdrawal_id, w.reason ?? '']));
+    const paidBy = new Map<string, string>();        // withdrawalId -> the confirmed tx that pays it
+    const claimants = new Map<string, Set<string>>(); // txid -> withdrawalIds it would pay
+    const unpaid: string[] = [];
+    const fresh: string[] = [];
+    for (const c of created) {
+      if (waived.has(c.withdrawal_id)) {
+        const k = `waived:${c.withdrawal_id}`;
+        if (!alerted.has(k)) {
+          alerted.add(k);
+          await this._alertCritical(`Withdrawal ${c.withdrawal_id} is WAIVED by an audit row (${waived.get(c.withdrawal_id)}): it will not be paid. ` +
+            `If nobody on the team wrote that row, the DB was tampered with.`, { withdrawalId: c.withdrawal_id }, 'BURN_UNPAID');
+        }
+        continue;
+      }
+      const [cur] = await this.sql<{ state: string }[]>`
+        SELECT bo.state FROM withdrawal_requests wr JOIN bridge_orders bo ON bo.id = wr.order_id WHERE wr.withdrawal_id = ${c.withdrawal_id}`;
+      if (cur?.state === OutboundState.MANUAL_REVIEW) continue;
+      if (!c.burn_tx) continue;
+      const burn = await this.burnVerifier.readBurn?.(c.withdrawal_id, c.burn_tx);
+      if (burn === null || burn === undefined) { retrySoon(); return; }
+      if (typeof burn === 'string') continue;                 // not a real burn (forged row): nothing to pay
+      const cands = await this.sql<{ hex: string | null; txid: string | null }[]>`
         SELECT metadata->>'signedHex' AS hex, metadata->>'txid' AS txid FROM audit_events a
-        WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_BROADCAST', 'PAYOUT_SENT_OUT_OF_STATE')
-          AND (a.metadata->>'withdrawalId' = ${r.withdrawal_id}
+        WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_BROADCAST', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_SETTLED_BY_HAND')
+          AND (a.metadata->>'withdrawalId' = ${c.withdrawal_id}
                OR a.order_id IN (SELECT o.order_id FROM audit_events o
-                                 WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${r.withdrawal_id}
-                                 UNION SELECT ${r.order_id}::uuid))
+                                 WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${c.withdrawal_id}))
       `;
       const ids = new Set<string>();
-      for (const e of signed) { try { if (e.hex) ids.add(txidFromRawHex(e.hex)); else if (e.txid) ids.add(e.txid.toLowerCase()); } catch { /* skip */ } }
-      let paid = false;
+      for (const e of cands) { try { if (e.hex) ids.add(txidFromRawHex(e.hex)); else if (e.txid) ids.add(e.txid.toLowerCase()); } catch { /* skip */ } }
+      let paidTx: string | null = null;
       for (const t of ids) {
-        const c = await this.rpc.getConfirmations(t).catch(() => null);
-        if (c === null) return;                     // node trouble: try again next round, no false alarm
-        if (c >= 1) { paid = true; break; }
+        let tx;
+        try { tx = await this.rpc.getRawTransactionVerbose(t); }
+        catch (err) { if (err instanceof RpcCallError && err.code === -5) continue; retrySoon(); return; }
+        if ((tx.confirmations ?? 0) < 1) continue;
+        const pays = tx.vout.some((o) => Math.round(o.value * 1e8) === Number(burn.amount)
+          && (o.scriptPubKey.address === burn.dest || (o.scriptPubKey.addresses ?? []).includes(burn.dest)));
+        if (!pays) continue;
+        paidTx = t;
+        break;
       }
-      if (!paid) {
-        this.unpaidAlerted.add(r.withdrawal_id);
-        await this._alertCritical(`Withdrawal ${r.withdrawal_id} (order ${r.order_id}) is ${r.state} but no payout for it is confirmed on our ` +
-          `Dobbscoin node: a burned withdrawal may be unpaid (or the DB was edited). Check it by hand.`,
-          { orderId: r.order_id, withdrawalId: r.withdrawal_id }, 'BURN_UNPAID');
+      if (paidTx) {
+        paidBy.set(c.withdrawal_id, paidTx);
+        if (!claimants.has(paidTx)) claimants.set(paidTx, new Set());
+        claimants.get(paidTx)!.add(c.withdrawal_id);
+      } else {
+        unpaid.push(c.withdrawal_id);
       }
     }
+    // One tx can pay only one withdrawal: if two claim the same tx, which one it
+    // really paid can't be told from the (forgeable) audit rows, so flag BOTH.
+    for (const [, ws] of claimants) if (ws.size > 1) for (const w of ws) unpaid.push(w);
+    for (const w of unpaid) if (!alerted.has(w)) { alerted.add(w); fresh.push(w); }
+    if (fresh.length > 0) {
+      const msg = fresh.length > 5
+        ? `${fresh.length} burned withdrawals have NO confirmed payout of the right amount to the right address on our Dobbscoin ` +
+          `node (first: ${fresh.slice(0, 5).join(', ')}). Check the node first (reindexing?), then the DB.`
+        : fresh.map((w) => `Withdrawal ${w} was burned on Gnosis but no confirmed Dobbscoin tx pays its amount to its address: ` +
+          `unpaid (or the DB was edited). Check it by hand.`).join(' | ');
+      await this._alertCritical(msg, { withdrawalIds: fresh.slice(0, 50) }, 'BURN_UNPAID');
+    }
+    await this.sql`
+      INSERT INTO bridge_state (key, value) VALUES ('burn_unpaid_alerted', ${JSON.stringify([...alerted])})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    `;
   }
 
   private async _alertCritical(message: string, data: Record<string, unknown>, type: Alert['type'] = 'MANUAL_REVIEW_ORDERS'): Promise<void> {
@@ -577,7 +642,7 @@ export class PayoutExecutor {
   private async _buildAndSignPayout(
     row: QueuedPayoutRow,
     alive: { txid: string; inputs: { txid: string; vout: number }[]; optional?: boolean }[] = [],
-    seenMaxAuditId: bigint = 0n,
+    seenIds: Set<string> = new Set(),
   ): Promise<void> {
     // Fetch available UTXOs
     const utxoRows = await this.sql<BridgeUtxoRow[]>`
@@ -644,16 +709,19 @@ export class PayoutExecutor {
       // (review round 11) One signer per withdrawal at a time, and nobody signed
       // for it since our already-paid check: else start over next poll.
       await tx`SELECT pg_advisory_xact_lock(hashtext(${'wbob-withdrawal:' + row.withdrawal_id}))`;
-      const [newer] = await tx<{ n: number }[]>`
-        SELECT count(*)::int AS n FROM audit_events a
-        WHERE a.id > ${seenMaxAuditId.toString()}
-          AND a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
+      // (review round 12) Compare the whole SET of rows, not "id > max seen":
+      // sequence ids are not handed out in commit order.
+      const nowRows = await tx<{ id: string }[]>`
+        SELECT a.id::text AS id FROM audit_events a
+        WHERE a.event_type IN ('PAYOUT_SIGNED', 'PAYOUT_SENT_OUT_OF_STATE', 'PAYOUT_BROADCAST')
           AND (a.metadata->>'withdrawalId' = ${row.withdrawal_id}
                OR a.order_id IN (SELECT o.order_id FROM audit_events o
                                  WHERE o.event_type = 'ORDER_CREATED' AND o.metadata->>'withdrawalId' = ${row.withdrawal_id}
                                  UNION SELECT ${row.order_id}::uuid))
       `;
-      if (newer && newer.n > 0) throw new UtxoRaceError(`a payout for withdrawalId ${row.withdrawal_id} was signed meanwhile`);
+      if (nowRows.some((r) => !seenIds.has(r.id))) {
+        throw new UtxoRaceError(`a payout for withdrawalId ${row.withdrawal_id} was signed meanwhile`);
+      }
       const rows = await tx<{ state: string }[]>`
         SELECT state FROM bridge_orders WHERE id = ${row.order_id} FOR UPDATE
       `;
@@ -1075,6 +1143,7 @@ export class PayoutExecutor {
   /** Park in MANUAL_REVIEW with a reason, logging instead of throwing. */
   private async _park(orderId: string, from: OutboundState, reason: string): Promise<void> {
     console.error(`[payout-executor] orderId=${orderId}: ${reason}`);
+    this._clearDefer(orderId);       // a re-queue starts its own wait clock
     try {
       await this._transitionOutbound(orderId, from, OutboundState.MANUAL_REVIEW, { error: reason });
     } catch (err) {

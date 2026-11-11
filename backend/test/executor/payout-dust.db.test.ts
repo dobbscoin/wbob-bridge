@@ -757,20 +757,59 @@ describe.skipIf(!URL)('PayoutExecutor dust / rejection handling (real Postgres)'
   });
 
   // ── Review round 11 (split, deploy 2): never silent ──────────────────────
-  it('a withdrawal marked COMPLETED with no confirmed payout raises BURN_UNPAID; a paid one does not', async () => {
-    const { orderId: unpaid } = await order(OutboundState.COMPLETED, 200_000n);
-    const { orderId: paidOrder } = await order(OutboundState.COMPLETED, 300_000n);
-    const hex = minimalSpend(rnd(32), 0);
+  it('BURN_UNPAID (round 12): every old burn needs a confirmed tx paying ITS amount to ITS address', async () => {
+    await sql`DELETE FROM bridge_state WHERE key = 'burn_unpaid_alerted'`;
+    const dest = ADDR;
+    const mkBurn = async (w: string) => {
+      const [o] = await sql<{ id: string }[]>`
+        INSERT INTO bridge_orders (order_type, state, user_gnosis_address, user_dobbscoin_address, amount_sat)
+        VALUES ('outbound', 'COMPLETED', ${'0x' + '2'.repeat(40)}, ${dest}, 200000) RETURNING id`;
+      await sql`INSERT INTO withdrawal_requests (order_id, withdrawal_id, sender_address, dobbscoin_address, amount_sat, user_nonce)
+                VALUES (${o!.id}, ${w}, ${'0x' + '2'.repeat(40)}, ${dest}, 200000, 0)`;
+      await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata, created_at)
+                VALUES (${o!.id}, 'ORDER_CREATED', 'WITHDRAW_REQUEST_CREATED', 'BURN_TX_SEEN', 'gnosis-watcher',
+                        ${sql.json({ withdrawalId: w, burnTxHash: '0x' + rnd(32) })}, now() - interval '2 days')`;
+      return o!.id;
+    };
+    const wPaid = BigInt('0x' + rnd(7)).toString(), wWrong = BigInt('0x' + rnd(7)).toString(),
+          wNone = BigInt('0x' + rnd(7)).toString(), wWaived = BigInt('0x' + rnd(7)).toString(), wReuse = BigInt('0x' + rnd(7)).toString();
+    const oPaid = await mkBurn(wPaid), oWrong = await mkBurn(wWrong), oNone = await mkBurn(wNone), oWaived = await mkBurn(wWaived), oReuse = await mkBurn(wReuse);
+    const good = minimalSpend(rnd(32), 0), wrong = minimalSpend(rnd(32), 1);
     await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
-              VALUES (${paidOrder}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ txid: txidFromRawHex(hex), signedHex: hex })})`;
-    const ex = executor(async () => 'x', { getConfirmations: async (t) => (t === txidFromRawHex(hex) ? 12 : -1) }) as unknown as
-      { checkTerminalWithdrawalsPaid(): Promise<void>; _alertCritical: (m: string, d: Record<string, unknown>, ty?: string) => Promise<void> };
-    const got: { type: string | undefined; data: Record<string, unknown> }[] = [];
-    ex._alertCritical = async (_m, d, ty) => { got.push({ type: ty, data: d }); };
+              VALUES (${oPaid}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ withdrawalId: wPaid, signedHex: good })})`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${oWrong}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ withdrawalId: wWrong, signedHex: wrong })})`;
+    // a forged row tries to justify wReuse with wPaid's (genuinely confirmed) payout
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${oReuse}, 'PAYOUT_SIGNED', 'PAYOUT_QUEUED', 'PAYOUT_SIGNED', 'payout-executor', ${sql.json({ withdrawalId: wReuse, signedHex: good })})`;
+    await sql`INSERT INTO audit_events (order_id, event_type, from_state, to_state, actor, metadata)
+              VALUES (${oWaived}, 'WITHDRAWAL_WAIVED', 'COMPLETED', 'COMPLETED', 'operator', ${sql.json({ withdrawalId: wWaived, reason: 're-minted' })})`;
+    const verbose = (t: string) => {
+      const pay = t === txidFromRawHex(good) ? dest : t === txidFromRawHex(wrong) ? '1BoatSLRHtKNngkdXEeobR76b53LETtpyT' : null;
+      if (!pay) throw new RpcCallError('getrawtransaction', -5, 'nope');
+      return { txid: t, confirmations: 9, vin: [], vout: [{ value: 0.002, n: 0, scriptPubKey: { hex: '', type: 'pubkeyhash', addresses: [pay] } }] };
+    };
+    const ex = executor(async () => 'x', {
+      getRawTransactionVerbose: async (t) => verbose(t),
+      burn: { verify: async () => ({ ok: true as const }), readBurn: async () => ({ amount: 200_000n, dest }) },
+    }) as unknown as { checkTerminalWithdrawalsPaid(): Promise<void>; lastPaidCheck: number;
+                       _alertCritical: (m: string, d: Record<string, unknown>, ty?: string) => Promise<void> };
+    const got: { m: string; d: Record<string, unknown> }[] = [];
+    ex._alertCritical = async (m, d) => { got.push({ m, d }); };
+    ex.lastPaidCheck = 0;
     await ex.checkTerminalWithdrawalsPaid();
-    const ids = got.filter((g) => g.type === 'BURN_UNPAID').map((g) => g.data['orderId']);
-    expect(ids).toContain(unpaid);
-    expect(ids).not.toContain(paidOrder);
+    const flagged = got.flatMap((g) => (g.d['withdrawalIds'] as string[] | undefined) ?? []);
+    expect(flagged).toContain(wWrong);      // a tx exists but pays someone else
+    expect(flagged).toContain(wNone);       // nothing at all
+    expect(flagged).toContain(wReuse);      // claims the same tx as wPaid: ambiguous, both flagged
+    expect(flagged).toContain(wPaid);
+    expect(got.some((g) => g.d['withdrawalId'] === wWaived && /WAIVED/.test(g.m))).toBe(true);
+    // a second round (e.g. after a restart) does not repeat them
+    got.length = 0;
+    ex.lastPaidCheck = 0;
+    await ex.checkTerminalWithdrawalsPaid();
+    expect(got.flatMap((g) => (g.d['withdrawalIds'] as string[] | undefined) ?? [])).toEqual([]);
+    expect(oPaid && oNone).toBeTruthy();
   });
 
   it('a payout waiting over an hour raises one PAYOUT_DEFERRED alert', async () => {

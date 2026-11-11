@@ -40,7 +40,8 @@ export class SolvencyMonitor {
   /** Last verdict from a poll that actually read the chain. Stale polls do not touch it. */
   private lastKnownSolvent: boolean | null = null;
   /** Epoch-ms of the last dispatch per alert type (for cooldown). */
-  private readonly alertCooldowns = new Map<AlertType, number>();
+  /** Keyed by type AND level, so a warning never mutes its escalation to critical. */
+  private readonly alertCooldowns = new Map<string, number>();
   /** MANUAL_REVIEW count at the last successful read (null = not read yet). */
   private lastManualReviewCount: number | null = null;
 
@@ -340,11 +341,11 @@ export class SolvencyMonitor {
 
     const now = Date.now();
     for (const alert of alerts) {
-      const lastFired = this.alertCooldowns.get(alert.type) ?? 0;
+      const lastFired = this.alertCooldowns.get(`${alert.type}:${alert.level}`) ?? 0;
       // A NEW order entering MANUAL_REVIEW is news; don't sit on it for a cooldown.
       const bypass = alert.type === 'MANUAL_REVIEW_ORDERS' && manualReviewRose;
       if (bypass || now - lastFired >= this.config.alertCooldownMs) {
-        this.alertCooldowns.set(alert.type, now);
+        this.alertCooldowns.set(`${alert.type}:${alert.level}`, now);
         await this.dispatcher.dispatch(alert);
       }
     }
@@ -384,13 +385,18 @@ export class SolvencyMonitor {
     const tip = await this.rpc.call<number>('getblockcount');
     const rows = await this.sql<{ watcher_id: string; block_height: number; updated_at: Date }[]>`
       SELECT watcher_id, block_height, updated_at FROM watcher_cursors`;
-    const LAG_BLOCKS = 30, STALE_MS = 3600_000;
-    const behind = rows.filter((r) => tip - r.block_height > LAG_BLOCKS || Date.now() - r.updated_at.getTime() > STALE_MS);
-    const current = rows.length - behind.length;
+    // (review round 12) Judge by height against OUR tip, not wall-clock: a
+    // cursor only moves when a block arrives, so a quiet Dobbscoin chain (hour-
+    // long gaps happen) made every watcher look "stale". A row untouched for 7
+    // days is a retired watcher id, not a watcher.
+    const LAG_BLOCKS = 30, RETIRED_MS = 7 * 86_400_000;
+    const live = rows.filter((r) => Date.now() - r.updated_at.getTime() < RETIRED_MS || tip - r.block_height <= LAG_BLOCKS);
+    const behind = live.filter((r) => tip - r.block_height > LAG_BLOCKS);
+    const current = live.length - behind.length;
     if (behind.length === 0 && current >= 3) return [];
     return [{
       level: current < 3 ? 'critical' : 'warning', type: 'WATCHER_LAG', timestamp: checkedAt,
-      message: `${behind.length} watcher(s) behind or stale (tip ${tip}): ` +
+      message: `${behind.length} watcher(s) behind (tip ${tip}): ` +
         behind.map((r) => `${r.watcher_id.slice(0, 10)}… at ${r.block_height}, updated ${Math.round((Date.now() - r.updated_at.getTime()) / 60000)} min ago`).join('; ') +
         `. ${current} current${current < 3 ? ' — fewer than 3: deposits will NOT mint' : ''}.`,
       data: { tip, current, behind: behind.map((r) => r.watcher_id) },

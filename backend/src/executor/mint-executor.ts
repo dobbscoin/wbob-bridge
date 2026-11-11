@@ -200,6 +200,8 @@ export function describeRevert(err: unknown): { name: string | null; text: strin
 
 export class MintExecutor {
   private readonly publicClient;
+  /** Our own node only: mint verdicts never come from a public fallback. */
+  private readonly primaryClient;
   private readonly walletClient;
   private readonly account;
   private readonly capReader: MintCapReader;
@@ -219,6 +221,7 @@ export class MintExecutor {
       // node going down. Writers stay pinned to gnosisRpcUrl — see config.ts.
       transport: fallback(config.gnosisRpcUrls.map((u) => http(u))),
     });
+    this.primaryClient = createPublicClient({ chain: gnosis, transport: http(config.gnosisRpcUrl) });
     this.walletClient = createWalletClient({
       account: this.account,
       chain: gnosis,
@@ -793,13 +796,23 @@ export class MintExecutor {
         AND mr.gnosis_tx_hash IS NOT NULL
     `;
 
+    // (review round 12) The verdict comes from OUR node (not the public
+    // fallbacks), and only once the receipt's block is finalized: otherwise a
+    // reorged-out or misreported mint could be marked COMPLETED (or FAILED).
+    let finalized: bigint | null = null;
+    if (submitted.length > 0) {
+      try { finalized = (await this.primaryClient.getBlock({ blockTag: 'finalized' })).number ?? null; }
+      catch { finalized = null; }
+      if (finalized === null) return;                  // can't tell: try again next poll
+    }
     for (const row of submitted) {
       try {
-        const receipt = await this.publicClient.getTransactionReceipt({
+        const receipt = await this.primaryClient.getTransactionReceipt({
           hash: row.gnosis_tx_hash as ViemHex,
         }).catch(() => null);
 
-        if (receipt === null) continue; // not yet mined
+        if (receipt === null) continue; // not yet mined (or not on our node yet)
+        if (finalized !== null && receipt.blockNumber > finalized) continue;   // wait for finality
 
         if (receipt.status === 'reverted') {
           // executeMint reverted — mark FAILED
