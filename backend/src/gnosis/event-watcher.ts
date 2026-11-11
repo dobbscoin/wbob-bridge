@@ -162,7 +162,22 @@ export class GnosisEventWatcher {
    * then "succeeds" with nothing new. One critical alert when its newest block
    * is more than 5 min old (Gnosis makes one every ~5 s); re-armed when fresh.
    */
+  private finalityLagAlerted = false;
   private async _checkHead(): Promise<void> {
+    // (review round 12) Ingestion now stops at `finalized`: if Gnosis stops
+    // finalizing (or our node's consensus side stalls) while `latest` moves,
+    // every scan "succeeds" with nothing new. Alert when the gap passes ~200
+    // blocks (normal: ~40), re-armed when it closes.
+    try {
+      const [lat, fin] = await Promise.all([this.publicClient.getBlockNumber(), this.publicClient.getBlock({ blockTag: 'finalized' })]);
+      const gap = fin.number === null || fin.number === undefined ? null : lat - fin.number;
+      if (gap !== null && gap <= 200n) this.finalityLagAlerted = false;
+      else if (!this.finalityLagAlerted) {
+        this.finalityLagAlerted = true;
+        await this._alert(`Gnosis finality is ${gap ?? '?'} blocks behind the tip on our node (normal ~40): withdrawals are not ` +
+          `being ingested or paid until it catches up.`, { gap: gap?.toString() ?? null });
+      }
+    } catch { /* unreachable: the scan-stall alert covers it */ }
     let ts: bigint;
     try { ts = (await this.publicClient.getBlock({ blockTag: 'latest' })).timestamp; }
     catch { return; }                                  // unreachable: the scan-stall alert covers it

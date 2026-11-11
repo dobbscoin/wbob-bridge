@@ -194,6 +194,13 @@ export function createBlockHandlers(
           });
           console.log(`[watcher] first-sight orderId=${deposit.order_id} txid=${match.txid} height=${block.height}`);
         } catch (err) {
+          // (review round 12) The UNIQUE outpoint index (migration 015) losing a
+          // race to another watcher means "already recorded", not a failure:
+          // holding the cursor for it would stall this watcher until a restart.
+          if ((err as { code?: string })?.code === '23505') {
+            console.warn(`[watcher] first-sight txid=${match.txid}:${match.vout} already recorded by another watcher`);
+            continue;
+          }
           complete = false;
           console.error(`[watcher] first-sight error txid=${match.txid}:`, err);
         }

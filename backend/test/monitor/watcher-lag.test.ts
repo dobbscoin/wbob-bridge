@@ -22,9 +22,16 @@ describe('watcher lag alerts', () => {
     expect(a[0]!.level).toBe('warning');
     expect(a[0]!.type).toBe('WATCHER_LAG');
   });
-  it('fewer than 3 current (stale updates count as behind) is critical', async () => {
-    const a = await monitor([w('a', 1000), w('b', 900), w('c', 1000, 120), w('d', 800), w('e', 1000)], 1000).watcherLagAlerts('t');
+  it('a quiet chain (all at the tip, no update for hours) is NOT an alert (round 12)', async () => {
+    expect(await monitor([w('a', 1000, 180), w('b', 1000, 180), w('c', 1000, 180), w('d', 1000, 180), w('e', 1000, 180)], 1000)
+      .watcherLagAlerts('t')).toEqual([]);
+  });
+  it('fewer than 3 current by HEIGHT is critical', async () => {
+    const a = await monitor([w('a', 1000), w('b', 900), w('c', 960), w('d', 800), w('e', 1000)], 1000).watcherLagAlerts('t');
     expect(a[0]!.level).toBe('critical');
     expect(a[0]!.message).toMatch(/will NOT mint/);
+  });
+  it('a retired watcher id (untouched for 7+ days, far behind) is ignored', async () => {
+    expect(await monitor([w('a', 1000), w('b', 1000), w('c', 1000), w('old', 500, 8 * 24 * 60)], 1000).watcherLagAlerts('t')).toEqual([]);
   });
 });
