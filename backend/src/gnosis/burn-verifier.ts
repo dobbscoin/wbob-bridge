@@ -54,12 +54,13 @@ type Receipt = {
 export interface BurnChainReader {
   getTransactionReceipt(a: { hash: Hex }): Promise<Receipt>;
   getBlockNumber(): Promise<bigint>;
+  getBlock(a: { blockTag: 'finalized' }): Promise<{ number: bigint | null }>;
 }
 
 export class BurnVerifier implements BurnVerifierLike {
   private readonly client: BurnChainReader;
   private readonly controllers: Set<string>;
-  /** withdrawalId -> first time our caught-up node said "no such receipt" (review round 6 #5). */
+  /** withdrawalId -> first time our caught-up node said "no such receipt". */
   private readonly notFoundSince = new Map<string, number>();
   /** "Does not exist" only after the node, caught up past the burn, says so for this long. */
   notFoundGraceMs = 10 * 60_000;
@@ -84,9 +85,9 @@ export class BurnVerifier implements BurnVerifierLike {
       ]);
     } catch (err) {
       const msg = String((err as Error)?.message ?? err);
-      // Only viem's own "receipt not found" is evidence, and only from a node that
-      // is past the burn's block, repeatedly: a lagging or resyncing node (or a
-      // proxy's 404 page) must defer, never cry tampering.
+      // (review round 11; ported from the V2 branch's round-6 fix) Only viem's
+      // own "receipt not found" is evidence, and only from a node past the
+      // burn's block, repeatedly: a lagging/resyncing node or a proxy 404 defers.
       if ((err as Error)?.name !== 'TransactionReceiptNotFoundError') {
         return { ok: false, defer: true, reason: `Gnosis node unreachable for burn check: ${msg.slice(0, 160)}` };
       }
@@ -130,6 +131,13 @@ export class BurnVerifier implements BurnVerifierLike {
     const depth = tip - rc.blockNumber + 1n;
     if (depth < BigInt(this.config.gnosisConfirmationDepth)) {
       return { ok: false, defer: true, reason: `burn only ${depth} block(s) deep (need ${this.config.gnosisConfirmationDepth})` };
+    }
+    // (review round 11) and finalized: a reorg can no longer remove it.
+    let fin: bigint | null;
+    try { fin = (await this.client.getBlock({ blockTag: 'finalized' })).number; }
+    catch { return { ok: false, defer: true, reason: 'Gnosis node unreachable for the finalized block' }; }
+    if (fin === null || rc.blockNumber > fin) {
+      return { ok: false, defer: true, reason: `burn block ${rc.blockNumber} is not finalized yet (finalized: ${fin ?? '?'})` };
     }
     return { ok: true };
   }

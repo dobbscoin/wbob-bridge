@@ -17,10 +17,11 @@ function log(o: { id?: bigint; amount?: bigint; dest?: string; address?: string;
     data: encodeAbiParameters([{ type: 'uint256' }, { type: 'string' }, { type: 'uint256' }], [o.amount ?? 500_000n, o.dest ?? ADDR, 0n]),
   };
 }
-function reader(r: { status?: 'success' | 'reverted'; logs?: ReturnType<typeof log>[]; block?: bigint; tip?: bigint; err?: Error } = {}): BurnChainReader {
+function reader(r: { status?: 'success' | 'reverted'; logs?: ReturnType<typeof log>[]; block?: bigint; tip?: bigint; err?: Error; finalized?: bigint | null } = {}): BurnChainReader {
   return {
     getTransactionReceipt: async () => { if (r.err) throw r.err; return { status: r.status ?? 'success', blockNumber: r.block ?? 100n, logs: r.logs ?? [log()] }; },
     getBlockNumber: async () => r.tip ?? 200n,
+    getBlock: async () => ({ number: r.finalized === undefined ? (r.tip ?? 200n) : r.finalized }),
   };
 }
 const claim = { withdrawalId: '7', burnTxHash: HASH as string | null, senderAddress: SENDER, amountSat: 500_000n, dobbscoinAddress: ADDR };
@@ -42,7 +43,7 @@ describe('BurnVerifier', () => {
     const lagging = new BurnVerifier(config, reader({ err: notFound(), tip: 105n }));
     expect(await lagging.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });
     const caughtUp = new BurnVerifier(config, reader({ err: notFound(), tip: 500n }));
-    expect(await caughtUp.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });   // first sighting
+    expect(await caughtUp.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });
     caughtUp.notFoundGraceMs = 0;
     expect(await caughtUp.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: false });
   });
@@ -50,6 +51,10 @@ describe('BurnVerifier', () => {
     const r = new BurnVerifier(config, reader({ err: new Error('HTTP request failed. Status: 404 Not Found'), tip: 500n }));
     r.notFoundGraceMs = 0;
     expect(await r.verify({ ...claim, burnBlockNumber: 100n })).toMatchObject({ ok: false, defer: true });
+  });
+  it('a deep but not yet finalized burn defers', async () => {
+    expect(await v({ block: 100n, tip: 200n, finalized: 90n })).toMatchObject({ ok: false, defer: true });
+    expect(await v({ block: 100n, tip: 200n, finalized: 150n })).toEqual({ ok: true });
   });
   it('defers (does not refuse) when the node is unreachable or the burn is shallow', async () => {
     expect(await v({ err: new Error('fetch failed') })).toMatchObject({ ok: false, defer: true });

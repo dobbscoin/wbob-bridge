@@ -103,6 +103,11 @@ class MockPublicClient {
   }
 
   async getBlockNumber(): Promise<bigint> { return this.blockNumber; }
+  /** finalized defaults to the tip (no extra lag) unless a test sets it. */
+  finalized: bigint | null = null;
+  async getBlock(_a?: unknown): Promise<{ number: bigint; timestamp: bigint }> {
+    return { number: this.finalized ?? this.blockNumber, timestamp: BigInt(Math.floor(Date.now() / 1000)) };
+  }
   async getLogs(params: { fromBlock: bigint; toBlock: bigint; address?: unknown }): Promise<FakeLog[]> {
     this.getLogsCalls.push({ fromBlock: params.fromBlock, toBlock: params.toBlock });
     this.getLogsAddresses.push(params.address);
@@ -647,3 +652,19 @@ describe('GnosisEventWatcher recount: daily full pass', () => {
     expect(sent.some((m) => /missing from the database/.test(m))).toBe(true);
   });
 });
+
+// ─── review round 11 (deploy 3): never past the finalized block ─────────────
+describe('GnosisEventWatcher: finality', () => {
+  it('the scan stops at the finalized block even when tip − depth is higher', async () => {
+    const config = makeConfig();
+    const mock = new MockPublicClient();
+    mock.setBlockNumber(300_000n);
+    mock.finalized = 299_950n;                              // 50 behind; tip − 12 would be 299_988
+    await setLastBlock(299_900n);
+    const w = makeWatcher(config, mock);
+    await (w as unknown as { processNewWithdrawals(): Promise<void> }).processNewWithdrawals();
+    expect(mock.getLogsCalls.every((c) => c.toBlock <= 299_950n)).toBe(true);
+    expect(await getState('gnosis_last_block')).toBe('299950');
+  });
+});
+
