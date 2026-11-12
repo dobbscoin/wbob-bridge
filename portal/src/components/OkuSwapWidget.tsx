@@ -1,7 +1,6 @@
 'use client';
 
 import { WBOB_ADDRESS } from '@/lib/contracts';
-import { WXDAI_ADDRESS } from '@/lib/onboarding';
 
 /**
  * Oku.trade launcher (NOT an iframe — Oku's CSP `frame-ancestors` only
@@ -13,7 +12,7 @@ import { WXDAI_ADDRESS } from '@/lib/onboarding';
  * preselected on Gnosis.
  */
 export function OkuSwapWidget() {
-  const inToken = WXDAI_ADDRESS;
+  const inToken = '0x0000000000000000000000000000000000000000'; // native xDAI (Oku sells plain xDAI, wraps it itself)
   const outToken = WBOB_ADDRESS || '';
   const href = `https://oku.trade/swap?inputChain=gnosis&inToken=${inToken}&outToken=${outToken}`;
 
@@ -21,10 +20,10 @@ export function OkuSwapWidget() {
     <div className="card space-y-3">
       <div>
         <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">
-          Trade WXDAI → wBOB · via Oku
+          Trade xDAI → wBOB · via Oku
         </h2>
         <p className="mt-1 text-xs text-gray-500">
-          The other direction. Trade WXDAI back into wBOB through Oku&rsquo;s
+          The other direction. Buy wBOB with plain xDAI through Oku&rsquo;s
           aggregated routes on Gnosis.
         </p>
       </div>
@@ -39,7 +38,7 @@ export function OkuSwapWidget() {
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src="/oku-trade.png"
-          alt="Oku swap box: sell WXDAI, buy wBOB. Click to open Oku.trade."
+          alt="Oku swap box: sell xDAI, buy wBOB. Click to open Oku.trade."
           width={455}
           height={620}
           className="block w-full h-auto"

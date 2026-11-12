@@ -233,9 +233,8 @@ export default function TestBedPage() {
           </div>
           <ul className="text-xs text-gray-400 space-y-1">
             <li>• CoW Swap — wBOB → xDAI</li>
-            <li>• Oku — WXDAI → wBOB</li>
+            <li>• Oku — xDAI → wBOB</li>
             <li>• Both need xDAI for gas (see below).</li>
-            <li>• WXDAI is xDAI wrapped for the pools. Gas, the drip and the Codex are all plain xDAI.</li>
           </ul>
           <p className="text-xs text-bob-400 group-hover:underline">
             Trade page →

@@ -8,7 +8,6 @@ import { TradeNotice } from '@/components/TradeNotice';
 import { EmptyMarketNotice } from '@/components/EmptyMarketNotice';
 import { CopyAddress } from '@/components/CopyAddress';
 import { WBOB_ADDRESS } from '@/lib/contracts';
-import { WXDAI_ADDRESS } from '@/lib/onboarding';
 
 export default function TradePage() {
   return (
@@ -22,7 +21,7 @@ export default function TradePage() {
         </h1>
         <p className="text-sm text-gray-400">
           Swap wBOB on Gnosis. CoW Swap runs right on this page (wBOB → plain xDAI)
-          and Oku opens in a new tab (WXDAI → wBOB). Every wBOB pool they trade
+          and Oku opens in a new tab (plain xDAI → wBOB). Every wBOB pool they trade
           against is ours, and so is the 1% pool fee.
         </p>
         <p className="text-xs text-gray-500">
@@ -52,9 +51,6 @@ export default function TradePage() {
             <span>• Verify the token addresses in your wallet before signing —</span>
             <span className="inline-flex items-center gap-1">
               wBOB <CopyAddress address={WBOB_ADDRESS} label="wBOB token address" />
-            </span>
-            <span className="inline-flex items-center gap-1">
-              WXDAI <CopyAddress address={WXDAI_ADDRESS} label="WXDAI token address" />
             </span>
           </li>
           <li>• You need a little xDAI for gas. CoW Swap needs it once, to approve wBOB. Oku needs it on every swap. If you have none, check the gas-drip status on the home page or use the public Gnosis faucet.</li>
