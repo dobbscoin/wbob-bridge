@@ -56,6 +56,8 @@ interface PendingMintRow {
   deposit_address:  string;
   hd_index:         number | null;
   deposit_value_sat: bigint | null;
+  registered_recipient: string | null;
+  registered_deposit_address: string | null;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -174,10 +176,13 @@ async function main(): Promise<void> {
         sd.source_chain_name,
         sd.deposit_address,
         sd.hd_index,
-        sd.amount_sat AS deposit_value_sat
+        sd.amount_sat AS deposit_value_sat,
+        da.recipient_gnosis_address AS registered_recipient,
+        da.dobbscoin_address        AS registered_deposit_address
       FROM mint_requests mr
       JOIN bridge_orders bo  ON bo.id = mr.order_id
       JOIN source_deposits sd ON sd.order_id = mr.order_id
+      LEFT JOIN deposit_addresses da ON da.hd_index = sd.hd_index
       WHERE bo.state = ${InboundState.MINT_AUTH_CREATED}
         AND mr.signature_count < 3
     `;

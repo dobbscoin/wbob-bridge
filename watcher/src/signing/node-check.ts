@@ -13,11 +13,13 @@
  *     about to be authorized (a daily-cap split mints less than the deposit)
  *   - the depositId in the row is exactly what computeDepositId gives for the
  *     node's view of that output plus the row's recipient
- *
- * NOT covered: a DB writer can still pair a real output with a different
- * recipient and a matching freshly computed depositId. The contract keys replay
- * protection on depositId only, so that needs a controller that also records
- * (sourceTxHash, sourceVout). Rebuild item.
+ *   - (2026-11-12, watcher split) the recipient about to be authorized is the one
+ *     registered for this deposit address in deposit_addresses (row keyed by
+ *     hd_index, whose dobbscoin_address must be the recorded deposit address).
+ *     Watchers on other boxes get INSERT on bridge_orders/source_deposits, so a
+ *     compromised one could otherwise record a real deposit with its own
+ *     recipient and a matching fresh depositId. This holds only while NO watcher
+ *     login can write deposit_addresses (only the backend API inserts there).
  */
 
 import { computeDepositId } from '../deposits/deposit-id.js';
@@ -43,6 +45,10 @@ export interface MintCheckRow {
    * must be >= minHeight, unless "txid:vout" is in allowed.
    */
   cutover_floor?: { minHeight: number; allowed: Set<string>; depositHeight: number | null } | null;
+  /** deposit_addresses.recipient_gnosis_address for this row's hd_index (null = no such row). */
+  registered_recipient: string | null;
+  /** deposit_addresses.dobbscoin_address for this row's hd_index (null = no such row). */
+  registered_deposit_address: string | null;
 }
 
 export function checkMintAgainstNode(
@@ -64,6 +70,15 @@ export function checkMintAgainstNode(
   if (row.expected_deposit_address === null) return 'cannot derive the bridge address for this row (no hd_index?)';
   if (row.deposit_address !== row.expected_deposit_address) {
     return `recorded deposit address ${row.deposit_address} is not the bridge's address ${row.expected_deposit_address} at this hd_index`;
+  }
+  if (row.registered_recipient === null || row.registered_deposit_address === null) {
+    return `no deposit_addresses row for this hd_index: no registered recipient to check ${row.recipient_address} against`;
+  }
+  if (row.registered_deposit_address !== row.deposit_address) {
+    return `deposit_addresses row for this hd_index is ${row.registered_deposit_address}, not the recorded ${row.deposit_address}`;
+  }
+  if (!sameEvmAddress(row.recipient_address, row.registered_recipient)) {
+    return `recipient ${row.recipient_address} is not the recipient registered for ${row.deposit_address} (${row.registered_recipient})`;
   }
   const out = st.outputs?.find((o) => o.n === row.vout);
   if (out === undefined) return `tx has no output ${row.vout}`;
@@ -97,4 +112,10 @@ export function checkMintAgainstNode(
     return `depositId ${row.deposit_id_hex} does not match the node's output (expected ${expected})`;
   }
   return null;
+}
+
+/** Same 20-byte EVM address, ignoring checksum case. Anything malformed is never equal. */
+function sameEvmAddress(a: string, b: string): boolean {
+  const ok = (x: string) => /^0x[0-9a-fA-F]{40}$/.test(x);
+  return ok(a) && ok(b) && a.toLowerCase() === b.toLowerCase();
 }

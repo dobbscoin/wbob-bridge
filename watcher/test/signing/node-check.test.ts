@@ -20,7 +20,7 @@ function row(over: Partial<MintCheckRow> = {}): MintCheckRow {
   return {
     txid: TXID, vout: 0, deposit_address: ADDR, source_chain_name: 'dobbscoin-mainnet',
     recipient_address: RECIPIENT, amount_sat: 100_000_000n, deposit_id_hex: id(RECIPIENT),
-    expected_deposit_address: ADDR, ...over,
+    expected_deposit_address: ADDR, registered_recipient: RECIPIENT, registered_deposit_address: ADDR, ...over,
   };
 }
 
@@ -71,7 +71,8 @@ describe('checkMintAgainstNode', () => {
   });
 
   it('refuses a recipient swapped without updating the depositId', () => {
-    expect(checkMintAgainstNode(row({ recipient_address: OTHER }), node(), FINAL)).toMatch(/does not match/);
+    // (registered recipient also OTHER, so this exercises the depositId check, not the registry one)
+    expect(checkMintAgainstNode(row({ recipient_address: OTHER, registered_recipient: OTHER }), node(), FINAL)).toMatch(/does not match/);
   });
 
   it('refuses a depositId computed for a bigger output than the node shows', () => {
@@ -114,5 +115,27 @@ describe('checkMintAgainstNode', () => {
   });
   it('V2 floor: an unknown deposit height is a refusal, never a pass', () => {
     expect(checkMintAgainstNode(row({ cutover_floor: floor(null) }), node(), FINAL)).toMatch(/block height/);
+  });
+
+  // ── 2026-11-12 watcher split: recipient must be the address's registered one ──
+  it('refuses a real deposit re-paired with another recipient and a freshly computed depositId', () => {
+    // A DB writer records the real output, its own recipient, and the depositId that matches them.
+    expect(checkMintAgainstNode(row({ recipient_address: OTHER, deposit_id_hex: id(OTHER) }), node(), FINAL))
+      .toMatch(/not the recipient registered/);
+  });
+  it('signs when the registered recipient differs only in checksum case', () => {
+    expect(checkMintAgainstNode(row({ registered_recipient: RECIPIENT.toLowerCase() }), node(), FINAL)).toBeNull();
+    expect(checkMintAgainstNode(row({ registered_recipient: RECIPIENT.toUpperCase().replace('0X', '0x') }), node(), FINAL)).toBeNull();
+  });
+  it('refuses when there is no deposit_addresses row for the hd_index', () => {
+    expect(checkMintAgainstNode(row({ registered_recipient: null, registered_deposit_address: null }), node(), FINAL))
+      .toMatch(/no deposit_addresses row/);
+  });
+  it('refuses when the deposit_addresses row is for a different address', () => {
+    expect(checkMintAgainstNode(row({ registered_deposit_address: '1SomeOtherAddrxxxxxxxxxxxxxxxxxx' }), node(), FINAL))
+      .toMatch(/deposit_addresses row for this hd_index is/);
+  });
+  it('a malformed registered recipient never matches', () => {
+    expect(checkMintAgainstNode(row({ registered_recipient: 'dead' }), node(), FINAL)).toMatch(/not the recipient registered/);
   });
 });
