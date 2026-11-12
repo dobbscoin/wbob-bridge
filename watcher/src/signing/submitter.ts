@@ -2,7 +2,8 @@
  * Signature submitter.
  *
  * Atomically appends this watcher's EIP-712 signature to the mint_requests row.
- * Uses SELECT FOR UPDATE so concurrent watchers can't double-append the same signer.
+ * SELECT FOR UPDATE inside one transaction, so concurrent watchers neither
+ * double-append the same signer nor overwrite each other's signatures.
  *
  * deposit_id is stored as BYTEA in Postgres; we convert from/to Hex strings here.
  */
@@ -51,34 +52,39 @@ export class SignatureSubmitter {
 
     const depositIdBuf = hexToBuffer(depositId);
 
-    const rows = await this.sql<Row[]>`
-      SELECT signatures
-      FROM mint_requests
-      WHERE deposit_id = ${depositIdBuf}
-      FOR UPDATE
-    `;
+    // One transaction, so the FOR UPDATE row lock holds across the read, the
+    // append and the write. Outside a transaction the lock ends with the SELECT
+    // and two watchers can each append to the same old list, losing one signature.
+    return this.sql.begin(async (tx) => {
+      const rows = await tx<Row[]>`
+        SELECT signatures
+        FROM mint_requests
+        WHERE deposit_id = ${depositIdBuf}
+        FOR UPDATE
+      `;
 
-    if (rows.length === 0) throw new MintRequestNotFoundError(depositId);
+      if (rows.length === 0) throw new MintRequestNotFoundError(depositId);
 
-    const current: SignatureEntry[] = rows[0]!.signatures ?? [];
+      const current: SignatureEntry[] = rows[0]!.signatures ?? [];
 
-    const alreadyPresent = current.some(
-      (e) => e.signer.toLowerCase() === signer.toLowerCase(),
-    );
+      const alreadyPresent = current.some(
+        (e) => e.signer.toLowerCase() === signer.toLowerCase(),
+      );
 
-    if (alreadyPresent) return { appended: false, totalSignatures: current.length };
+      if (alreadyPresent) return { appended: false, totalSignatures: current.length };
 
-    const updated = [...current, { signer, sig }];
+      const updated = [...current, { signer, sig }];
 
-    await this.sql`
-      UPDATE mint_requests
-      SET signatures      = ${this.sql.json(updated as unknown as JSONValue)},
-          signature_count = ${updated.length},
-          updated_at      = now()
-      WHERE deposit_id = ${depositIdBuf}
-    `;
+      await tx`
+        UPDATE mint_requests
+        SET signatures      = ${tx.json(updated as unknown as JSONValue)},
+            signature_count = ${updated.length},
+            updated_at      = now()
+        WHERE deposit_id = ${depositIdBuf}
+      `;
 
-    return { appended: true, totalSignatures: updated.length };
+      return { appended: true, totalSignatures: updated.length };
+    }) as Promise<SubmitResult>;
   }
 
   async getSignatures(depositId: Hex): Promise<SignatureEntry[]> {
